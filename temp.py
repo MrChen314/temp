@@ -1,34 +1,10 @@
-class Qwen3MoeSparseMoeBlock(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.num_experts = config.num_experts
-        self.top_k = config.num_experts_per_tok
-        self.norm_topk_prob = config.norm_topk_prob
-        self.config = config
-
-        # gating
-        self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
-
-        # Use nn.ModuleList for loading compatibility with transformers
-        self.experts = nn.ModuleList(
-            [Qwen3MoeMLP(config, intermediate_size=config.moe_intermediate_size) for _ in range(self.num_experts)]
-        )
-
-    def post_init(self):
-        """
-        Convert nn.ModuleList experts to fused Qwen3MoeExperts after model loading.
-        This method should be called after the model weights are loaded.
-        """
-        if isinstance(self.experts, nn.ModuleList):
-            # Create Qwen3MoeExperts instance
-            fused_experts = Qwen3MoeExperts(self.config)
-            
-            # Copy weights from ModuleList to fused experts
-            for expert_idx, expert in enumerate(self.experts):
-                fused_experts.gate_proj.data[expert_idx] = expert.gate_proj.weight.data.T.clone()
-                fused_experts.up_proj.data[expert_idx] = expert.up_proj.weight.data.T.clone()
-                fused_experts.down_proj.data[expert_idx] = expert.down_proj.weight.data.T.clone()
-            
-            # Replace ModuleList with fused experts
-            self.experts = fused_experts
-            logger.info("Converted nn.ModuleList experts to fused Qwen3MoeExperts")
+The expanded size of the tensor (2048) must match the existing size (768) at non-singleton dimension 1.  Target sizes: [768, 2048].  Tensor sizes: [2048, 768]
+  File "/home/c30061641/Veomni/VeOmni_Qwen3Moe/veomni/models/transformers/qwen3_moe/modeling_qwen3_moe.py", line 391, in post_init
+    fused_experts.gate_proj.data[expert_idx] = expert.gate_proj.weight.data.T.clone()
+  File "/home/c30061641/Veomni/VeOmni_Qwen3Moe/veomni/models/auto.py", line 130, in build_foundation_model
+    module.post_init()
+  File "/home/c30061641/Veomni/VeOmni_Qwen3Moe/tasks/train_torch.py", line 152, in main
+    model = build_foundation_model(
+  File "/home/c30061641/Veomni/VeOmni_Qwen3Moe/tasks/train_torch.py", line 405, in <module>
+    main()
+RuntimeError: The expanded size of the tensor (2048) must match the existing size (768) at non-singleton dimension 1.  Target sizes: [768, 2048].  Tensor sizes: [2048, 768]
