@@ -1,5 +1,4 @@
-
-class Qwen3MoeSparseFusedMoeBlock(nn.Module):
+class Qwen3MoeSparseMoeBlock(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.num_experts = config.num_experts
@@ -33,10 +32,3 @@ class Qwen3MoeSparseFusedMoeBlock(nn.Module):
             # Replace ModuleList with fused experts
             self.experts = fused_experts
             logger.info("Converted nn.ModuleList experts to fused Qwen3MoeExperts")
-
-
-    for module in model.modules():
-        # Check if the module has post_init method and is a MoE block
-        if hasattr(module, "post_init") and hasattr(module, "experts") and isinstance(module.experts, torch.nn.ModuleList):
-            module.post_init()
-            logger.info_rank0(f"Called post_init for {module.__class__.__name__}")
