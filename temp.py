@@ -1,36 +1,26 @@
-    def post_init(self):
-        """
-        Convert nn.ModuleList experts to fused Qwen3MoeExperts after model loading.
-        This method should be called after the model weights are loaded.
-        """
-        if isinstance(self.experts, nn.ModuleList):
-            # Check if experts are on meta device (no actual data yet)
-            if len(self.experts) > 0 and self.experts[0].gate_proj.weight.device.type == "meta":
-                logger.info("Skipping post_init for Qwen3MoeSparseMoeBlock: experts are still on meta device")
-                return
-            
-            # Create Qwen3MoeExperts instance
-            fused_experts = Qwen3MoeExperts(self.config)
-            
-            # Get device and dtype from the first expert
-            device = self.experts[0].gate_proj.weight.device
-            dtype = self.experts[0].gate_proj.weight.dtype
-            
-            # Copy weights from ModuleList to fused experts in batch for efficiency
-            # Linear.weight shape: [out_features, in_features]
-            # gate_proj: [intermediate_size, hidden_dim]
-            # up_proj: [intermediate_size, hidden_dim]
-            # down_proj: [hidden_dim, intermediate_size]
-            # Stack all expert weights at once
-            gate_proj_weights = torch.stack([expert.gate_proj.weight.data for expert in self.experts], dim=0)
-            up_proj_weights = torch.stack([expert.up_proj.weight.data for expert in self.experts], dim=0)
-            down_proj_weights = torch.stack([expert.down_proj.weight.data for expert in self.experts], dim=0)
-            
-            # Move to target device and copy
-            fused_experts.gate_proj.data = gate_proj_weights.to(device=device, dtype=dtype)
-            fused_experts.up_proj.data = up_proj_weights.to(device=device, dtype=dtype)
-            fused_experts.down_proj.data = down_proj_weights.to(device=device, dtype=dtype)
-            
-            # Replace ModuleList with fused experts
-            self.experts = fused_experts
-            logger.info("Converted nn.ModuleList experts to fused Qwen3MoeExperts")
+[rank1]: Traceback (most recent call last):
+[rank1]:   File "/home/c30061641/Veomni/VeOmni_Qwen3Moe/tasks/train_torch.py", line 405, in <module>
+[rank1]:     main()
+[rank1]:   File "/home/c30061641/Veomni/VeOmni_Qwen3Moe/tasks/train_torch.py", line 299, in main
+[rank1]:     loss: "torch.Tensor" = model(**micro_batch, use_cache=False).loss.mean() / len(micro_batches)
+[rank1]:   File "/root/anaconda3/envs/veomni/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+[rank1]:     return self._call_impl(*args, **kwargs)
+[rank1]:   File "/root/anaconda3/envs/veomni/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1857, in _call_impl
+[rank1]:     return inner()
+[rank1]:   File "/root/anaconda3/envs/veomni/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1784, in inner
+[rank1]:     args_kwargs_result = hook(self, args, kwargs)  # type: ignore[misc]
+[rank1]:   File "/root/anaconda3/envs/veomni/lib/python3.10/site-packages/torch/distributed/fsdp/_fully_shard/_fsdp_state.py", line 62, in fsdp_hook_wrapper
+[rank1]:     return torch._dynamo.disable(func, recursive=True)(*args, **kwargs)
+[rank1]:   File "/root/anaconda3/envs/veomni/lib/python3.10/site-packages/torch/_dynamo/eval_frame.py", line 838, in _fn
+[rank1]:     return fn(*args, **kwargs)
+[rank1]:   File "/root/anaconda3/envs/veomni/lib/python3.10/site-packages/torch/distributed/fsdp/_fully_shard/_fsdp_state.py", line 222, in _pre_forward
+[rank1]:     args, kwargs = self._root_pre_forward(module, args, kwargs)
+[rank1]:   File "/root/anaconda3/envs/veomni/lib/python3.10/site-packages/torch_npu/distributed/fsdp/_add_fsdp_patch.py", line 95, in _patched_root_pre_forward
+[rank1]:     self._lazy_init()
+[rank1]:   File "/root/anaconda3/envs/veomni/lib/python3.10/site-packages/torch/distributed/fsdp/_fully_shard/_fsdp_state.py", line 178, in _lazy_init
+[rank1]:     state._fsdp_param_group.lazy_init()
+[rank1]:   File "/root/anaconda3/envs/veomni/lib/python3.10/site-packages/torch/distributed/fsdp/_fully_shard/_fsdp_param_group.py", line 244, in lazy_init
+[rank1]:     self._validate_no_meta_params()
+[rank1]:   File "/root/anaconda3/envs/veomni/lib/python3.10/site-packages/torch/distributed/fsdp/_fully_shard/_fsdp_param_group.py", line 667, in _validate_no_meta_params
+[rank1]:     raise RuntimeError(
+[rank1]: RuntimeError: FSDP parameters should be materialized from meta device before training, but the following were still on meta device: ['model.embed_tokens.weight', 'model.norm.weight', 'lm_head.weight']
