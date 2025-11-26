@@ -92,7 +92,7 @@ def index_baseline_forward(
     参数:
         q: query tensor, shape = (b, m, h, d)
         k: key tensor, shape = (b, n, d)
-        q_s: query 的缩放因子 (weights * softmax_scale), shape = (m, h)
+        q_s: query 的缩放因子 (weights * softmax_scale), shape = (m, h) 或 (b, m, h)
     
     返回:
         index_score: shape = (b, m, n)
@@ -105,7 +105,8 @@ def index_baseline_forward(
     relu_logits = torch.relu(logits)
     
     # Step 3: 乘以 q_s（缩放因子）
-    # q_s.unsqueeze(-1): (m, h) -> (m, h, 1)，会广播到 (b, m, h, n)
+    # q_s.unsqueeze(-1): (m, h) -> (m, h, 1) 或 (b, m, h) -> (b, m, h, 1)
+    # 会广播到 (b, m, h, n)
     scaled_logits = relu_logits * q_s.unsqueeze(-1)
     
     # Step 4: 沿 head 维度求和
@@ -139,7 +140,7 @@ def index_baseline_backward_tile(
         d_out: 输出梯度, shape = (b, m, n)
         q: query tensor, shape = (b, m, h, d)
         k: key tensor, shape = (b, n, d)
-        q_s: query 的缩放因子, shape = (m, h)
+        q_s: query 的缩放因子, shape = (m, h) 或 (b, m, h)
         cache: 缓存的中间结果 (logits, relu_logits)
         tile_M: M 方向的分块大小
         tile_N: N 方向的分块大小
@@ -152,6 +153,9 @@ def index_baseline_backward_tile(
     logits, relu_logits = cache
     B, M, H, D = q.shape
     N = k.shape[1]
+    
+    # 判断 q_s 是 2D (m, h) 还是 3D (b, m, h)
+    q_s_is_3d = (q_s.dim() == 3)
 
     # 输出梯度
     dq = torch.zeros_like(q)           # (B, M, H, D)
@@ -163,7 +167,12 @@ def index_baseline_backward_tile(
         m1, m2 = i, min(i + tile_M, M)
         q_tile = q[:, m1:m2]                    # (B, tile_M, H, D)
         d_out_tile = d_out[:, m1:m2]            # (B, tile_M, N)
-        q_s_tile = q_s[m1:m2]                   # (tile_M, H)
+        
+        # 根据 q_s 的维度选择切片方式
+        if q_s_is_3d:
+            q_s_tile = q_s[:, m1:m2, :]         # (B, tile_M, H)
+        else:
+            q_s_tile = q_s[m1:m2]               # (tile_M, H)
 
         # 内循环：N 方向
         for j in range(0, N, tile_N):
@@ -187,7 +196,7 @@ def index_baseline_backward_tile(
             # scaled_logits = relu_logits * q_s.unsqueeze(-1)
             # d_relu_logits = d_scaled_logits * q_s.unsqueeze(-1)
             # d_q_s += (d_scaled_logits * relu_logits).sum(dim=-1)
-            q_s_tile_expanded = q_s_tile.unsqueeze(-1)  # (tile_M, H, 1)
+            q_s_tile_expanded = q_s_tile.unsqueeze(-1)  # (tile_M, H, 1) 或 (B, tile_M, H, 1)
             d_relu_logits_tile = d_scaled_logits_tile * q_s_tile_expanded  # (B, tile_M, H, tile_N)
             d_q_s[:, m1:m2] += (d_scaled_logits_tile * relu_logits_tile).sum(dim=-1)  # (B, tile_M, H)
             
