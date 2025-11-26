@@ -1,190 +1,298 @@
-class Qwen2_5_VLVisionSdpaAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int = 16) -> None:
-        super().__init__()
-        self.num_heads = num_heads
-        self.qkv = nn.Linear(dim, dim * 3, bias=True)
-        self.proj = nn.Linear(dim, dim)
+"""
+IndexerBaselineFunction - 无量化版本（分块显存友好版）
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        rotary_pos_emb: Optional[torch.Tensor] = None,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> torch.Tensor:
-        seq_length = hidden_states.shape[0]
-        
-        # ulysses sp patch: qkv projection
-        qkv = self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3)
-        
-        unpadded_dim_size = cu_seqlens[-1]
-        if get_parallel_state().ulysses_enabled:
-            qkv = gather_seq_scatter_heads(qkv, seq_dim=1, head_dim=2)
-            sp_padding_size = qkv.size(1) - unpadded_dim_size
-            if sp_padding_size > 0:
-                qkv = unpad_tensor(qkv, dim=1, padding_size=sp_padding_size)
-            seq_length = qkv.shape[1]
-        q, k, v = qkv.unbind(0)
+使用 weights 进行加权计算，与 indexer_no_quant.py 保持一致。
+反向传播使用分块计算以节省显存。
+"""
 
-        if position_embeddings is None:
-            logger.warning_once(
-                "The attention layers in this model are transitioning from computing the RoPE embeddings internally "
-                "through `rotary_pos_emb` (2D tensor of RoPE theta values), to using externally computed "
-                "`position_embeddings` (Tuple of tensors, containing cos and sin). In v4.54 `rotary_pos_emb` will be "
-                "removed and `position_embeddings` will be mandatory."
-            )
-            emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
-            cos = emb.cos()
-            sin = emb.sin()
-        else:
-            cos, sin = position_embeddings
-        q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
-
-        attn_output = torch_npu.npu_fusion_attention(
-                q, k, v, q.shape[1],
-                pse=None,
-                padding_mask=None,
-                atten_mask=None,
-                scale=1.0 / math.sqrt(q.shape[-1]),
-                keep_prob=1,
-                input_layout='TND',
-                actual_seq_qlen=cu_seqlens.tolist()[1:],
-                actual_seq_kvlen=cu_seqlens.tolist()[1:],
-                pre_tockens=2147483647,
-                next_tockens=2147483647,
-                sparse_mode=0)[0]
-
-        # attention_mask = torch.zeros([1, seq_length, seq_length], device=q.device, dtype=torch.bool)
-        # for i in range(1, len(cu_seqlens)):
-        #     attention_mask[..., cu_seqlens[i - 1] : cu_seqlens[i], cu_seqlens[i - 1] : cu_seqlens[i]] = True
-        # q = q.transpose(0, 1)
-        # k = k.transpose(0, 1)
-        # v = v.transpose(0, 1)
-        # attn_output = F.scaled_dot_product_attention(
-        #     q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0), attention_mask, dropout_p=0.0
-        # )
-        # attn_output = attn_output.squeeze(0).transpose(0, 1)
-        if get_parallel_state().ulysses_enabled:
-            attn_output = pad_tensor(attn_output, dim=0, padding_size=sp_padding_size)
-            attn_output = gather_heads_scatter_seq(attn_output, head_dim=1, seq_dim=0)
-        attn_output = attn_output.reshape(hidden_states.shape[0], -1)
-        attn_output = self.proj(attn_output)
-        return attn_output
+import torch
 
 
-QWEN2_5_VL_VISION_ATTENTION_CLASSES = {
-    "eager": Qwen2_5_VLVisionAttention,
-    "flash_attention_2": Qwen2_5_VLVisionSdpaAttention,
-    "sdpa": Qwen2_5_VLVisionSdpaAttention,
-}
-
-
-
-
-
-class Qwen2_5_VLSdpaAttention(Qwen2_5_VLAttention):
+class IndexerBaselineFunction(torch.autograd.Function):
     """
-    Qwen2 attention module using torch.nn.functional.scaled_dot_product_attention. This module inherits from
-    `Qwen2Attention` as the weights of the module stays untouched. The only changes are on the forward pass to adapt to
-    SDPA API.
+    无量化的 Indexer 基线实现（分块显存友好版）。
+    
+    使用 weights 对每个 head 进行加权计算。
     """
 
-    # Adapted from Qwen2Attention.forward
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        if output_attentions:
-            # TODO: Improve this warning with e.g. `model.config.attn_implementation = "manual"` once this is implemented.
-            logger.warning_once(
-                "Qwen2_5_VLModel is using Qwen2_5_VLSdpaAttention, but `torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to the manual attention implementation, "
-                'but specifying the manual implementation will be required from Transformers version v5.0.0 onwards. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
-            )
-            return super().forward(
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_value=past_key_value,
-                output_attentions=output_attentions,
-                use_cache=use_cache,
-                cache_position=cache_position,
-                position_embeddings=position_embeddings,
-            )
+    @staticmethod
+    def forward(ctx, q: torch.Tensor, k: torch.Tensor, weights: torch.Tensor):
+        """
+        无量化 Indexer 前向计算。
+        
+        参数:
+            q: query tensor, shape = (b, m, h, d)
+            k: key tensor, shape = (b, n, d)
+            weights: 权重 tensor, shape = (h, m)
+        
+        返回:
+            index_score: shape = (b, m, n)
+        """
+        assert q.shape[-1] == 128, f"q last dim must be 128, got {q.shape[-1]}"
+        assert k.shape[-1] == 128, f"k last dim must be 128, got {k.shape[-1]}"
 
-        bsz, q_len, _ = hidden_states.size()
+        # 计算 softmax_scale
+        softmax_scale = q.shape[-1] ** -0.5  # 1/sqrt(D)
+        
+        # 处理 weights：转置并乘以 softmax_scale
+        weights_transposed = torch.transpose(weights, 0, 1).contiguous()  # (h, m) -> (m, h)
+        q_s_weights = weights_transposed * softmax_scale  # (m, h)
 
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
+        # 调用核心计算函数
+        index_score, cache = index_baseline_forward(q, k, q_s_weights)
 
-        query_states = query_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+        # 保存反向所需 tensor
+        ctx.save_for_backward(q, k, q_s_weights)
+        ctx.softmax_scale = softmax_scale
+        ctx.cache = cache
 
-        # ulysses sp patch: qkv proj
-        if get_parallel_state().ulysses_enabled:
-            query_states = gather_seq_scatter_heads(query_states, seq_dim=2, head_dim=1)
-            key_states = gather_seq_scatter_heads(key_states, seq_dim=2, head_dim=1)
-            value_states = gather_seq_scatter_heads(value_states, seq_dim=2, head_dim=1)
+        return index_score
 
-        cos, sin = position_embeddings
-        query_states, key_states = apply_multimodal_rotary_pos_emb(
-            query_states, key_states, cos, sin, self.rope_scaling["mrope_section"]
+    @staticmethod
+    def backward(ctx, grad_output):
+        """
+        无量化 Indexer 反向计算。
+        
+        参数:
+            grad_output: 输出梯度, shape = (b, m, n)
+        
+        返回:
+            grad_q: q 的梯度, shape = (b, m, h, d)
+            grad_k: k 的梯度, shape = (b, n, d)
+            grad_weights: weights 的梯度, shape = (h, m)
+        """
+        q, k, q_s_weights = ctx.saved_tensors
+        softmax_scale = ctx.softmax_scale
+        cache = ctx.cache
+
+        grad_q, grad_k, grad_q_s = index_baseline_backward_tile(
+            grad_output.contiguous(), q, k, q_s_weights, cache
         )
+        
+        # 计算 weights 的梯度
+        # grad_q_s shape: (b, m, h)
+        # 需要沿 batch 维度求和，然后转置
+        grad_q_s_sum = grad_q_s.sum(dim=0)  # (m, h)
+        grad_weights = torch.transpose(grad_q_s_sum * softmax_scale, 0, 1).contiguous()  # (h, m)
+        
+        return grad_q, grad_k, grad_weights
 
-        if past_key_value is not None:
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}  # Specific to RoPE models
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
+# ------------------------------------------------------------------
+# 前向：使用 q_s 进行加权
+# ------------------------------------------------------------------
+def index_baseline_forward(
+    q: torch.Tensor, 
+    k: torch.Tensor, 
+    q_s: torch.Tensor
+) -> tuple:
+    """
+    无量化 Indexer 前向核心计算。
+    
+    参数:
+        q: query tensor, shape = (b, m, h, d)
+        k: key tensor, shape = (b, n, d)
+        q_s: query 的缩放因子 (weights * softmax_scale), shape = (m, h)
+    
+    返回:
+        index_score: shape = (b, m, n)
+        cache: 缓存的中间结果，用于反向传播
+    """
+    # Step 1: 计算 q 和 k 的点积
+    logits = torch.einsum('bmhd,bnd->bmhn', q, k)  # (B, M, H, N)
+    
+    # Step 2: ReLU 激活
+    relu_logits = torch.relu(logits)
+    
+    # Step 3: 乘以 q_s（缩放因子）
+    # q_s.unsqueeze(-1): (m, h) -> (m, h, 1)，会广播到 (b, m, h, n)
+    scaled_logits = relu_logits * q_s.unsqueeze(-1)
+    
+    # Step 4: 沿 head 维度求和
+    logits_sum = scaled_logits.sum(dim=2)  # (B, M, N)
+    
+    # k_s 为全 1（无量化），所以 index_score = logits_sum
+    index_score = logits_sum
+    
+    # 缓存中间结果
+    cache = (logits, relu_logits)
+    
+    return index_score, cache
 
-        causal_mask = attention_mask
-        if attention_mask is not None:  # no matter the length, we just slice it
-            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
 
-        # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
-        # Reference: https://github.com/pytorch/pytorch/issues/112577.
-        if query_states.device.type == "cuda" and attention_mask is not None:
-            query_states = query_states.contiguous()
-            key_states = key_states.contiguous()
-            value_states = value_states.contiguous()
+# ------------------------------------------------------------------
+# 反向：分块计算以节省显存
+# ------------------------------------------------------------------
+def index_baseline_backward_tile(
+    d_out: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_s: torch.Tensor,
+    cache: tuple,
+    tile_M: int = 128,
+    tile_N: int = 128
+) -> tuple:
+    """
+    无量化 Indexer 反向核心计算（分块显存友好版）。
+    
+    参数:
+        d_out: 输出梯度, shape = (b, m, n)
+        q: query tensor, shape = (b, m, h, d)
+        k: key tensor, shape = (b, n, d)
+        q_s: query 的缩放因子, shape = (m, h)
+        cache: 缓存的中间结果 (logits, relu_logits)
+        tile_M: M 方向的分块大小
+        tile_N: N 方向的分块大小
+    
+    返回:
+        d_q: q 的梯度, shape = (b, m, h, d)
+        d_k: k 的梯度, shape = (b, n, d)
+        d_q_s: q_s 的梯度, shape = (b, m, h)
+    """
+    logits, relu_logits = cache
+    B, M, H, D = q.shape
+    N = k.shape[1]
 
-        # We dispatch to SDPA's Flash Attention or Efficient kernels via this `is_causal` if statement instead of an inline conditional assignment
-        # in SDPA to support both torch.compile's dynamic shapes and full graph options. An inline conditional prevents dynamic shapes from compiling.
-        # The q_len > 1 is necessary to match with AttentionMaskConverter.to_causal_4d that does not create a causal mask in case q_len == 1.
-        is_causal = True if causal_mask is None and q_len > 1 else False
+    # 输出梯度
+    dq = torch.zeros_like(q)           # (B, M, H, D)
+    dk = torch.zeros_like(k)           # (B, N, D)
+    d_q_s = torch.zeros(B, M, H, device=q.device, dtype=q.dtype)  # (B, M, H)
 
-        attn_output = torch.nn.functional.scaled_dot_product_attention(
-            query_states,
-            key_states,
-            value_states,
-            attn_mask=causal_mask,
-            dropout_p=self.attention_dropout if self.training else 0.0,
-            is_causal=is_causal,
+    # 外循环：M 方向
+    for i in range(0, M, tile_M):
+        m1, m2 = i, min(i + tile_M, M)
+        q_tile = q[:, m1:m2]                    # (B, tile_M, H, D)
+        d_out_tile = d_out[:, m1:m2]            # (B, tile_M, N)
+        q_s_tile = q_s[m1:m2]                   # (tile_M, H)
+
+        # 内循环：N 方向
+        for j in range(0, N, tile_N):
+            n1, n2 = j, min(j + tile_N, N)
+
+            # 1. 取出当前块需要的张量
+            k_tile = k[:, n1:n2]                      # (B, tile_N, D)
+            logits_tile = logits[:, m1:m2, :, n1:n2]  # (B, tile_M, H, tile_N)
+            relu_logits_tile = relu_logits[:, m1:m2, :, n1:n2]  # (B, tile_M, H, tile_N)
+            mask_tile = (logits_tile > 0).float()     # ReLU gate
+
+            # 2. 反向传播链式法则
+            # index_score = logits_sum (k_s=1)
+            # d_logits_sum = d_out
+            d_logits_sum_tile = d_out_tile[:, :, n1:n2]  # (B, tile_M, tile_N)
+            
+            # logits_sum = scaled_logits.sum(dim=2)
+            # d_scaled_logits = d_logits_sum.unsqueeze(2).expand(...)
+            d_scaled_logits_tile = d_logits_sum_tile.unsqueeze(2)  # (B, tile_M, 1, tile_N)
+            
+            # scaled_logits = relu_logits * q_s.unsqueeze(-1)
+            # d_relu_logits = d_scaled_logits * q_s.unsqueeze(-1)
+            # d_q_s += (d_scaled_logits * relu_logits).sum(dim=-1)
+            q_s_tile_expanded = q_s_tile.unsqueeze(-1)  # (tile_M, H, 1)
+            d_relu_logits_tile = d_scaled_logits_tile * q_s_tile_expanded  # (B, tile_M, H, tile_N)
+            d_q_s[:, m1:m2] += (d_scaled_logits_tile * relu_logits_tile).sum(dim=-1)  # (B, tile_M, H)
+            
+            # relu_logits = relu(logits)
+            # d_logits = d_relu_logits * (logits > 0)
+            d_logits_tile = d_relu_logits_tile * mask_tile  # (B, tile_M, H, tile_N)
+
+            # 3. 立即计算局部贡献并累加
+            # logits = einsum('bmhd,bnd->bmhn', q, k)
+            # d_q = einsum('bmhn,bnd->bmhd', d_logits, k)
+            # d_k = einsum('bmhn,bmhd->bnd', d_logits, q)
+            dq[:, m1:m2] += torch.einsum('bmhn,bnd->bmhd', d_logits_tile, k_tile)
+            dk[:, n1:n2] += torch.einsum('bmhn,bmhd->bnd', d_logits_tile, q_tile)
+
+            # 4. 释放当前块所有中间张量
+            del d_logits_tile, d_relu_logits_tile, d_scaled_logits_tile
+            del mask_tile, relu_logits_tile, logits_tile, k_tile
+        
+        del q_tile, d_out_tile, q_s_tile
+
+    return dq, dk, d_q_s
+
+
+# ============================================================
+# 测试代码
+# ============================================================
+
+if __name__ == "__main__":
+    torch.manual_seed(42)
+    
+    print("=" * 60)
+    print("IndexerBaselineFunction 分块版本测试")
+    print("=" * 60)
+    
+    # 定义参数
+    batch_size = 2
+    seq_len_q = 4
+    seq_len_k = 6
+    num_heads = 8
+    head_dim = 128  # 必须是 128
+    
+    print(f"\n参数设置:")
+    print(f"  batch_size = {batch_size}")
+    print(f"  seq_len_q = {seq_len_q}")
+    print(f"  seq_len_k = {seq_len_k}")
+    print(f"  num_heads = {num_heads}")
+    print(f"  head_dim = {head_dim}")
+    
+    # 创建输入张量
+    q = torch.randn(batch_size, seq_len_q, num_heads, head_dim, requires_grad=True)
+    k = torch.randn(batch_size, seq_len_k, head_dim, requires_grad=True)
+    weights = torch.randn(num_heads, seq_len_q, requires_grad=True)
+    
+    print(f"\n输入张量:")
+    print(f"  q shape: {q.shape}")
+    print(f"  k shape: {k.shape}")
+    print(f"  weights shape: {weights.shape}")
+    
+    # 前向计算
+    print(f"\n{'='*60}")
+    print("前向计算")
+    print("=" * 60)
+    
+    index_score = IndexerBaselineFunction.apply(q, k, weights)
+    
+    print(f"index_score shape: {index_score.shape}")
+    print(f"index_score:\n{index_score}")
+    
+    # 反向计算
+    print(f"\n{'='*60}")
+    print("反向计算")
+    print("=" * 60)
+    
+    grad_output = torch.ones_like(index_score)
+    index_score.backward(grad_output)
+    
+    print(f"q.grad shape: {q.grad.shape}")
+    print(f"k.grad shape: {k.grad.shape}")
+    print(f"weights.grad shape: {weights.grad.shape}")
+    
+    print(f"\nq.grad (前5个元素): {q.grad.flatten()[:5]}")
+    print(f"k.grad (前5个元素): {k.grad.flatten()[:5]}")
+    print(f"weights.grad:\n{weights.grad}")
+    
+    # 数值梯度检查
+    print(f"\n{'='*60}")
+    print("梯度检查 (gradcheck)")
+    print("=" * 60)
+    
+    q_small = torch.randn(1, 2, 2, 128, requires_grad=True, dtype=torch.float64)
+    k_small = torch.randn(1, 3, 128, requires_grad=True, dtype=torch.float64)
+    weights_small = torch.randn(2, 2, requires_grad=True, dtype=torch.float64)
+    
+    try:
+        result = torch.autograd.gradcheck(
+            IndexerBaselineFunction.apply,
+            (q_small, k_small, weights_small),
+            eps=1e-6,
+            atol=1e-4,
+            rtol=1e-3
         )
-
-        # ulysses sp patch: o projection
-        if get_parallel_state().ulysses_enabled:
-            attn_output = gather_heads_scatter_seq(attn_output, head_dim=2, seq_dim=1)
-
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.view(bsz, q_len, self.hidden_size)
-
-        attn_output = self.o_proj(attn_output)
-
-        return attn_output, None, past_key_value
-
-
-QWEN2_5_VL_ATTENTION_CLASSES = {
-    "eager": Qwen2_5_VLAttention,
-    "flash_attention_2": Qwen2_5_VLSdpaAttention,
-    "sdpa": Qwen2_5_VLSdpaAttention,
-}
+        print(f"梯度检查结果: {'✓ 通过' if result else '✗ 失败'}")
+    except Exception as e:
+        print(f"梯度检查异常: {e}")
+    
+    print(f"\n{'='*60}")
+    print("测试完成")
+    print("=" * 60)
