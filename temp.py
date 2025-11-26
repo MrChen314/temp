@@ -23,7 +23,10 @@ class IndexerBaselineFunction(torch.autograd.Function):
         参数:
             q: query tensor, shape = (b, m, h, d)
             k: key tensor, shape = (b, n, d)
-            weights: 权重 tensor, shape = (h, m)
+            weights: 权重 tensor, 支持多种形状:
+                     - (h, m): 标准形状
+                     - (m, h): 已转置的形状
+                     - (m, 1, h): 带中间维度的形状
         
         返回:
             index_score: shape = (b, m, n)
@@ -34,8 +37,20 @@ class IndexerBaselineFunction(torch.autograd.Function):
         # 计算 softmax_scale
         softmax_scale = q.shape[-1] ** -0.5  # 1/sqrt(D)
         
-        # 处理 weights：转置并乘以 softmax_scale
-        weights_transposed = torch.transpose(weights, 0, 1).contiguous()  # (h, m) -> (m, h)
+        # 保存原始 weights 形状，用于反向传播时恢复
+        weights_shape = weights.shape
+        
+        # 处理不同形状的 weights，统一转换为 (m, h)
+        if weights.dim() == 2:
+            # 可能是 (h, m) 或 (m, h)
+            # 假设 weights 需要转置（原始是 (h, m)）
+            weights_transposed = torch.transpose(weights, 0, 1).contiguous()  # (h, m) -> (m, h)
+        elif weights.dim() == 3:
+            # (m, 1, h) 形状，squeeze 中间维度
+            weights_transposed = weights.squeeze(1)  # (m, 1, h) -> (m, h)
+        else:
+            raise ValueError(f"Unsupported weights shape: {weights.shape}")
+        
         q_s_weights = weights_transposed * softmax_scale  # (m, h)
 
         # 调用核心计算函数
@@ -45,6 +60,7 @@ class IndexerBaselineFunction(torch.autograd.Function):
         ctx.save_for_backward(q, k, q_s_weights)
         ctx.softmax_scale = softmax_scale
         ctx.cache = cache
+        ctx.weights_shape = weights_shape  # 保存原始形状
 
         return index_score
 
@@ -59,11 +75,12 @@ class IndexerBaselineFunction(torch.autograd.Function):
         返回:
             grad_q: q 的梯度, shape = (b, m, h, d)
             grad_k: k 的梯度, shape = (b, n, d)
-            grad_weights: weights 的梯度, shape = (h, m)
+            grad_weights: weights 的梯度, 形状与输入 weights 一致
         """
         q, k, q_s_weights = ctx.saved_tensors
         softmax_scale = ctx.softmax_scale
         cache = ctx.cache
+        weights_shape = ctx.weights_shape  # 原始 weights 形状
 
         grad_q, grad_k, grad_q_s = index_baseline_backward_tile(
             grad_output.contiguous(), q, k, q_s_weights, cache
@@ -71,9 +88,19 @@ class IndexerBaselineFunction(torch.autograd.Function):
         
         # 计算 weights 的梯度
         # grad_q_s shape: (b, m, h)
-        # 需要沿 batch 维度求和，然后转置
+        # 需要沿 batch 维度求和
         grad_q_s_sum = grad_q_s.sum(dim=0)  # (m, h)
-        grad_weights = torch.transpose(grad_q_s_sum * softmax_scale, 0, 1).contiguous()  # (h, m)
+        grad_weights_mh = grad_q_s_sum * softmax_scale  # (m, h)
+        
+        # 根据原始 weights 形状恢复梯度形状
+        if len(weights_shape) == 2:
+            # 原始是 (h, m)，需要转置
+            grad_weights = torch.transpose(grad_weights_mh, 0, 1).contiguous()  # (h, m)
+        elif len(weights_shape) == 3:
+            # 原始是 (m, 1, h)，需要 unsqueeze
+            grad_weights = grad_weights_mh.unsqueeze(1)  # (m, 1, h)
+        else:
+            grad_weights = grad_weights_mh
         
         return grad_q, grad_k, grad_weights
 
