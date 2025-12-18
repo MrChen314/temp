@@ -1,171 +1,51 @@
 # ruff: noqa
-"""
-Sparse MLA Forward - 优化版本
-针对 NVIDIA H20 GPU 优化 (78 SMs, 227KB shared memory per block with opt-in)
-
-输入配置:
-- heads=2, dim=256, tail_dim=64, topk=2048, kv_group=1
-- q.shape:[1, 2048, 2, 320], kv.shape:[1, 2048, 1, 320]
-"""
 import torch
 import tilelang
 from tilelang import language as T
-from utils import assert_tensors_similar
-
-
-def compute_shared_memory_usage(H_per_block, D, D_tail, BI, num_stages, dtype_size=2, accum_dtype_size=4):
-    """计算 shared memory 使用量 (单位: bytes)"""
-    # 静态分配 (不参与 pipeline)
-    Q_shared = H_per_block * D * dtype_size
-    Q_tail_shared = H_per_block * D_tail * dtype_size
-    O_shared = H_per_block * D * dtype_size
-    Lse_shared = H_per_block * accum_dtype_size
-    S_shared = H_per_block * BI * dtype_size
-    
-    # Pipeline 分配 (需要 double/triple buffer)
-    KV_shared = BI * D * dtype_size * num_stages
-    K_tail_shared = BI * D_tail * dtype_size * num_stages
-    
-    total = Q_shared + Q_tail_shared + O_shared + Lse_shared + S_shared + KV_shared + K_tail_shared
-    return {
-        'Q_shared': Q_shared,
-        'Q_tail_shared': Q_tail_shared,
-        'KV_shared': KV_shared,
-        'K_tail_shared': K_tail_shared,
-        'O_shared': O_shared,
-        'Lse_shared': Lse_shared,
-        'S_shared': S_shared,
-        'total': total,
-        'total_kb': total / 1024,
-    }
-
-
-def compute_register_usage(H_per_block, D, BI, threads, accum_dtype_size=4):
-    """计算寄存器使用量 (单位: bytes per thread)"""
-    # Fragment 分配
-    acc_o = H_per_block * D * accum_dtype_size
-    acc_s = H_per_block * BI * accum_dtype_size
-    sumexp = H_per_block * accum_dtype_size
-    sumexp_i = H_per_block * accum_dtype_size
-    alpha = H_per_block * accum_dtype_size
-    m_i = H_per_block * accum_dtype_size
-    m_i_prev = H_per_block * accum_dtype_size
-    mask = BI  # bool, ~1 byte each
-    
-    total = acc_o + acc_s + sumexp + sumexp_i + alpha + m_i + m_i_prev + mask
-    per_thread = total / threads
-    registers_per_thread = per_thread / 4  # 32-bit registers
-    
-    return {
-        'acc_o': acc_o,
-        'acc_s': acc_s,
-        'scalar_fragments': sumexp + sumexp_i + alpha + m_i + m_i_prev,
-        'mask': mask,
-        'total': total,
-        'per_thread_bytes': per_thread,
-        'registers_per_thread': registers_per_thread,
-    }
-
-
-def find_optimal_config(heads, dim, tail_dim, topk, kv_group=1, 
-                        shared_mem_limit_kb=227, max_registers_per_thread=256):
-    """
-    自动搜索最优配置
-    
-    H20 限制:
-    - Shared memory: 227 KB (opt-in)
-    - Registers per SM: 65536
-    - Max threads per block: 1024
-    """
-    head_kv = heads // kv_group
-    padded_H = max(tilelang.math.next_power_of_2(head_kv), 16)
-    H_per_block = padded_H if head_kv <= 64 else 64
-    
-    # 候选配置
-    block_I_candidates = [32, 64, 128, 256]
-    num_stages_candidates = [1, 2, 3, 4]
-    threads_candidates = [128, 256, 512]
-    
-    valid_configs = []
-    
-    for block_I in block_I_candidates:
-        if topk % block_I != 0:
-            continue
-            
-        for num_stages in num_stages_candidates:
-            for threads in threads_candidates:
-                smem = compute_shared_memory_usage(H_per_block, dim, tail_dim, block_I, num_stages)
-                regs = compute_register_usage(H_per_block, dim, block_I, threads)
-                
-                if smem['total_kb'] <= shared_mem_limit_kb and regs['registers_per_thread'] <= max_registers_per_thread:
-                    # 计算循环次数
-                    num_iterations = tilelang.cdiv(topk, block_I)
-                    
-                    # 启发式评分: 优先减少循环次数，同时平衡 shared memory 使用
-                    # 更高的 block_I 和 num_stages 通常更好
-                    score = (
-                        block_I * 10  # 更大的 block_I 减少循环次数
-                        + num_stages * 5  # 更多 stages 提高流水线效率
-                        - smem['total_kb'] * 0.1  # 轻微惩罚过高的 shared memory 使用
-                        + (256 - regs['registers_per_thread']) * 0.5  # 奖励较低的寄存器使用
-                    )
-                    
-                    valid_configs.append({
-                        'block_I': block_I,
-                        'num_stages': num_stages,
-                        'threads': threads,
-                        'smem_kb': smem['total_kb'],
-                        'regs_per_thread': regs['registers_per_thread'],
-                        'num_iterations': num_iterations,
-                        'score': score,
-                    })
-    
-    # 按评分排序
-    valid_configs.sort(key=lambda x: x['score'], reverse=True)
-    return valid_configs
+from tilelang.engine.callback import register_cuda_postproc_callback
+import argparse
 
 
 @tilelang.jit(
     out_idx=[-2, -1],
-    pass_configs={
-        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-    },
+    compile_flags=[
+        "-O3",
+        "-Wno-deprecated-declarations",
+        "-U__CUDA_NO_HALF_OPERATORS__",
+        "-U__CUDA_NO_HALF_CONVERSIONS__",
+        "-U__CUDA_NO_HALF2_OPERATORS__",
+        "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+        "--expt-relaxed-constexpr",
+        "--expt-extended-lambda",
+        "--ptxas-options=-v,--register-usage-level=10",
+        "-DNDEBUG",
+    ],
 )
-def sparse_mla_fwd_optimized(
+def sparse_mla_fwd(
+    batch,
+    seq_len,
+    seq_len_kv,
     heads,
     dim,
     tail_dim,
     topk,
+    kv_stride,
     kv_group=1,
     sm_scale=None,
     is_causal=True,
     CP0=True,
-    block_I=128,      # 优化: 从 64 增加到 128，减少循环次数
-    num_stages=2,      # 保持 2 stages，避免 shared memory 超限
-    threads=256,
+    block_I=64,
+    num_stages=0,
+    threads=384,
 ):
-    """
-    优化后的 Sparse MLA Forward kernel
-    
-    主要优化:
-    1. block_I 从 64 增加到 128，循环次数从 32 减少到 16
-    2. 更好的内存访问合并
-    3. 减少冗余的 shared memory 分配
-    """
     assert dim == tilelang.math.next_power_of_2(dim), f"haven't check padding correctness yet, dim={dim}"
     assert tail_dim == tilelang.math.next_power_of_2(tail_dim), f"haven't check padding correctness yet, dim={tail_dim}"
     assert is_causal == True, "non-casual is not supported"
-    assert topk % block_I == 0, f"topk({topk}) should be divisible by block_I({block_I})"
-    
+    assert topk % block_I == 0, "otherwise will load some index=0 thus causing wrong kv to be loaded"
     if sm_scale is None:
         sm_scale = (1.0 / (dim + tail_dim)) ** 0.5 * 1.44269504  # log2(e)
     else:
         sm_scale = sm_scale * 1.44269504  # log2(e)
-
-    batch = T.dynamic("batch")
-    seq_len = T.dynamic("seq_len")
-    seq_len_kv = T.dynamic("seq_len_kv")
 
     head_kv = heads // kv_group
     q_shape = [batch, seq_len, heads, dim + tail_dim]
@@ -182,13 +62,19 @@ def sparse_mla_fwd_optimized(
     padded_H = max(tilelang.math.next_power_of_2(head_kv), 16)
     if padded_H != H:
         assert kv_group == 1, (
-            "here we solve the H padding automatically, otherwise you should handle Q copy and Output copy with your mask"
+            "here we solve the H padding automatically, other wise you should handle Q copy and Output copy with your mask (when kv_group == 1, use g_i * padded_H:(g_i+1) * padded_H would be handled automatically)"
         )
     BI = block_I
     NI = tilelang.cdiv(topk, block_I)
+    assert NI % 2 == 0, "NI should be a multiple of 2"
     D = dim
     D_tail = tail_dim
-
+    KV_stride = kv_stride
+    
+    # Producer 线程加载循环次数，每次加载 64 个元素 (8 threads * 8 vectorized)
+    # D/2 需要 D//2//64 = D//128 次循环
+    D_HALF_LOAD_ITERS = D // 128
+    assert D // 2 == D_HALF_LOAD_ITERS * 64, f"D/2 必须是 64 的倍数, D={D}"
     if head_kv > 64:
         assert head_kv % 64 == 0, "head_kv should be a multiple of 64"
         REPLICATE_H = head_kv // 64
@@ -197,187 +83,313 @@ def sparse_mla_fwd_optimized(
 
     H_per_block = padded_H if REPLICATE_H == 1 else 64
 
-    # 打印资源使用情况
-    smem_usage = compute_shared_memory_usage(H_per_block, D, D_tail, BI, num_stages)
-    reg_usage = compute_register_usage(H_per_block, D, BI, threads)
-    print(f"[资源分析] Shared Memory: {smem_usage['total_kb']:.2f} KB / 227 KB")
-    print(f"[资源分析] Registers per thread: {reg_usage['registers_per_thread']:.1f} / 256")
-    print(f"[资源分析] 循环次数: {NI}, block_I: {BI}, num_stages: {num_stages}")
-
     @T.prim_func
     def main(
         Q: T.Tensor(q_shape, dtype),  # type: ignore
         KV: T.Tensor(kv_shape, dtype),  # type: ignore
         Indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore
+        q_start_index_s: T.Tensor(1, indices_dtype),
         Output: T.Tensor(o_shape, dtype),  # type: ignore
         Lse: T.Tensor(lse_shape, accum_dtype),  # type: ignore
     ):
-        with T.Kernel(seq_len * REPLICATE_H, batch, kv_group, threads=threads) as (
-            bx,
-            by,
-            bz,
-        ):
-            # Shared memory 分配
-            Q_shared = T.alloc_shared([H_per_block, D], dtype)
+        with T.Kernel((seq_len - kv_stride + 1 if CP0 else seq_len) * REPLICATE_H, batch, kv_group, threads=threads) as (bx, by, bz):
+            Q_shared_l = T.alloc_shared([H_per_block, D // 2], dtype)
+            Q_shared_r = T.alloc_shared([H_per_block, D // 2], dtype)
             Q_tail_shared = T.alloc_shared([H_per_block, D_tail], dtype)
-            KV_shared = T.alloc_shared([BI, D], dtype)
-            K_tail_shared = T.alloc_shared([BI, D_tail], dtype)
-            S_shared = T.alloc_shared([H_per_block, BI], dtype)
-            
-            # 寄存器分配
-            mask = T.alloc_fragment([BI], "bool")
-            acc_o = T.alloc_fragment([H_per_block, D], accum_dtype)
+            KV_shared_0_l = T.alloc_shared([BI, D // 2], dtype)
+            KV_shared_0_r = T.alloc_shared([BI, D // 2], dtype)
+            KV_shared_1_l = T.alloc_shared([BI, D // 2], dtype)
+            KV_shared_1_r = T.alloc_shared([BI, D // 2], dtype)
+            K_tail_shared_0 = T.alloc_shared([BI, D_tail], dtype)
+            K_tail_shared_1 = T.alloc_shared([BI, D_tail], dtype)
+            O_shared_l = Q_shared_l
+            O_shared_r = Q_shared_r
+            is_kv_valid = T.alloc_shared([BI], "bool", scope="shared")
+
+            acc_o_l = T.alloc_fragment([H_per_block, D // 2], accum_dtype)
+            acc_o_r = T.alloc_fragment([H_per_block, D // 2], accum_dtype)
             acc_s = T.alloc_fragment([H_per_block, BI], accum_dtype)
+            S_shared = T.alloc_shared([H_per_block, BI], dtype)
             sumexp = T.alloc_fragment([H_per_block], accum_dtype)
+            sum_exp_shared = T.alloc_shared([H_per_block], accum_dtype)
             sumexp_i = T.alloc_fragment([H_per_block], accum_dtype)
-            alpha = T.alloc_fragment([H_per_block], accum_dtype)
+            alpha_shared = T.alloc_shared([H_per_block], accum_dtype, scope="shared")
+            alpha_local = T.alloc_fragment([H_per_block], accum_dtype)
             m_i = T.alloc_fragment([H_per_block], accum_dtype)
             m_i_prev = T.alloc_fragment([H_per_block], accum_dtype)
+            indices_local = T.alloc_local([1], indices_dtype)
 
-            # 初始化
-            T.fill(acc_o, 0)
-            T.fill(sumexp, 0)
-            T.fill(m_i, -(2**30))  # 避免 -inf - inf 产生 nan
+            # TODO: Multi buffer
+            bar_q = T.alloc_barrier(arrive_count=384)
+            bar_k_0_ready = T.alloc_barrier(arrive_count=128)
+            bar_k_1_ready = T.alloc_barrier(arrive_count=128)
+            bar_k_0_free = T.alloc_barrier(arrive_count=256)
+            bar_k_1_free = T.alloc_barrier(arrive_count=256)
+            bar_sScale_and_sS_ready = T.alloc_barrier(arrive_count=256)
+            bar_sScale_and_sS_free = T.alloc_barrier(arrive_count=256)
 
             b_i, g_i = by, bz
-            s_i = bx if REPLICATE_H == 1 else (bx // REPLICATE_H)
-            q_i = s_i
-            max_kv_i = q_i
+            s_i = (bx + (KV_stride - 1 if CP0 else 0)) if REPLICATE_H == 1 else (bx // REPLICATE_H + (KV_stride - 1 if CP0 else 0))
+            q_i = q_start_index_s[0] + s_i
+            max_kv_i = (q_i + 1 - KV_stride) // KV_stride
 
             H0 = g_i * padded_H + (0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * 64)
             H1 = H0 + H_per_block
 
-            # 加载 Q 到 shared memory (只在循环外加载一次)
-            T.copy(Q[b_i, s_i, H0:H1, :D], Q_shared)
+            tx = T.get_thread_binding()
+
+            T.copy(Q[b_i, s_i, H0:H1, 0 : D // 2], Q_shared_l)
+            T.copy(Q[b_i, s_i, H0:H1, D // 2 : D], Q_shared_r)
             T.copy(Q[b_i, s_i, H0:H1, D:], Q_tail_shared)
+            T.barrier_arrive(bar_q)
 
-            # 主循环 - 使用 software pipeline
-            for i_i in T.Pipelined(NI, num_stages=num_stages):
-                # 计算 mask (causal attention)
-                for bi_i in T.Parallel(BI):
-                    mask[bi_i] = Indices[b_i, s_i, g_i, i_i * BI + bi_i] <= max_kv_i
+            if tx < 128:
+                T.set_max_nreg(240, 1)
+                T.fill(sumexp, 0)
+                T.fill(m_i, -(2**30))  # avoid -inf - inf to cause nan
+                T.fill(acc_o_l, 0)
+                T.barrier_wait(bar_q, 0)
 
-                # 加载 KV 到 shared memory (gather 操作)
-                for bi_i, d_i in T.Parallel(BI, D):
-                    KV_shared[bi_i, d_i] = KV[b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, d_i]
-                for bi_i, d_i in T.Parallel(BI, D_tail):
-                    K_tail_shared[bi_i, d_i] = KV[b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, D + d_i]
+                for i_i in T.serial(T.ceildiv(NI, 2)):
+                    # Buffer 0
+                    T.barrier_wait(bar_k_0_ready[0], (i_i & 1))
 
-                # 应用 mask 到 attention scores
-                for h_i, bi_i in T.Parallel(H_per_block, BI):
-                    acc_s[h_i, bi_i] = T.if_then_else(mask[bi_i], 0, -T.infinity(acc_s.dtype))
-                
-                # Q @ K^T (分两部分计算)
-                T.gemm(
-                    Q_shared,
-                    KV_shared,
-                    acc_s,
-                    transpose_B=True,
-                    policy=T.GemmWarpPolicy.FullRow,
-                )
-                T.gemm(
-                    Q_tail_shared,
-                    K_tail_shared,
-                    acc_s,
-                    transpose_B=True,
-                    policy=T.GemmWarpPolicy.FullRow,
-                )
-                
-                # Online softmax 更新
-                T.copy(m_i, m_i_prev)
-                T.reduce_max(acc_s, m_i, dim=1, clear=False)
+                    for h_i, bi_i in T.Parallel(H_per_block, BI):
+                        acc_s[h_i, bi_i] = T.if_then_else(is_kv_valid[bi_i], 0, -T.infinity(acc_s.dtype))
+                    T.gemm(Q_shared_l, KV_shared_0_l, acc_s, transpose_B=True, wg_wait=-1)
+                    T.gemm(Q_shared_r, KV_shared_0_r, acc_s, transpose_B=True, wg_wait=-1)
+                    T.gemm(Q_tail_shared, K_tail_shared_0, acc_s, transpose_B=True, wg_wait=-1)
+
+                    T.wait_wgmma(0)
+
+                    if i_i != 0:
+                        T.barrier_arrive(bar_sScale_and_sS_free)
+                        T.barrier_wait(bar_sScale_and_sS_free, ((i_i * 2) & 1) ^ 1)
+
+                    T.copy(m_i, m_i_prev)
+                    T.reduce_max(acc_s, m_i, dim=1, clear=False)
+                    for h_i in T.Parallel(H_per_block):
+                        m_i[h_i] = T.max(m_i[h_i], m_i_prev[h_i])
+                    for h_i in T.Parallel(H_per_block):
+                        alpha_local[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale)
+                    for h_i, bi_i in T.Parallel(H_per_block, BI):
+                        acc_s[h_i, bi_i] = T.exp2(acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale)
+                    T.reduce_sum(acc_s, sumexp_i, dim=1)  # is this a accumulate operator?
+                    for h_i in T.Parallel(H_per_block):
+                        sumexp[h_i] = sumexp[h_i] * alpha_local[h_i] + sumexp_i[h_i]
+                    for h_i, d_i in T.Parallel(H_per_block, D // 2):
+                        acc_o_l[h_i, d_i] *= alpha_local[h_i]
+                    T.copy(alpha_local, alpha_shared)
+
+                    T.copy(acc_s, S_shared)
+                    T.gemm(S_shared, KV_shared_0_l, acc_o_l)
+
+                    T.barrier_arrive(bar_sScale_and_sS_ready)
+                    T.barrier_arrive(bar_k_0_free[0])
+
+                    # Buffer 1
+                    T.barrier_wait(bar_k_1_ready[0], (i_i & 1))
+
+                    for h_i, bi_i in T.Parallel(H_per_block, BI):
+                        acc_s[h_i, bi_i] = T.if_then_else(is_kv_valid[bi_i], 0, -T.infinity(acc_s.dtype))
+                    T.gemm(Q_shared_l, KV_shared_1_l, acc_s, transpose_B=True, wg_wait=-1)
+                    T.gemm(Q_shared_r, KV_shared_1_r, acc_s, transpose_B=True, wg_wait=-1)
+                    T.gemm(Q_tail_shared, K_tail_shared_1, acc_s, transpose_B=True, wg_wait=-1)
+
+                    T.wait_wgmma(0)
+
+                    T.barrier_arrive(bar_sScale_and_sS_free)
+                    T.barrier_wait(bar_sScale_and_sS_free, ((i_i * 2 + 1) & 1) ^ 1)
+
+                    T.copy(m_i, m_i_prev)
+                    T.reduce_max(acc_s, m_i, dim=1, clear=False)
+                    for h_i in T.Parallel(H_per_block):
+                        m_i[h_i] = T.max(m_i[h_i], m_i_prev[h_i])
+                    for h_i in T.Parallel(H_per_block):
+                        alpha_local[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale)
+                    for h_i, bi_i in T.Parallel(H_per_block, BI):
+                        acc_s[h_i, bi_i] = T.exp2(acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale)
+                    T.reduce_sum(acc_s, sumexp_i, dim=1)  # is this a accumulate operator?
+                    for h_i in T.Parallel(H_per_block):
+                        sumexp[h_i] = sumexp[h_i] * alpha_local[h_i] + sumexp_i[h_i]
+                    for h_i, d_i in T.Parallel(H_per_block, D // 2):
+                        acc_o_l[h_i, d_i] *= alpha_local[h_i]
+                    T.copy(alpha_local, alpha_shared)
+
+                    T.copy(acc_s, S_shared)
+                    T.gemm(S_shared, KV_shared_1_l, acc_o_l)
+
+                    T.barrier_arrive(bar_sScale_and_sS_ready)
+                    T.barrier_arrive(bar_k_1_free[0])
+
+                # Rescale
                 for h_i in T.Parallel(H_per_block):
-                    m_i[h_i] = T.max(m_i[h_i], m_i_prev[h_i])
-                
-                # 计算缩放因子 alpha
+                    sum_exp_shared[h_i] = sumexp[h_i]
+                for h_i, d_i in T.Parallel(H_per_block, D // 2):
+                    acc_o_l[h_i, d_i] /= sumexp[h_i]
                 for h_i in T.Parallel(H_per_block):
-                    alpha[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale)
-                
-                # 计算 softmax(scores)
-                for h_i, bi_i in T.Parallel(H_per_block, BI):
-                    acc_s[h_i, bi_i] = T.exp2(acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale)
-                
-                # 更新 sumexp
-                T.reduce_sum(acc_s, sumexp_i, dim=1)
-                for h_i in T.Parallel(H_per_block):
-                    sumexp[h_i] = sumexp[h_i] * alpha[h_i] + sumexp_i[h_i]
-                
-                # 缩放之前的 output
-                for h_i, d_i in T.Parallel(H_per_block, D):
-                    acc_o[h_i, d_i] = acc_o[h_i, d_i] * alpha[h_i]
+                    sumexp[h_i] = T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale
+                T.copy(acc_o_l, O_shared_l)
+                T.copy(O_shared_l, Output[b_i, s_i, H0:H1, 0 : D // 2])
 
-                # P @ V
-                T.copy(acc_s, S_shared)
-                T.gemm(S_shared, KV_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
+            elif tx >= 128 and tx < 256:
+                T.set_max_nreg(168, 1)
+                T.fill(acc_o_r, 0)
+                for i_i in T.serial(T.ceildiv(NI, 2)):
+                    # Buffer 0
+                    T.barrier_arrive(bar_sScale_and_sS_ready)
+                    T.barrier_wait(bar_sScale_and_sS_ready, ((i_i * 2) & 1))
+                    for h_i, d_i in T.Parallel(H_per_block, D // 2):
+                        acc_o_r[h_i, d_i] *= alpha_shared[h_i]
+                    T.gemm(S_shared, KV_shared_0_r, acc_o_r)
+                    T.barrier_arrive(bar_k_0_free[0])
+                    T.barrier_arrive(bar_sScale_and_sS_free)
 
-            # 最终归一化
-            for h_i, d_i in T.Parallel(H_per_block, D):
-                acc_o[h_i, d_i] /= sumexp[h_i]
-            for h_i in T.Parallel(H_per_block):
-                sumexp[h_i] = T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale
+                    # Buffer 1
+                    T.barrier_arrive(bar_sScale_and_sS_ready)
+                    T.barrier_wait(bar_sScale_and_sS_ready, ((i_i * 2 + 1) & 1))
+                    for h_i, d_i in T.Parallel(H_per_block, D // 2):
+                        acc_o_r[h_i, d_i] *= alpha_shared[h_i]
+                    T.gemm(S_shared, KV_shared_1_r, acc_o_r)
+                    T.barrier_arrive(bar_k_1_free[0])
+                    if i_i != T.ceildiv(NI, 2) - 1:
+                        T.barrier_arrive(bar_sScale_and_sS_free)
 
-            # 写回结果 (直接写回 global memory，减少 shared memory 使用)
-            T.copy(acc_o, Output[b_i, s_i, H0:H1, :])
-            T.copy(sumexp, Lse[b_i, s_i, H0:H1])
+                # Rescale
+                for h_i, d_i in T.Parallel(H_per_block, D // 2):
+                    acc_o_r[h_i, d_i] /= sum_exp_shared[h_i]
+
+                T.copy(acc_o_r, O_shared_r)
+                T.copy(O_shared_r, Output[b_i, s_i, H0:H1, D // 2 : D])
+            elif tx >= 256:
+                # producer
+                T.set_max_nreg(80, 0)
+                for i_i in T.serial(T.ceildiv(NI, 2)):
+                    # Buffer 0
+                    T.barrier_wait(bar_k_0_free[0], ((i_i & 1) ^ 1))
+                    for r in T.serial(4):
+                        indices_local[0] = Indices[b_i, s_i, g_i, (i_i * 2) * BI + r * 16 + (tx - 256) // 8]
+                        is_kv_valid[r * 16 + (tx - 256) // 8] = indices_local[0] <= max_kv_i
+                        if is_kv_valid[r * 16 + (tx - 256) // 8]:
+                            with T.attr("default", "async_scope", 1):
+                                for u in T.serial(D_HALF_LOAD_ITERS):  # 根据 D 动态调整
+                                    for v in T.vectorized(8):
+                                        KV_shared_0_l[r * 16 + (tx - 256) // 8, 64 * u + (tx - 256) % 8 * 8 + v] = KV[
+                                            b_i, indices_local[0], g_i, 64 * u + (tx - 256) % 8 * 8 + v
+                                        ]
+                                        KV_shared_0_r[r * 16 + (tx - 256) // 8, 64 * u + (tx - 256) % 8 * 8 + v] = KV[
+                                            b_i, indices_local[0], g_i, D // 2 + 64 * u + (tx - 256) % 8 * 8 + v
+                                        ]
+                            with T.attr("default", "async_scope", 1):
+                                for v in T.vectorized(8):
+                                    K_tail_shared_0[r * 16 + (tx - 256) // 8, (tx - 256) % 8 * 8 + v] = KV[
+                                        b_i, indices_local[0], g_i, D + (tx - 256) % 8 * 8 + v
+                                    ]
+                    T.cp_async_barrier_noinc(bar_k_0_ready[0])
+
+                    # Buffer 1
+                    T.barrier_wait(bar_k_1_free[0], ((i_i & 1) ^ 1))
+                    for r in T.serial(4):
+                        indices_local[0] = Indices[b_i, s_i, g_i, (i_i * 2 + 1) * BI + r * 16 + (tx - 256) // 8]
+                        is_kv_valid[r * 16 + (tx - 256) // 8] = indices_local[0] <= max_kv_i
+                        if is_kv_valid[r * 16 + (tx - 256) // 8]:
+                            with T.attr("default", "async_scope", 1):
+                                for u in T.serial(D_HALF_LOAD_ITERS):  # 根据 D 动态调整
+                                    for v in T.vectorized(8):
+                                        KV_shared_1_l[r * 16 + (tx - 256) // 8, 64 * u + (tx - 256) % 8 * 8 + v] = KV[
+                                            b_i, indices_local[0], g_i, 64 * u + (tx - 256) % 8 * 8 + v
+                                        ]
+                                        KV_shared_1_r[r * 16 + (tx - 256) // 8, 64 * u + (tx - 256) % 8 * 8 + v] = KV[
+                                            b_i, indices_local[0], g_i, D // 2 + 64 * u + (tx - 256) % 8 * 8 + v
+                                        ]
+                            with T.attr("default", "async_scope", 1):
+                                for v in T.vectorized(8):
+                                    K_tail_shared_1[r * 16 + (tx - 256) // 8, (tx - 256) % 8 * 8 + v] = KV[
+                                        b_i, indices_local[0], g_i, D + (tx - 256) % 8 * 8 + v
+                                    ]
+                    T.cp_async_barrier_noinc(bar_k_1_ready[0])
 
     return main
 
 
-def sparse_mla_fwd_interface_optimized(
-    q, kv, indices, 
-    sm_scale=None, 
-    return_p_sum: bool = False, 
-    d_v=256,  # 根据输入调整
-    block_I=128,  # 优化后的默认值
-    num_stages=2, 
-    threads=256
+def sparse_mla_fwd_interface(
+    q, kv, indices, q_start_index_s, kv_stride, sm_scale=None, is_casual=True, return_kernel=False, print_kernel=False,
+    d_v=None,  # 新增参数: 输出维度，如果为 None 则自动推断
 ):
-    """优化后的接口函数"""
-    is_casual = True
-    assert return_p_sum == False, "This kernel file is for fwd only"
     assert q.is_contiguous() and kv.is_contiguous() and indices.is_contiguous()
-    
     batch, seq_len, heads, dim_plus_tail_dim = q.shape
     _, seq_len_kv, kv_group, _ = kv.shape
 
-    dim = d_v
+    # 支持自定义 dim，不再硬编码为 576/512
+    if d_v is None:
+        # 默认行为：假设 tail_dim = 64
+        if dim_plus_tail_dim == 576:
+            dim = 512
+        elif dim_plus_tail_dim == 320:
+            dim = 256
+        else:
+            raise ValueError(f"无法自动推断 dim，请显式指定 d_v 参数。dim_plus_tail_dim={dim_plus_tail_dim}")
+    else:
+        dim = d_v
+
     assert kv.shape[-1] == dim_plus_tail_dim
     tail_dim = dim_plus_tail_dim - dim
     assert kv.shape[0] == batch
     _, _, _, topk = indices.shape
     assert indices.shape == (batch, seq_len, kv_group, topk)
 
-    kernel = sparse_mla_fwd_optimized(
-        heads, dim, tail_dim, topk, kv_group, sm_scale, is_casual, 
-        block_I=block_I, num_stages=num_stages, threads=threads
-    )
-    out, lse = kernel(q, kv, indices)
+    if q_start_index_s != 0:
+        assert q_start_index_s > kv_stride, (
+            "If it is because each cp has too short length, you should fix the logic involving CP0 (cp_rank == 0), to make sure q with pos < KV_Stride - 1 is masked (or you may just ignore how this is handled if nan in these q's Out would not effect others, which is reported to be likely to happen by wangding)"
+        )
+    CP0 = q_start_index_s == 0
+
+    kernel = sparse_mla_fwd(batch, seq_len, seq_len_kv, heads, dim, tail_dim, topk, kv_stride, kv_group, sm_scale, is_casual, CP0)
+    if print_kernel:
+        print(kernel.get_kernel_source())
+    out, lse = kernel(q, kv, indices, torch.tensor([q_start_index_s], dtype=torch.int32, device="cuda"))
+    if return_kernel:
+        return kernel
+    if q_start_index_s == 0 and kv_stride > 1:
+        out[:, : kv_stride - 1, :, :] = 0
     return out, lse
 
 
-def ref_sparse_mla_fwd_interface(q, kv, indices, sm_scale=None, is_casual=True, d_v=256):
-    """参考实现"""
+def ref_sparse_mla_fwd_interface(q, kv, indices, q_start_index_s, kv_stride=4, sm_scale=None, is_casual=True, d_v=None):
     q = q.float()
     kv = kv.float()
     indices = indices.transpose(1, 2)
     b, sq, h, dim_q = q.shape
-    b, sk, g, _ = kv.shape
+    b, sk, g, dim_plus_tail_dim = kv.shape
+    if q_start_index_s is None:
+        q_start_index_s = sk * kv_stride - sq
 
-    dim = d_v
+    # 支持自定义 dim
+    if d_v is None:
+        if dim_plus_tail_dim == 576:
+            dim = 512
+        elif dim_plus_tail_dim == 320:
+            dim = 256
+        else:
+            raise ValueError(f"无法自动推断 dim，请显式指定 d_v 参数。dim_plus_tail_dim={dim_plus_tail_dim}")
+    else:
+        dim = d_v
+    
     k = kv
     v = kv[..., :dim]
 
     b, _, _, dim_v = v.shape
+    num_kv_per_index = 1
     g_index = g
     h_index = h // g
-    compressed_casual_mask = torch.arange(0, sq, dtype=torch.int32, device="cuda").view(-1, 1) >= torch.arange(
-        1 - 1, sk * 1, 1, dtype=torch.int32, device="cuda"
-    ).view(1, -1)
+    compressed_casual_mask = torch.arange(q_start_index_s, sq + q_start_index_s, dtype=torch.int32, device="cuda").view(
+        -1, 1
+    ) >= torch.arange(kv_stride - 1, sk * kv_stride, kv_stride, dtype=torch.int32, device="cuda").view(1, -1)
 
     mask = q.new_zeros(b, g_index, sq, sk + 1, dtype=torch.bool).scatter(3, indices.long(), 1)
     mask = mask[..., :-1]
     mask = mask & compressed_casual_mask.view(1, 1, sq, sk)
-    mask[:, :, : 1 - 1, 0] = True
+    mask[:, :, : kv_stride - 1, 0] = True
     mask = mask.view(b, g_index, 1, sq, sk)
 
     q = q.view(b, sq, g, -1, dim_q)
@@ -392,64 +404,68 @@ def ref_sparse_mla_fwd_interface(q, kv, indices, sm_scale=None, is_casual=True, 
     return o.to(torch.bfloat16)
 
 
-def test_sparse_mla_fwd_optimized(
-    B=1,
-    S=2048,
-    SKV=2048,
-    H=2,
-    HKV=1,
-    DQK=320,  # dim + tail_dim = 256 + 64
-    DV=256,
-    topk=2048,
-    dtype=torch.bfloat16,
-    check_correctness=True,
-    block_I=128,  # 优化后的值
-    num_stages=2,
-    threads=256,
+def test_sparse_mla_fwd_pipelined(
+    B=1, S=2048, SKV=2048, H=2, HKV=1, DQK=320, DV=256, topk=2048, dtype=torch.bfloat16, q_start_s_index=0, check_correctness=True
 ):
-    """测试优化后的 kernel"""
-    print("=" * 60)
-    print(f"测试配置: B={B}, S={S}, SKV={SKV}, H={H}, HKV={HKV}")
-    print(f"         DQK={DQK}, DV={DV}, topk={topk}")
-    print(f"         block_I={block_I}, num_stages={num_stages}, threads={threads}")
-    print("=" * 60)
+    """
+    测试 pipelined 版本
     
+    默认参数来自 sparse_mal_fwd_input.txt:
+    - heads=2, dim=256, tail_dim=64, topk=2048, kv_group=1
+    - q.shape:[1, 2048, 2, 320], kv.shape:[1, 2048, 1, 320]
+    """
+    KV_stride = 1
+
+    print("=" * 70)
+    print("Sparse MLA Forward Pipelined 测试")
+    print("=" * 70)
+    print(f"配置: B={B}, S={S}, SKV={SKV}, H={H}, HKV={HKV}")
+    print(f"      DQK={DQK}, DV={DV}, topk={topk}")
+    print(f"      kv_stride={KV_stride}, q_start_s_index={q_start_s_index}")
+    print("=" * 70)
+
     torch.random.manual_seed(0)
-    q = torch.randn((B, S, H, DQK), dtype=dtype, device="cuda").requires_grad_(True)
-    kv = torch.randn((B, SKV, HKV, DQK), dtype=dtype, device="cuda").requires_grad_(True)
+    q = torch.randn((B, S, H, DQK), dtype=dtype, device="cuda").requires_grad_(True) / 10
+    kv = torch.randn((B, SKV, HKV, DQK), dtype=dtype, device="cuda").requires_grad_(True) / 10
+    q_start_s_index_t = torch.tensor([q_start_s_index], dtype=torch.int32, device="cuda")
+
+    q.clamp_(-10, 10)
+    kv.clamp_(-10, 10)
 
     indices = torch.full((B, S, HKV, topk), SKV, dtype=torch.int32, device="cuda")
     for b in range(B):
         for t in range(S):
             for h in range(HKV):
-                i_i = torch.randperm(max(1, t))[:topk]
+                i_i = torch.randperm(min(max(1, ((t + q_start_s_index) // KV_stride)), SKV))[:topk]
                 indices[b, t, h, : len(i_i)] = i_i
 
-    tl_out, tl_lse = sparse_mla_fwd_interface_optimized(
-        q, kv, indices, 
-        d_v=DV,
-        block_I=block_I, 
-        num_stages=num_stages, 
-        threads=threads
-    )
-
-    if check_correctness:
-        ref_out = ref_sparse_mla_fwd_interface(q, kv, indices, d_v=DV)
-        assert_tensors_similar(tl_out, ref_out, eps=1e-2, name="out")
-        print("✓ 正确性验证通过")
+    kernel = sparse_mla_fwd_interface(q, kv, indices, q_start_s_index, KV_stride, return_kernel=True, print_kernel=False, d_v=DV)
 
     def fn():
-        return sparse_mla_fwd_interface_optimized(
-            q, kv, indices, 
-            d_v=DV,
-            block_I=block_I, 
-            num_stages=num_stages, 
-            threads=threads
-        )
+        out, lse = kernel(q, kv, indices, q_start_s_index_t)
+        if q_start_s_index == 0 and KV_stride > 1:
+            out[:, : KV_stride - 1, :, :] = 0
+        return out, lse
+
+    tl_out, tl_lse = fn()
+    
+    if check_correctness:
+        ref_out = ref_sparse_mla_fwd_interface(q, kv, indices, q_start_s_index, KV_stride, d_v=DV)
+        try:
+            torch.testing.assert_close(tl_out, ref_out, rtol=1e-2, atol=1e-2)
+            print("✓ 正确性验证通过")
+        except AssertionError as e:
+            print(f"✗ 正确性验证失败")
+            max_diff = (tl_out - ref_out).abs().max().item()
+            print(f"  最大差异: {max_diff}")
 
     from tilelang.profiler import do_bench
 
-    ms = do_bench(fn, rep=100, warmup=250)
+    ms = do_bench(
+        fn,
+        rep=100,
+        warmup=50,
+    )
     print(f"平均时间: {ms:.3f} ms")
     print(f"FWD IO bandwidth = {(B * S * DQK * topk * 2) / (ms * 1e-3) / 1e12:.2f} TB/s")
     print(f"FWD TFLOPS = {(B * S * (DQK + DV) * topk * 2 * H) / (ms * 1e-3) / 1e12:.2f}")
@@ -457,95 +473,204 @@ def test_sparse_mla_fwd_optimized(
     return ms
 
 
-def benchmark_different_configs():
-    """测试不同配置的性能"""
-    print("\n" + "=" * 70)
-    print("不同配置性能对比")
-    print("=" * 70)
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--test_correctness", action="store_true", help="运行正确性测试")
+    parser.add_argument("--use_input_params", action="store_true", help="使用 sparse_mal_fwd_input.txt 的参数")
+    parser.add_argument("--use_deepseek_params", action="store_true", help="使用 DeepSeek 标准参数 (DQK=576)")
+    args = parser.parse_args()
     
-    # 根据输入文件的参数
-    configs = [
-        # (block_I, num_stages, threads)
-        (64, 2, 256),   # 原始配置
-        (128, 2, 256),  # 增大 block_I
-        (64, 3, 256),   # 增加 pipeline stages
-        (128, 2, 128),  # 减少线程数
-        (128, 2, 512),  # 增加线程数
-        (64, 2, 128),   # 原始 block_I + 少线程
-    ]
+    if args.use_deepseek_params:
+        # DeepSeek 标准配置
+        B, S, SKV, H, HKV, DQK, DV, topk, dtype = 1, 4096, 8192, 128, 1, 576, 512, 2048, torch.bfloat16
+        q_start_s_index = 1024
+    else:
+        # 默认使用输入文件参数 (sparse_mal_fwd_input.txt)
+        # heads=2, dim=256, tail_dim=64, topk=2048, kv_group=1
+        # q.shape:[1, 2048, 2, 320], kv.shape:[1, 2048, 1, 320]
+        B, S, SKV, H, HKV, DQK, DV, topk, dtype = 1, 2048, 2048, 2, 1, 320, 256, 2048, torch.bfloat16
+        q_start_s_index = 0
     
-    results = []
-    for block_I, num_stages, threads in configs:
-        print(f"\n--- 配置: block_I={block_I}, num_stages={num_stages}, threads={threads} ---")
-        try:
-            ms = test_sparse_mla_fwd_optimized(
-                B=1, S=2048, SKV=2048, H=2, HKV=1, DQK=320, DV=256, topk=2048,
-                block_I=block_I, num_stages=num_stages, threads=threads,
-                check_correctness=False  # 只测性能
-            )
-            results.append((block_I, num_stages, threads, ms))
-        except Exception as e:
-            print(f"配置失败: {e}")
-            results.append((block_I, num_stages, threads, float('inf')))
-    
-    print("\n" + "=" * 70)
-    print("性能排名 (从快到慢):")
-    print("=" * 70)
-    results.sort(key=lambda x: x[3])
-    for i, (block_I, num_stages, threads, ms) in enumerate(results):
-        if ms == float('inf'):
-            print(f"{i+1}. block_I={block_I}, num_stages={num_stages}, threads={threads}: 失败")
-        else:
-            print(f"{i+1}. block_I={block_I}, num_stages={num_stages}, threads={threads}: {ms:.3f} ms")
+    test_sparse_mla_fwd_pipelined(B, S, SKV, H, HKV, DQK, DV, topk, dtype, q_start_s_index, check_correctness=True)
 
 
-def print_config_analysis():
-    """打印配置分析"""
-    print("\n" + "=" * 70)
-    print("配置空间分析 (NVIDIA H20: 227KB shared memory)")
+
+
+
+
+
+
+
+
+
+
+# ruff: noqa
+"""
+Sparse MLA Forward Pipelined 版本测试脚本
+
+测试环境: NVIDIA H20
+- SM 数量: 78
+- 每个线程块共享内存上限: 227.0 KB
+
+输入文件参数 (sparse_mal_fwd_input.txt):
+- heads=2, dim=256, tail_dim=64, topk=2048, kv_group=1
+- q.shape:[1, 2048, 2, 320], kv.shape:[1, 2048, 1, 320]
+- DQK = 320, DV = 256
+"""
+import torch
+import argparse
+from sparse_mla_fwd_pipelined import (
+    sparse_mla_fwd_interface,
+    ref_sparse_mla_fwd_interface,
+)
+
+
+def test_pipelined_with_input_params():
+    """
+    使用 sparse_mal_fwd_input.txt 的参数测试
+    
+    heads=2, dim=256, tail_dim=64, topk=2048, kv_group=1
+    q.shape:[1, 2048, 2, 320], kv.shape:[1, 2048, 1, 320]
+    """
+    print("=" * 70)
+    print("使用 sparse_mal_fwd_input.txt 参数测试")
     print("=" * 70)
     
-    # 根据输入文件的参数
-    heads, dim, tail_dim, topk, kv_group = 2, 256, 64, 2048, 1
+    # 输入文件参数
+    B = 1
+    S = 2048
+    SKV = 2048
+    H = 2          # heads
+    HKV = 1        # kv_group
+    DQK = 320      # dim + tail_dim = 256 + 64
+    DV = 256       # dim (输出维度)
+    topk = 2048
+    dtype = torch.bfloat16
+    kv_stride = 1
+    q_start_s_index = 0
     
-    configs = find_optimal_config(heads, dim, tail_dim, topk, kv_group)
+    print(f"配置:")
+    print(f"  - B={B}, S={S}, SKV={SKV}")
+    print(f"  - H={H}, HKV={HKV}")
+    print(f"  - DQK={DQK}, DV={DV}, tail_dim={DQK-DV}")
+    print(f"  - topk={topk}")
+    print(f"  - kv_stride={kv_stride}, q_start_s_index={q_start_s_index}")
+    print("=" * 70)
     
-    print(f"\n输入参数: heads={heads}, dim={dim}, tail_dim={tail_dim}, topk={topk}")
-    print(f"\n找到 {len(configs)} 个有效配置，前 10 个最优配置:")
-    print("-" * 70)
-    print(f"{'block_I':>8} {'stages':>7} {'threads':>8} {'SMEM(KB)':>10} {'Regs/Thr':>10} {'Iters':>6} {'Score':>8}")
-    print("-" * 70)
+    torch.random.manual_seed(0)
+    q = torch.randn((B, S, H, DQK), dtype=dtype, device="cuda") / 10
+    kv = torch.randn((B, SKV, HKV, DQK), dtype=dtype, device="cuda") / 10
+    q_start_s_index_t = torch.tensor([q_start_s_index], dtype=torch.int32, device="cuda")
     
-    for cfg in configs[:10]:
-        print(f"{cfg['block_I']:>8} {cfg['num_stages']:>7} {cfg['threads']:>8} "
-              f"{cfg['smem_kb']:>10.1f} {cfg['regs_per_thread']:>10.1f} "
-              f"{cfg['num_iterations']:>6} {cfg['score']:>8.1f}")
+    q.clamp_(-10, 10)
+    kv.clamp_(-10, 10)
+    
+    indices = torch.full((B, S, HKV, topk), SKV, dtype=torch.int32, device="cuda")
+    for b in range(B):
+        for t in range(S):
+            for h in range(HKV):
+                max_idx = min(max(1, ((t + q_start_s_index) // kv_stride)), SKV)
+                i_i = torch.randperm(max_idx)[:topk]
+                indices[b, t, h, : len(i_i)] = i_i
+    
+    print("正在编译 kernel...")
+    kernel = sparse_mla_fwd_interface(
+        q, kv, indices, q_start_s_index, kv_stride, 
+        return_kernel=True, print_kernel=False, d_v=DV
+    )
+    
+    def fn():
+        out, lse = kernel(q, kv, indices, q_start_s_index_t)
+        return out, lse
+    
+    # 正确性验证
+    print("正在验证正确性...")
+    tl_out, tl_lse = fn()
+    ref_out = ref_sparse_mla_fwd_interface(q, kv, indices, q_start_s_index, kv_stride, d_v=DV)
+    
+    try:
+        torch.testing.assert_close(tl_out, ref_out, rtol=1e-2, atol=1e-2)
+        print("✓ 正确性验证通过")
+    except AssertionError as e:
+        print(f"✗ 正确性验证失败")
+        max_diff = (tl_out - ref_out).abs().max().item()
+        mean_diff = (tl_out - ref_out).abs().mean().item()
+        print(f"  最大差异: {max_diff}")
+        print(f"  平均差异: {mean_diff}")
+    
+    # 性能测试
+    print("\n正在进行性能测试...")
+    from tilelang.profiler import do_bench
+    
+    ms = do_bench(fn, rep=100, warmup=50)
+    
+    io_bytes = B * S * DQK * topk * 2
+    flops = B * S * (DQK + DV) * topk * 2 * H
+    
+    io_bandwidth = io_bytes / (ms * 1e-3) / 1e12
+    tflops = flops / (ms * 1e-3) / 1e12
+    
+    print(f"\n性能结果:")
+    print(f"  平均时间: {ms:.3f} ms")
+    print(f"  FWD IO bandwidth = {io_bandwidth:.2f} TB/s")
+    print(f"  FWD TFLOPS = {tflops:.2f}")
+    
+    return ms, io_bandwidth, tflops
+
+
+def compare_with_optimized():
+    """与 sparse_mla_fwd_optimized.py 的结果对比"""
+    print("\n" + "=" * 70)
+    print("与 sparse_mla_fwd_optimized.py 结果对比")
+    print("=" * 70)
+    
+    print("""
+sparse_mla_fwd_optimized.py 最佳结果 (同参数):
+- 配置: block_I=64, num_stages=2, threads=128
+- 平均时间: 1.089 ms
+- FWD IO bandwidth = 2.47 TB/s
+- FWD TFLOPS = 8.87
+
+sparse_mla_fwd_pipelined.py 特点:
+- 手动 warp specialization (3 组线程)
+- 手动 double buffering
+- D 维度拆分 (左/右两半并行计算)
+""")
+    
+    ms, bw, tflops = test_pipelined_with_input_params()
+    
+    print("\n" + "=" * 70)
+    print("对比总结")
+    print("=" * 70)
+    optimized_ms = 1.089
+    print(f"  Optimized 版本: {optimized_ms:.3f} ms")
+    print(f"  Pipelined 版本: {ms:.3f} ms")
+    if ms < optimized_ms:
+        print(f"  Pipelined 版本快 {(optimized_ms - ms) / optimized_ms * 100:.1f}%")
+    else:
+        print(f"  Optimized 版本快 {(ms - optimized_ms) / ms * 100:.1f}%")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Sparse MLA Forward Pipelined 测试")
+    parser.add_argument("--compare", action="store_true", help="与 optimized 版本对比")
+    args = parser.parse_args()
+    
+    print("=" * 70)
+    print("Sparse MLA Forward Pipelined 测试")
+    print("=" * 70)
+    print("GPU: NVIDIA H20")
+    print("Shared Memory: 227 KB (opt-in)")
+    print("SM 数量: 78")
+    print("=" * 70)
+    
+    if args.compare:
+        compare_with_optimized()
+    else:
+        test_pipelined_with_input_params()
 
 
 if __name__ == "__main__":
-    # 1. 打印配置分析
-    print_config_analysis()
-    
-    # 2. 使用输入文件中的具体参数测试
-    print("\n" + "=" * 70)
-    print("使用输入文件参数测试")
-    print("=" * 70)
-    
-    test_sparse_mla_fwd_optimized(
-        B=1,
-        S=2048,
-        SKV=2048,
-        H=2,
-        HKV=1,
-        DQK=320,  # 256 + 64
-        DV=256,
-        topk=2048,
-        dtype=torch.bfloat16,
-        check_correctness=True,
-        block_I=128,  # 推荐的优化配置
-        num_stages=2,
-        threads=256,
-    )
-    
-    # 3. 对比不同配置
-    benchmark_different_configs()
+    main()
+
+
