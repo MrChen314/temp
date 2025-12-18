@@ -161,25 +161,25 @@ def sparse_mla_fwd_baseline(
 
 
 # ============================================================================
-# 优化6: Warp Specialization（高级）
-# 将线程分为三组：Producer（加载数据）、Consumer1（Q@K+softmax）、Consumer2（P@V）
+# 优化7: 批量处理 query - 将多个 seq position 的 Q 合并计算
+# 
+# 原理说明:
+# - 当前配置 H=2, 必须 pad 到 H_per_block=16, 浪费 87.5%
+# - 优化思路: 将 S_per_block=8 个 seq position 的 Q 合并
+# - 合并后 GEMM 维度: [8*2, D] @ [BI, D]^T = [16, BI]，正好填满，无浪费
+# 
+# 约束:
+# - 需要 seq_len 是 S_per_block 的倍数
+# - 相邻 seq positions 共享同一套 indices（使用最后一个的 indices）
 # ============================================================================
 @tilelang.jit(
     out_idx=[-2, -1],
-    compile_flags=[
-        "-O3",
-        "-Wno-deprecated-declarations",
-        "-U__CUDA_NO_HALF_OPERATORS__",
-        "-U__CUDA_NO_HALF_CONVERSIONS__",
-        "-U__CUDA_NO_HALF2_OPERATORS__",
-        "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-        "--expt-relaxed-constexpr",
-        "--expt-extended-lambda",
-        "--ptxas-options=-v,--register-usage-level=10",
-        "-DNDEBUG",
-    ],
+    pass_configs={
+        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+    },
 )
-def sparse_mla_fwd_warp_specialized(
+def sparse_mla_fwd_batched_query(
     heads,
     dim,
     tail_dim,
@@ -188,16 +188,19 @@ def sparse_mla_fwd_warp_specialized(
     sm_scale=None,
     is_causal=True,
     block_I=64,
-    num_stages=1,  # 这里 num_stages 不再使用，因为我们手动实现流水线
-    threads=384,   # 384线程: 128 (consumer1) + 128 (consumer2) + 128 (producer)
+    num_stages=1,
+    threads=128,
+    S_per_block=8,  # 每个 block 处理的 seq position 数量
 ):
     """
-    优化6: Warp Specialization
-    - Producer (tx >= 256): 负责加载 KV 数据
-    - Consumer 1 (tx < 128): 负责 Q@K + softmax + P@V_left
-    - Consumer 2 (128 <= tx < 256): 负责 P@V_right
+    优化7: 批量处理 query
     
-    通过 barrier 协调，实现计算与数据加载的重叠
+    将 S_per_block 个相邻 seq position 的 Q 合并计算:
+    - 原始: GEMM [H_per_block, D] @ [BI, D]^T, H_per_block=16 但实际 H=2
+    - 优化: GEMM [S_per_block * H, D] @ [BI, D]^T, 8*2=16 正好填满
+    
+    每个 seq position 有独立的 mask (基于各自的 max_kv_i)
+    共享同一套 indices (使用 block 内最后一个 seq position 的 indices)
     """
     assert dim == tilelang.math.next_power_of_2(dim)
     assert tail_dim == tilelang.math.next_power_of_2(tail_dim)
@@ -224,18 +227,17 @@ def sparse_mla_fwd_warp_specialized(
     accum_dtype = T.float32
 
     H = head_kv
-    padded_H = max(tilelang.math.next_power_of_2(head_kv), 16)
     BI = block_I
     NI = tilelang.cdiv(topk, block_I)
     D = dim
     D_tail = tail_dim
-
-    REPLICATE_H = head_kv // 64 if head_kv > 64 else 1
-    H_per_block = padded_H if REPLICATE_H == 1 else 64
     
-    # Producer 线程加载循环次数
-    D_HALF_LOAD_ITERS = D // 128
-    assert D // 2 == D_HALF_LOAD_ITERS * 64, f"D/2 必须是 64 的倍数, D={D}"
+    # 计算合并后的维度
+    # 将 S_per_block 个 seq position 的 H 个 head 合并
+    # 例如: S_per_block=8, H=2 -> merged_H = 16
+    merged_H = S_per_block * H
+    # 确保 merged_H >= 16 以满足 GEMM 要求
+    padded_merged_H = max(tilelang.math.next_power_of_2(merged_H), 16)
 
     @T.prim_func
     def main(
@@ -245,230 +247,131 @@ def sparse_mla_fwd_warp_specialized(
         Output: T.Tensor(o_shape, dtype),
         Lse: T.Tensor(lse_shape, accum_dtype),
     ):
-        with T.Kernel(seq_len * REPLICATE_H, batch, kv_group, threads=threads) as (bx, by, bz):
-            # Q 相关 shared memory
-            Q_shared_l = T.alloc_shared([H_per_block, D // 2], dtype)
-            Q_shared_r = T.alloc_shared([H_per_block, D // 2], dtype)
-            Q_tail_shared = T.alloc_shared([H_per_block, D_tail], dtype)
+        # Grid: (seq_len / S_per_block, batch, kv_group)
+        with T.Kernel(T.ceildiv(seq_len, S_per_block), batch, kv_group, threads=threads) as (bx, by, bz):
+            # Q shared memory: [S_per_block * H, D] (合并多个 seq position)
+            Q_shared = T.alloc_shared([padded_merged_H, D], dtype)
+            Q_tail_shared = T.alloc_shared([padded_merged_H, D_tail], dtype)
+            KV_shared = T.alloc_shared([BI, D], dtype)
+            K_tail_shared = T.alloc_shared([BI, D_tail], dtype)
+            O_shared = T.alloc_shared([padded_merged_H, D], dtype)
+            Lse_shared = T.alloc_shared([padded_merged_H], accum_dtype)
             
-            # KV 双缓冲
-            KV_shared_0_l = T.alloc_shared([BI, D // 2], dtype)
-            KV_shared_0_r = T.alloc_shared([BI, D // 2], dtype)
-            KV_shared_1_l = T.alloc_shared([BI, D // 2], dtype)
-            KV_shared_1_r = T.alloc_shared([BI, D // 2], dtype)
-            K_tail_shared_0 = T.alloc_shared([BI, D_tail], dtype)
-            K_tail_shared_1 = T.alloc_shared([BI, D_tail], dtype)
+            # mask 现在是 2D: 每个 seq position 有自己的 mask
+            # mask[s, bi] 表示第 s 个 seq position 对第 bi 个 KV 是否有效
+            mask = T.alloc_shared([S_per_block, BI], "bool")
             
-            # O 复用 Q 的 shared memory
-            O_shared_l = Q_shared_l
-            O_shared_r = Q_shared_r
-            
-            # KV 有效性标记
-            is_kv_valid = T.alloc_shared([BI], "bool", scope="shared")
-            
-            # Consumer 1 相关
-            acc_o_l = T.alloc_fragment([H_per_block, D // 2], accum_dtype)
-            acc_o_r = T.alloc_fragment([H_per_block, D // 2], accum_dtype)
-            acc_s = T.alloc_fragment([H_per_block, BI], accum_dtype)
-            S_shared = T.alloc_shared([H_per_block, BI], dtype)
-            sumexp = T.alloc_fragment([H_per_block], accum_dtype)
-            sum_exp_shared = T.alloc_shared([H_per_block], accum_dtype)
-            sumexp_i = T.alloc_fragment([H_per_block], accum_dtype)
-            alpha_shared = T.alloc_shared([H_per_block], accum_dtype, scope="shared")
-            alpha_local = T.alloc_fragment([H_per_block], accum_dtype)
-            m_i = T.alloc_fragment([H_per_block], accum_dtype)
-            m_i_prev = T.alloc_fragment([H_per_block], accum_dtype)
-            indices_local = T.alloc_local([1], indices_dtype)
-            
-            # Barriers for synchronization
-            bar_q = T.alloc_barrier(arrive_count=384)
-            bar_k_0_ready = T.alloc_barrier(arrive_count=128)
-            bar_k_1_ready = T.alloc_barrier(arrive_count=128)
-            bar_k_0_free = T.alloc_barrier(arrive_count=256)
-            bar_k_1_free = T.alloc_barrier(arrive_count=256)
-            bar_sScale_and_sS_ready = T.alloc_barrier(arrive_count=256)
-            bar_sScale_and_sS_free = T.alloc_barrier(arrive_count=256)
+            # 每个 seq position 的 max_kv_i
+            max_kv_indices = T.alloc_shared([S_per_block], indices_dtype)
+
+            acc_o = T.alloc_fragment([padded_merged_H, D], accum_dtype)
+            acc_s = T.alloc_fragment([padded_merged_H, BI], accum_dtype)
+            S_shared = T.alloc_shared([padded_merged_H, BI], dtype)
+            sumexp = T.alloc_fragment([padded_merged_H], accum_dtype)
+            sumexp_i = T.alloc_fragment([padded_merged_H], accum_dtype)
+            alpha = T.alloc_fragment([padded_merged_H], accum_dtype)
+            m_i = T.alloc_fragment([padded_merged_H], accum_dtype)
+            m_i_prev = T.alloc_fragment([padded_merged_H], accum_dtype)
+
+            T.fill(acc_o, 0)
+            T.fill(sumexp, 0)
+            T.fill(m_i, -(2**30))
 
             b_i, g_i = by, bz
-            s_i = bx if REPLICATE_H == 1 else (bx // REPLICATE_H)
-            q_i = s_i
-            max_kv_i = q_i
+            # block 起始的 seq position
+            s_base = bx * S_per_block
+            # 使用 block 内最后一个有效 seq position 的 indices
+            s_for_indices = T.min(s_base + S_per_block - 1, seq_len - 1)
 
-            H0 = g_i * padded_H + (0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * 64)
-            H1 = H0 + H_per_block
-
-            tx = T.get_thread_binding()
-
-            # 所有线程加载 Q
-            T.copy(Q[b_i, s_i, H0:H1, 0 : D // 2], Q_shared_l)
-            T.copy(Q[b_i, s_i, H0:H1, D // 2 : D], Q_shared_r)
-            T.copy(Q[b_i, s_i, H0:H1, D:], Q_tail_shared)
-            T.barrier_arrive(bar_q)
-
-            # ========== Consumer 1: Q@K + softmax + P@V_left ==========
-            if tx < 128:
-                T.set_max_nreg(240, 1)
-                T.fill(sumexp, 0)
-                T.fill(m_i, -(2**30))
-                T.fill(acc_o_l, 0)
-                T.barrier_wait(bar_q, 0)
-
-                for i_i in T.serial(T.ceildiv(NI, 2)):
-                    # Buffer 0
-                    T.barrier_wait(bar_k_0_ready[0], (i_i & 1))
-
-                    for h_i, bi_i in T.Parallel(H_per_block, BI):
-                        acc_s[h_i, bi_i] = T.if_then_else(is_kv_valid[bi_i], 0, -T.infinity(acc_s.dtype))
-                    T.gemm(Q_shared_l, KV_shared_0_l, acc_s, transpose_B=True, wg_wait=-1)
-                    T.gemm(Q_shared_r, KV_shared_0_r, acc_s, transpose_B=True, wg_wait=-1)
-                    T.gemm(Q_tail_shared, K_tail_shared_0, acc_s, transpose_B=True, wg_wait=-1)
-                    T.wait_wgmma(0)
-
-                    if i_i != 0:
-                        T.barrier_arrive(bar_sScale_and_sS_free)
-                        T.barrier_wait(bar_sScale_and_sS_free, ((i_i * 2) & 1) ^ 1)
-
-                    T.copy(m_i, m_i_prev)
-                    T.reduce_max(acc_s, m_i, dim=1, clear=False)
-                    for h_i in T.Parallel(H_per_block):
-                        m_i[h_i] = T.max(m_i[h_i], m_i_prev[h_i])
-                    for h_i in T.Parallel(H_per_block):
-                        alpha_local[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale)
-                    for h_i, bi_i in T.Parallel(H_per_block, BI):
-                        acc_s[h_i, bi_i] = T.exp2(acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale)
-                    T.reduce_sum(acc_s, sumexp_i, dim=1)
-                    for h_i in T.Parallel(H_per_block):
-                        sumexp[h_i] = sumexp[h_i] * alpha_local[h_i] + sumexp_i[h_i]
-                    for h_i, d_i in T.Parallel(H_per_block, D // 2):
-                        acc_o_l[h_i, d_i] *= alpha_local[h_i]
-                    T.copy(alpha_local, alpha_shared)
-                    T.copy(acc_s, S_shared)
-                    T.gemm(S_shared, KV_shared_0_l, acc_o_l)
-
-                    T.barrier_arrive(bar_sScale_and_sS_ready)
-                    T.barrier_arrive(bar_k_0_free[0])
-
-                    # Buffer 1
-                    T.barrier_wait(bar_k_1_ready[0], (i_i & 1))
-
-                    for h_i, bi_i in T.Parallel(H_per_block, BI):
-                        acc_s[h_i, bi_i] = T.if_then_else(is_kv_valid[bi_i], 0, -T.infinity(acc_s.dtype))
-                    T.gemm(Q_shared_l, KV_shared_1_l, acc_s, transpose_B=True, wg_wait=-1)
-                    T.gemm(Q_shared_r, KV_shared_1_r, acc_s, transpose_B=True, wg_wait=-1)
-                    T.gemm(Q_tail_shared, K_tail_shared_1, acc_s, transpose_B=True, wg_wait=-1)
-                    T.wait_wgmma(0)
-
-                    T.barrier_arrive(bar_sScale_and_sS_free)
-                    T.barrier_wait(bar_sScale_and_sS_free, ((i_i * 2 + 1) & 1) ^ 1)
-
-                    T.copy(m_i, m_i_prev)
-                    T.reduce_max(acc_s, m_i, dim=1, clear=False)
-                    for h_i in T.Parallel(H_per_block):
-                        m_i[h_i] = T.max(m_i[h_i], m_i_prev[h_i])
-                    for h_i in T.Parallel(H_per_block):
-                        alpha_local[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale)
-                    for h_i, bi_i in T.Parallel(H_per_block, BI):
-                        acc_s[h_i, bi_i] = T.exp2(acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale)
-                    T.reduce_sum(acc_s, sumexp_i, dim=1)
-                    for h_i in T.Parallel(H_per_block):
-                        sumexp[h_i] = sumexp[h_i] * alpha_local[h_i] + sumexp_i[h_i]
-                    for h_i, d_i in T.Parallel(H_per_block, D // 2):
-                        acc_o_l[h_i, d_i] *= alpha_local[h_i]
-                    T.copy(alpha_local, alpha_shared)
-                    T.copy(acc_s, S_shared)
-                    T.gemm(S_shared, KV_shared_1_l, acc_o_l)
-
-                    T.barrier_arrive(bar_sScale_and_sS_ready)
-                    T.barrier_arrive(bar_k_1_free[0])
-
-                # Rescale
-                for h_i in T.Parallel(H_per_block):
-                    sum_exp_shared[h_i] = sumexp[h_i]
-                for h_i, d_i in T.Parallel(H_per_block, D // 2):
-                    acc_o_l[h_i, d_i] /= sumexp[h_i]
-                for h_i in T.Parallel(H_per_block):
-                    sumexp[h_i] = T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale
-                T.copy(acc_o_l, O_shared_l)
-                T.copy(O_shared_l, Output[b_i, s_i, H0:H1, 0 : D // 2])
-
-            # ========== Consumer 2: P@V_right ==========
-            elif tx >= 128 and tx < 256:
-                T.set_max_nreg(168, 1)
-                T.fill(acc_o_r, 0)
-                for i_i in T.serial(T.ceildiv(NI, 2)):
-                    # Buffer 0
-                    T.barrier_arrive(bar_sScale_and_sS_ready)
-                    T.barrier_wait(bar_sScale_and_sS_ready, ((i_i * 2) & 1))
-                    for h_i, d_i in T.Parallel(H_per_block, D // 2):
-                        acc_o_r[h_i, d_i] *= alpha_shared[h_i]
-                    T.gemm(S_shared, KV_shared_0_r, acc_o_r)
-                    T.barrier_arrive(bar_k_0_free[0])
-                    T.barrier_arrive(bar_sScale_and_sS_free)
-
-                    # Buffer 1
-                    T.barrier_arrive(bar_sScale_and_sS_ready)
-                    T.barrier_wait(bar_sScale_and_sS_ready, ((i_i * 2 + 1) & 1))
-                    for h_i, d_i in T.Parallel(H_per_block, D // 2):
-                        acc_o_r[h_i, d_i] *= alpha_shared[h_i]
-                    T.gemm(S_shared, KV_shared_1_r, acc_o_r)
-                    T.barrier_arrive(bar_k_1_free[0])
-                    if i_i != T.ceildiv(NI, 2) - 1:
-                        T.barrier_arrive(bar_sScale_and_sS_free)
-
-                # Rescale
-                for h_i, d_i in T.Parallel(H_per_block, D // 2):
-                    acc_o_r[h_i, d_i] /= sum_exp_shared[h_i]
-
-                T.copy(acc_o_r, O_shared_r)
-                T.copy(O_shared_r, Output[b_i, s_i, H0:H1, D // 2 : D])
+            # 加载多个 seq position 的 Q 到 shared memory
+            # Q_shared 布局: [s0_h0, s0_h1, s1_h0, s1_h1, ..., s7_h0, s7_h1, padding...]
+            for s_offset in T.serial(S_per_block):
+                s_i = s_base + s_offset
+                # 计算该 seq position 在 Q_shared 中的起始位置
+                h_offset = s_offset * H
+                # 设置 max_kv_i (causal mask)
+                max_kv_indices[s_offset] = s_i
                 
-            # ========== Producer: 加载 KV 数据 ==========
-            elif tx >= 256:
-                T.set_max_nreg(80, 0)
-                for i_i in T.serial(T.ceildiv(NI, 2)):
-                    # Buffer 0
-                    T.barrier_wait(bar_k_0_free[0], ((i_i & 1) ^ 1))
-                    for r in T.serial(4):
-                        indices_local[0] = Indices[b_i, s_i, g_i, (i_i * 2) * BI + r * 16 + (tx - 256) // 8]
-                        is_kv_valid[r * 16 + (tx - 256) // 8] = indices_local[0] <= max_kv_i
-                        if is_kv_valid[r * 16 + (tx - 256) // 8]:
-                            with T.attr("default", "async_scope", 1):
-                                for u in T.serial(D_HALF_LOAD_ITERS):
-                                    for v in T.vectorized(8):
-                                        KV_shared_0_l[r * 16 + (tx - 256) // 8, 64 * u + (tx - 256) % 8 * 8 + v] = KV[
-                                            b_i, indices_local[0], g_i, 64 * u + (tx - 256) % 8 * 8 + v
-                                        ]
-                                        KV_shared_0_r[r * 16 + (tx - 256) // 8, 64 * u + (tx - 256) % 8 * 8 + v] = KV[
-                                            b_i, indices_local[0], g_i, D // 2 + 64 * u + (tx - 256) % 8 * 8 + v
-                                        ]
-                            with T.attr("default", "async_scope", 1):
-                                for v in T.vectorized(8):
-                                    K_tail_shared_0[r * 16 + (tx - 256) // 8, (tx - 256) % 8 * 8 + v] = KV[
-                                        b_i, indices_local[0], g_i, D + (tx - 256) % 8 * 8 + v
-                                    ]
-                    T.cp_async_barrier_noinc(bar_k_0_ready[0])
+                # 加载 Q (只有有效的 seq position)
+                for h_i in T.serial(H):
+                    for d_i in T.Parallel(D):
+                        Q_shared[h_offset + h_i, d_i] = T.if_then_else(
+                            s_i < seq_len,
+                            Q[b_i, s_i, g_i * H + h_i, d_i],
+                            T.cast(0, dtype)
+                        )
+                    for d_i in T.Parallel(D_tail):
+                        Q_tail_shared[h_offset + h_i, d_i] = T.if_then_else(
+                            s_i < seq_len,
+                            Q[b_i, s_i, g_i * H + h_i, D + d_i],
+                            T.cast(0, dtype)
+                        )
 
-                    # Buffer 1
-                    T.barrier_wait(bar_k_1_free[0], ((i_i & 1) ^ 1))
-                    for r in T.serial(4):
-                        indices_local[0] = Indices[b_i, s_i, g_i, (i_i * 2 + 1) * BI + r * 16 + (tx - 256) // 8]
-                        is_kv_valid[r * 16 + (tx - 256) // 8] = indices_local[0] <= max_kv_i
-                        if is_kv_valid[r * 16 + (tx - 256) // 8]:
-                            with T.attr("default", "async_scope", 1):
-                                for u in T.serial(D_HALF_LOAD_ITERS):
-                                    for v in T.vectorized(8):
-                                        KV_shared_1_l[r * 16 + (tx - 256) // 8, 64 * u + (tx - 256) % 8 * 8 + v] = KV[
-                                            b_i, indices_local[0], g_i, 64 * u + (tx - 256) % 8 * 8 + v
-                                        ]
-                                        KV_shared_1_r[r * 16 + (tx - 256) // 8, 64 * u + (tx - 256) % 8 * 8 + v] = KV[
-                                            b_i, indices_local[0], g_i, D // 2 + 64 * u + (tx - 256) % 8 * 8 + v
-                                        ]
-                            with T.attr("default", "async_scope", 1):
-                                for v in T.vectorized(8):
-                                    K_tail_shared_1[r * 16 + (tx - 256) // 8, (tx - 256) % 8 * 8 + v] = KV[
-                                        b_i, indices_local[0], g_i, D + (tx - 256) % 8 * 8 + v
-                                    ]
-                    T.cp_async_barrier_noinc(bar_k_1_ready[0])
+            for i_i in T.Pipelined(NI, num_stages=num_stages):
+                # 计算每个 seq position 的 mask
+                for s_offset, bi_i in T.Parallel(S_per_block, BI):
+                    kv_idx = Indices[b_i, s_for_indices, g_i, i_i * BI + bi_i]
+                    mask[s_offset, bi_i] = kv_idx <= max_kv_indices[s_offset]
+
+                # 加载 KV (使用 block 内最后一个 seq position 的 indices)
+                for bi_i, d_i in T.Parallel(BI, D):
+                    KV_shared[bi_i, d_i] = KV[b_i, Indices[b_i, s_for_indices, g_i, i_i * BI + bi_i], g_i, d_i]
+                for bi_i, d_i in T.Parallel(BI, D_tail):
+                    K_tail_shared[bi_i, d_i] = KV[b_i, Indices[b_i, s_for_indices, g_i, i_i * BI + bi_i], g_i, D + d_i]
+
+                # 初始化 acc_s，应用各自的 mask
+                for sh_i, bi_i in T.Parallel(padded_merged_H, BI):
+                    # 计算对应的 s_offset 和 h_i
+                    s_offset = sh_i // H
+                    # 只有 s_offset < S_per_block 且 mask 有效时才计算
+                    is_valid = T.if_then_else(
+                        s_offset < S_per_block,
+                        mask[s_offset, bi_i],
+                        False
+                    )
+                    acc_s[sh_i, bi_i] = T.if_then_else(is_valid, 0, -T.infinity(acc_s.dtype))
+                
+                T.gemm(Q_shared, KV_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
+                T.gemm(Q_tail_shared, K_tail_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
+                
+                T.copy(m_i, m_i_prev)
+                T.reduce_max(acc_s, m_i, dim=1, clear=False)
+                for sh_i in T.Parallel(padded_merged_H):
+                    m_i[sh_i] = T.max(m_i[sh_i], m_i_prev[sh_i])
+                for sh_i in T.Parallel(padded_merged_H):
+                    alpha[sh_i] = T.exp2((m_i_prev[sh_i] - m_i[sh_i]) * sm_scale)
+                for sh_i, bi_i in T.Parallel(padded_merged_H, BI):
+                    acc_s[sh_i, bi_i] = T.exp2(acc_s[sh_i, bi_i] * sm_scale - m_i[sh_i] * sm_scale)
+                T.reduce_sum(acc_s, sumexp_i, dim=1)
+                for sh_i in T.Parallel(padded_merged_H):
+                    sumexp[sh_i] = sumexp[sh_i] * alpha[sh_i] + sumexp_i[sh_i]
+                for sh_i, d_i in T.Parallel(padded_merged_H, D):
+                    acc_o[sh_i, d_i] = acc_o[sh_i, d_i] * alpha[sh_i]
+
+                T.copy(acc_s, S_shared)
+                T.gemm(S_shared, KV_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
+
+            # Rescale
+            for sh_i, d_i in T.Parallel(padded_merged_H, D):
+                acc_o[sh_i, d_i] /= sumexp[sh_i]
+            for sh_i in T.Parallel(padded_merged_H):
+                sumexp[sh_i] = T.log2(sumexp[sh_i]) + m_i[sh_i] * sm_scale
+
+            T.copy(acc_o, O_shared)
+            T.copy(sumexp, Lse_shared)
+            
+            # 将结果写回各自的 seq position
+            for s_offset in T.serial(S_per_block):
+                s_i = s_base + s_offset
+                h_offset = s_offset * H
+                for h_i in T.serial(H):
+                    # 只写入有效的 seq position
+                    for d_i in T.Parallel(D):
+                        if s_i < seq_len:
+                            Output[b_i, s_i, g_i * H + h_i, d_i] = O_shared[h_offset + h_i, d_i]
+                for h_i in T.serial(H):
+                    if s_i < seq_len:
+                        Lse[b_i, s_i, g_i * H + h_i] = Lse_shared[h_offset + h_i]
 
     return main
 
@@ -562,33 +465,49 @@ def benchmark_comparison(
     # 计算 tail_dim
     tail_dim = DQK - DV
     
-    # 定义所有优化方案
+    # 定义所有优化方案 (kernel_func, block_I, threads, S_per_block)
     optimizations = [
-        ("原始方案 (优化1配置)", sparse_mla_fwd_baseline, 64, 128),
-        ("优化6: Warp Specialization", sparse_mla_fwd_warp_specialized, 64, 384),
+        ("原始方案 (优化1配置)", sparse_mla_fwd_baseline, 64, 128, 1),
+        ("优化7: 批量处理 Query (S=8)", sparse_mla_fwd_batched_query, 64, 128, 8),
     ]
     
     results = []
     ref_out = None
     
-    for name, kernel_func, block_i, num_threads in optimizations:
+    for name, kernel_func, block_i, num_threads, s_per_block in optimizations:
         print(f"\n测试: {name}")
         print("-" * 40)
         
         try:
             # 编译 kernel
-            kernel = kernel_func(
-                heads=H,
-                dim=DV,
-                tail_dim=tail_dim,
-                topk=topk,
-                kv_group=HKV,
-                sm_scale=None,
-                is_causal=True,
-                block_I=block_i,
-                num_stages=1,
-                threads=num_threads,
-            )
+            if s_per_block > 1:
+                # 优化7: 批量处理
+                kernel = kernel_func(
+                    heads=H,
+                    dim=DV,
+                    tail_dim=tail_dim,
+                    topk=topk,
+                    kv_group=HKV,
+                    sm_scale=None,
+                    is_causal=True,
+                    block_I=block_i,
+                    num_stages=1,
+                    threads=num_threads,
+                    S_per_block=s_per_block,
+                )
+            else:
+                kernel = kernel_func(
+                    heads=H,
+                    dim=DV,
+                    tail_dim=tail_dim,
+                    topk=topk,
+                    kv_group=HKV,
+                    sm_scale=None,
+                    is_causal=True,
+                    block_I=block_i,
+                    num_stages=1,
+                    threads=num_threads,
+                )
             
             # 运行一次获取输出
             out, lse = kernel(q, kv, indices)
