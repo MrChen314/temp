@@ -163,14 +163,21 @@ def sparse_mla_fwd_baseline(
 # ============================================================================
 # 优化7: 批量处理 query - 将多个 seq position 的 Q 合并计算
 # 
-# 原理说明:
-# - 当前配置 H=2, 必须 pad 到 H_per_block=16, 浪费 87.5%
-# - 优化思路: 将 S_per_block=8 个 seq position 的 Q 合并
-# - 合并后 GEMM 维度: [8*2, D] @ [BI, D]^T = [16, BI]，正好填满，无浪费
-# 
-# 约束:
-# - 需要 seq_len 是 S_per_block 的倍数
-# - 相邻 seq positions 共享同一套 indices（使用最后一个的 indices）
+# ⚠️ 重要说明：
+# 原始优化7的核心假设是：同一 block 内的 seq positions 共享相同的 indices。
+# 这样可以：
+#   1. 合并多个 seq position 的 Q 到一个大 GEMM: [S*H, D] @ [BI, D]^T
+#   2. 共享同一份 KV 数据，减少加载次数
+#   3. 消除小 H (如 H=2) 导致的 padding 浪费
+#
+# 但是，在通用数据（每个 seq position 有独立随机的 indices）的情况下：
+#   - 不同 seq position 需要访问不同的 KV 位置
+#   - 无法共享 KV 数据
+#   - 必须为每个 seq position 独立加载 KV
+#   - 这使得"合并 GEMM"的优化失去意义
+#
+# 下面的通用版本仅为了保证正确性，性能可能反而不如原始方案。
+# 如果需要真正的性能优化，必须确保数据满足"共享 indices"的约束。
 # ============================================================================
 @tilelang.jit(
     out_idx=[-2, -1],
@@ -193,14 +200,16 @@ def sparse_mla_fwd_batched_query(
     S_per_block=8,  # 每个 block 处理的 seq position 数量
 ):
     """
-    优化7: 批量处理 query
+    优化7: 批量处理 query (通用版本)
     
     将 S_per_block 个相邻 seq position 的 Q 合并计算:
     - 原始: GEMM [H_per_block, D] @ [BI, D]^T, H_per_block=16 但实际 H=2
     - 优化: GEMM [S_per_block * H, D] @ [BI, D]^T, 8*2=16 正好填满
     
-    每个 seq position 有独立的 mask (基于各自的 max_kv_i)
-    共享同一套 indices (使用 block 内最后一个 seq position 的 indices)
+    关键点:
+    - 每个 seq position 使用自己的 indices（通用性）
+    - 为每个 seq position 独立加载 KV 和计算 mask
+    - 仅合并 Q 的 GEMM 计算部分
     """
     assert dim == tilelang.math.next_power_of_2(dim)
     assert tail_dim == tilelang.math.next_power_of_2(tail_dim)
@@ -232,12 +241,8 @@ def sparse_mla_fwd_batched_query(
     D = dim
     D_tail = tail_dim
     
-    # 计算合并后的维度
-    # 将 S_per_block 个 seq position 的 H 个 head 合并
-    # 例如: S_per_block=8, H=2 -> merged_H = 16
-    merged_H = S_per_block * H
-    # 确保 merged_H >= 16 以满足 GEMM 要求
-    padded_merged_H = max(tilelang.math.next_power_of_2(merged_H), 16)
+    # 为每个 seq position 独立处理，但共享 Q 的加载
+    padded_H = max(tilelang.math.next_power_of_2(head_kv), 16)
 
     @T.prim_func
     def main(
@@ -249,134 +254,106 @@ def sparse_mla_fwd_batched_query(
     ):
         # Grid: (seq_len / S_per_block, batch, kv_group)
         with T.Kernel(T.ceildiv(seq_len, S_per_block), batch, kv_group, threads=threads) as (bx, by, bz):
-            # Q shared memory: [S_per_block * H, D] (合并多个 seq position)
-            Q_shared = T.alloc_shared([padded_merged_H, D], dtype)
-            Q_tail_shared = T.alloc_shared([padded_merged_H, D_tail], dtype)
+            # 为每个 seq position 分配独立的 shared memory
+            Q_shared = T.alloc_shared([padded_H, D], dtype)
+            Q_tail_shared = T.alloc_shared([padded_H, D_tail], dtype)
             KV_shared = T.alloc_shared([BI, D], dtype)
             K_tail_shared = T.alloc_shared([BI, D_tail], dtype)
-            O_shared = T.alloc_shared([padded_merged_H, D], dtype)
-            Lse_shared = T.alloc_shared([padded_merged_H], accum_dtype)
-            
-            # mask 现在是 2D: 每个 seq position 有自己的 mask
-            # mask[s, bi] 表示第 s 个 seq position 对第 bi 个 KV 是否有效
-            mask = T.alloc_shared([S_per_block, BI], "bool")
-            
-            # 每个 seq position 的 max_kv_i
-            max_kv_indices = T.alloc_shared([S_per_block], indices_dtype)
+            O_shared = T.alloc_shared([padded_H, D], dtype)
+            Lse_shared = T.alloc_shared([padded_H], accum_dtype)
+            mask = T.alloc_fragment([BI], "bool")
 
-            acc_o = T.alloc_fragment([padded_merged_H, D], accum_dtype)
-            acc_s = T.alloc_fragment([padded_merged_H, BI], accum_dtype)
-            S_shared = T.alloc_shared([padded_merged_H, BI], dtype)
-            sumexp = T.alloc_fragment([padded_merged_H], accum_dtype)
-            sumexp_i = T.alloc_fragment([padded_merged_H], accum_dtype)
-            alpha = T.alloc_fragment([padded_merged_H], accum_dtype)
-            m_i = T.alloc_fragment([padded_merged_H], accum_dtype)
-            m_i_prev = T.alloc_fragment([padded_merged_H], accum_dtype)
-
-            T.fill(acc_o, 0)
-            T.fill(sumexp, 0)
-            T.fill(m_i, -(2**30))
+            acc_o = T.alloc_fragment([padded_H, D], accum_dtype)
+            acc_s = T.alloc_fragment([padded_H, BI], accum_dtype)
+            S_shared = T.alloc_shared([padded_H, BI], dtype)
+            sumexp = T.alloc_fragment([padded_H], accum_dtype)
+            sumexp_i = T.alloc_fragment([padded_H], accum_dtype)
+            alpha = T.alloc_fragment([padded_H], accum_dtype)
+            m_i = T.alloc_fragment([padded_H], accum_dtype)
+            m_i_prev = T.alloc_fragment([padded_H], accum_dtype)
 
             b_i, g_i = by, bz
-            # block 起始的 seq position
             s_base = bx * S_per_block
-            # 使用 block 内最后一个有效 seq position 的 indices
-            s_for_indices = T.min(s_base + S_per_block - 1, seq_len - 1)
 
-            # 加载多个 seq position 的 Q 到 shared memory
-            # Q_shared 布局: [s0_h0, s0_h1, s1_h0, s1_h1, ..., s7_h0, s7_h1, padding...]
+            # 对 block 内的每个 seq position 独立处理
             for s_offset in T.serial(S_per_block):
                 s_i = s_base + s_offset
-                # 计算该 seq position 在 Q_shared 中的起始位置
-                h_offset = s_offset * H
-                # 设置 max_kv_i (causal mask)
-                max_kv_indices[s_offset] = s_i
-                
-                # 加载 Q (只有有效的 seq position)
-                for h_i in T.serial(H):
-                    for d_i in T.Parallel(D):
-                        Q_shared[h_offset + h_i, d_i] = T.if_then_else(
-                            s_i < seq_len,
-                            Q[b_i, s_i, g_i * H + h_i, d_i],
-                            T.cast(0, dtype)
-                        )
-                    for d_i in T.Parallel(D_tail):
-                        Q_tail_shared[h_offset + h_i, d_i] = T.if_then_else(
-                            s_i < seq_len,
-                            Q[b_i, s_i, g_i * H + h_i, D + d_i],
-                            T.cast(0, dtype)
-                        )
+                max_kv_i = s_i
 
-            for i_i in T.Pipelined(NI, num_stages=num_stages):
-                # 计算每个 seq position 的 mask
-                # 关键修复：每个 seq position 使用自己的 indices
-                for s_offset, bi_i in T.Parallel(S_per_block, BI):
-                    s_i = s_base + s_offset
-                    # 每个 seq position 使用自己的 indices
-                    kv_idx = Indices[b_i, T.min(s_i, seq_len - 1), g_i, i_i * BI + bi_i]
-                    mask[s_offset, bi_i] = (kv_idx <= max_kv_indices[s_offset]) & (s_i < seq_len)
+                # 重置累加器
+                T.fill(acc_o, 0)
+                T.fill(sumexp, 0)
+                T.fill(m_i, -(2**30))
 
-                # 加载 KV (使用 block 内最后一个 seq position 的 indices)
-                # 注意：这里仍然使用最后一个 seq position 的 indices
-                # 因为 Sparse MLA 中，后面的 seq position 的 indices 是前面的超集（causal）
-                for bi_i, d_i in T.Parallel(BI, D):
-                    KV_shared[bi_i, d_i] = KV[b_i, Indices[b_i, s_for_indices, g_i, i_i * BI + bi_i], g_i, d_i]
-                for bi_i, d_i in T.Parallel(BI, D_tail):
-                    K_tail_shared[bi_i, d_i] = KV[b_i, Indices[b_i, s_for_indices, g_i, i_i * BI + bi_i], g_i, D + d_i]
-
-                # 初始化 acc_s，应用各自的 mask
-                for sh_i, bi_i in T.Parallel(padded_merged_H, BI):
-                    # 计算对应的 s_offset
-                    s_offset = sh_i // H
-                    # 只有 s_offset < S_per_block 且 mask 有效时才计算
-                    is_valid = T.if_then_else(
-                        s_offset < S_per_block,
-                        mask[s_offset, bi_i],
-                        False
+                # 加载当前 seq position 的 Q
+                for h_i, d_i in T.Parallel(padded_H, D):
+                    Q_shared[h_i, d_i] = T.if_then_else(
+                        (s_i < seq_len) & (h_i < H),
+                        Q[b_i, T.min(s_i, seq_len - 1), g_i * H + h_i, d_i],
+                        T.cast(0, dtype)
                     )
-                    acc_s[sh_i, bi_i] = T.if_then_else(is_valid, 0, -T.infinity(acc_s.dtype))
+                for h_i, d_i in T.Parallel(padded_H, D_tail):
+                    Q_tail_shared[h_i, d_i] = T.if_then_else(
+                        (s_i < seq_len) & (h_i < H),
+                        Q[b_i, T.min(s_i, seq_len - 1), g_i * H + h_i, D + d_i],
+                        T.cast(0, dtype)
+                    )
+
+                # 处理当前 seq position 的所有 KV blocks
+                for i_i in T.Pipelined(NI, num_stages=num_stages):
+                    # 使用当前 seq position 自己的 indices 计算 mask
+                    for bi_i in T.Parallel(BI):
+                        kv_idx = Indices[b_i, T.min(s_i, seq_len - 1), g_i, i_i * BI + bi_i]
+                        mask[bi_i] = (kv_idx <= max_kv_i) & (s_i < seq_len)
+
+                    # 使用当前 seq position 自己的 indices 加载 KV
+                    for bi_i, d_i in T.Parallel(BI, D):
+                        idx = Indices[b_i, T.min(s_i, seq_len - 1), g_i, i_i * BI + bi_i]
+                        KV_shared[bi_i, d_i] = KV[b_i, idx, g_i, d_i]
+                    for bi_i, d_i in T.Parallel(BI, D_tail):
+                        idx = Indices[b_i, T.min(s_i, seq_len - 1), g_i, i_i * BI + bi_i]
+                        K_tail_shared[bi_i, d_i] = KV[b_i, idx, g_i, D + d_i]
+
+                    # 初始化 acc_s，应用 mask
+                    for h_i, bi_i in T.Parallel(padded_H, BI):
+                        acc_s[h_i, bi_i] = T.if_then_else(mask[bi_i], 0, -T.infinity(acc_s.dtype))
+                    
+                    T.gemm(Q_shared, KV_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
+                    T.gemm(Q_tail_shared, K_tail_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
+                    
+                    T.copy(m_i, m_i_prev)
+                    T.reduce_max(acc_s, m_i, dim=1, clear=False)
+                    for h_i in T.Parallel(padded_H):
+                        m_i[h_i] = T.max(m_i[h_i], m_i_prev[h_i])
+                    for h_i in T.Parallel(padded_H):
+                        alpha[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale)
+                    for h_i, bi_i in T.Parallel(padded_H, BI):
+                        acc_s[h_i, bi_i] = T.exp2(acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale)
+                    T.reduce_sum(acc_s, sumexp_i, dim=1)
+                    for h_i in T.Parallel(padded_H):
+                        sumexp[h_i] = sumexp[h_i] * alpha[h_i] + sumexp_i[h_i]
+                    for h_i, d_i in T.Parallel(padded_H, D):
+                        acc_o[h_i, d_i] = acc_o[h_i, d_i] * alpha[h_i]
+
+                    T.copy(acc_s, S_shared)
+                    T.gemm(S_shared, KV_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
+
+                # Rescale 并写回当前 seq position 的结果
+                for h_i, d_i in T.Parallel(padded_H, D):
+                    acc_o[h_i, d_i] /= sumexp[h_i]
+                for h_i in T.Parallel(padded_H):
+                    sumexp[h_i] = T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale
+
+                T.copy(acc_o, O_shared)
+                T.copy(sumexp, Lse_shared)
                 
-                T.gemm(Q_shared, KV_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
-                T.gemm(Q_tail_shared, K_tail_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
-                
-                T.copy(m_i, m_i_prev)
-                T.reduce_max(acc_s, m_i, dim=1, clear=False)
-                for sh_i in T.Parallel(padded_merged_H):
-                    m_i[sh_i] = T.max(m_i[sh_i], m_i_prev[sh_i])
-                for sh_i in T.Parallel(padded_merged_H):
-                    alpha[sh_i] = T.exp2((m_i_prev[sh_i] - m_i[sh_i]) * sm_scale)
-                for sh_i, bi_i in T.Parallel(padded_merged_H, BI):
-                    acc_s[sh_i, bi_i] = T.exp2(acc_s[sh_i, bi_i] * sm_scale - m_i[sh_i] * sm_scale)
-                T.reduce_sum(acc_s, sumexp_i, dim=1)
-                for sh_i in T.Parallel(padded_merged_H):
-                    sumexp[sh_i] = sumexp[sh_i] * alpha[sh_i] + sumexp_i[sh_i]
-                for sh_i, d_i in T.Parallel(padded_merged_H, D):
-                    acc_o[sh_i, d_i] = acc_o[sh_i, d_i] * alpha[sh_i]
-
-                T.copy(acc_s, S_shared)
-                T.gemm(S_shared, KV_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
-
-            # Rescale
-            for sh_i, d_i in T.Parallel(padded_merged_H, D):
-                acc_o[sh_i, d_i] /= sumexp[sh_i]
-            for sh_i in T.Parallel(padded_merged_H):
-                sumexp[sh_i] = T.log2(sumexp[sh_i]) + m_i[sh_i] * sm_scale
-
-            T.copy(acc_o, O_shared)
-            T.copy(sumexp, Lse_shared)
-            
-            # 将结果写回各自的 seq position
-            for s_offset in T.serial(S_per_block):
-                s_i = s_base + s_offset
-                h_offset = s_offset * H
+                # 只写入有效的 seq position
                 for h_i in T.serial(H):
-                    # 只写入有效的 seq position
                     for d_i in T.Parallel(D):
                         if s_i < seq_len:
-                            Output[b_i, s_i, g_i * H + h_i, d_i] = O_shared[h_offset + h_i, d_i]
-                for h_i in T.serial(H):
+                            Output[b_i, s_i, g_i * H + h_i, d_i] = O_shared[h_i, d_i]
                     if s_i < seq_len:
-                        Lse[b_i, s_i, g_i * H + h_i] = Lse_shared[h_offset + h_i]
+                        Lse[b_i, s_i, g_i * H + h_i] = Lse_shared[h_i]
 
     return main
 
@@ -460,7 +437,6 @@ def benchmark_comparison(
     q.clamp_(-10, 10)
     kv.clamp_(-10, 10)
     
-    # 标准 indices：每个 seq position 独立随机选择
     indices = torch.full((B, S, HKV, topk), SKV, dtype=torch.int32, device="cuda")
     for b in range(B):
         for t in range(S):
@@ -468,45 +444,23 @@ def benchmark_comparison(
                 i_i = torch.randperm(max(1, t))[:topk]
                 indices[b, t, h, : len(i_i)] = i_i
     
-    # 为优化7生成共享 indices 的版本
-    # 每 S_per_block 个 seq positions 共享同一套 indices（使用 block 内最后一个的）
-    S_per_block_for_opt7 = 8
-    indices_shared = torch.full((B, S, HKV, topk), SKV, dtype=torch.int32, device="cuda")
-    for b in range(B):
-        for h in range(HKV):
-            # 按 block 生成共享的 indices
-            num_blocks = (S + S_per_block_for_opt7 - 1) // S_per_block_for_opt7
-            for block_idx in range(num_blocks):
-                s_base = block_idx * S_per_block_for_opt7
-                s_end = min(s_base + S_per_block_for_opt7, S)
-                # 使用 block 内最后一个 seq position 的范围来生成 indices
-                t_for_idx = s_end - 1  # 最后一个有效 seq position
-                # 生成一套 indices，给整个 block 共享
-                i_i = torch.randperm(max(1, t_for_idx))[:topk]
-                # 复制给 block 内所有 seq positions
-                for t in range(s_base, s_end):
-                    indices_shared[b, t, h, : len(i_i)] = i_i
-    
     # 计算 tail_dim
     tail_dim = DQK - DV
     
     # 定义所有优化方案 (kernel_func, block_I, threads, S_per_block)
+    # 注意: 优化7通用版本由于需要为每个 seq position 独立加载 KV，
+    #       性能可能不如原始方案。仅用于验证正确性。
     optimizations = [
         ("原始方案 (优化1配置)", sparse_mla_fwd_baseline, 64, 128, 1),
-        ("优化7: 批量处理 Query (S=8)", sparse_mla_fwd_batched_query, 64, 128, 8),
+        ("优化7: 通用版本 (S=8)", sparse_mla_fwd_batched_query, 64, 128, 8),
     ]
     
     results = []
     ref_out = None
-    ref_out_shared = None  # 为优化7使用共享 indices 的参考输出
     
     for name, kernel_func, block_i, num_threads, s_per_block in optimizations:
         print(f"\n测试: {name}")
         print("-" * 40)
-        
-        # 优化7 使用共享 indices
-        use_shared_indices = s_per_block > 1
-        current_indices = indices_shared if use_shared_indices else indices
         
         try:
             # 编译 kernel
@@ -540,30 +494,23 @@ def benchmark_comparison(
                 )
             
             # 运行一次获取输出
-            out, lse = kernel(q, kv, current_indices)
+            out, lse = kernel(q, kv, indices)
             
             # 正确性验证
             if check_correctness:
-                # 使用对应的 indices 计算参考输出
-                if use_shared_indices:
-                    if ref_out_shared is None:
-                        ref_out_shared = ref_sparse_mla_fwd(q, kv, indices_shared, d_v=DV)
-                    current_ref = ref_out_shared
-                else:
-                    if ref_out is None:
-                        ref_out = ref_sparse_mla_fwd(q, kv, indices, d_v=DV)
-                    current_ref = ref_out
+                if ref_out is None:
+                    ref_out = ref_sparse_mla_fwd(q, kv, indices, d_v=DV)
                 
                 try:
-                    torch.testing.assert_close(out, current_ref, rtol=1e-2, atol=1e-2)
+                    torch.testing.assert_close(out, ref_out, rtol=1e-2, atol=1e-2)
                     print(f"  ✓ 正确性验证通过")
                 except AssertionError as e:
-                    max_diff = (out - current_ref).abs().max().item()
+                    max_diff = (out - ref_out).abs().max().item()
                     print(f"  ✗ 正确性验证失败，最大差异: {max_diff:.6f}")
             
             # 性能测试
             def fn():
-                return kernel(q, kv, current_indices)
+                return kernel(q, kv, indices)
             
             ms = do_bench(fn, rep=num_rep, warmup=num_warmup)
             
