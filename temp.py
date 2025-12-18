@@ -221,6 +221,10 @@ def benchmark_config(block_I, num_stages, threads, warmup=50, rep=100):
                 i_i = torch.randperm(max(1, t))[:topk]
                 indices[b, t, h, : len(i_i)] = i_i
     
+    # 创建输出 buffer
+    output = torch.empty((B, S, H, DV), dtype=dtype, device="cuda")
+    lse = torch.empty((B, S, H), dtype=torch.float32, device="cuda")
+    
     try:
         kernel = sparse_mla_fwd_debug(
             H, DV, DQK - DV, topk,
@@ -228,7 +232,7 @@ def benchmark_config(block_I, num_stages, threads, warmup=50, rep=100):
         )
         
         def fn():
-            return kernel(q, kv, indices)
+            return kernel(q, kv, indices, output, lse)
         
         # 预热
         for _ in range(10):
@@ -344,6 +348,13 @@ def profiler_analysis(block_I=64, num_stages=2, threads=128):
                 i_i = torch.randperm(max(1, t))[:topk]
                 indices[b, t, h, : len(i_i)] = i_i
     
+    # 创建输出 buffer
+    output = torch.empty((B, S, H, DV), dtype=dtype, device="cuda")
+    lse = torch.empty((B, S, H), dtype=torch.float32, device="cuda")
+    
+    # 顺序: Q, KV, Indices, Output, Lse (根据 kernel 定义)
+    input_tensors = [q, kv, indices, output, lse]
+    
     kernel = sparse_mla_fwd_debug(
         H, DV, DQK - DV, topk,
         block_I=block_I, num_stages=num_stages, threads=threads
@@ -355,11 +366,11 @@ def profiler_analysis(block_I=64, num_stages=2, threads=128):
     # 多种测量模式
     print("\n📊 性能测量:")
     
-    # 使用不同的 return_mode
-    latency_mean = profiler.do_bench(warmup=50, rep=200, return_mode="mean")
-    latency_median = profiler.do_bench(warmup=50, rep=200, return_mode="median")
-    latency_min = profiler.do_bench(warmup=50, rep=200, return_mode="min")
-    latency_max = profiler.do_bench(warmup=50, rep=200, return_mode="max")
+    # 使用不同的 return_mode，传入 input_tensors 解决动态形状报错
+    latency_mean = profiler.do_bench(input_tensors=input_tensors, warmup=50, rep=200, return_mode="mean")
+    latency_median = profiler.do_bench(input_tensors=input_tensors, warmup=50, rep=200, return_mode="median")
+    latency_min = profiler.do_bench(input_tensors=input_tensors, warmup=50, rep=200, return_mode="min")
+    latency_max = profiler.do_bench(input_tensors=input_tensors, warmup=50, rep=200, return_mode="max")
     
     print(f"  Mean:   {latency_mean:.3f} ms")
     print(f"  Median: {latency_median:.3f} ms")
@@ -369,7 +380,7 @@ def profiler_analysis(block_I=64, num_stages=2, threads=128):
     
     # 分位数
     print("\n📈 分位数分析:")
-    quantiles = profiler.do_bench(warmup=50, rep=200, quantiles=[0.25, 0.5, 0.75, 0.9, 0.95, 0.99])
+    quantiles = profiler.do_bench(input_tensors=input_tensors, warmup=50, rep=200, quantiles=[0.25, 0.5, 0.75, 0.9, 0.95, 0.99])
     percentiles = [25, 50, 75, 90, 95, 99]
     for p, q in zip(percentiles, quantiles):
         print(f"  P{p}: {q:.3f} ms")
