@@ -6,8 +6,8 @@ DQK=576, DV=512, topk=64
 
 [INFO] Running kernel with T.print debug statements...
 ============================================================
-2025-12-19 12:14:10  [TileLang:tilelang.jit.kernel:INFO]: TileLang begins to compile kernel `main` with `out_idx=[-2, -1]`
-ptxas fatal   : Unresolved extern function '_Z24debug_print_buffer_valueIbEvPKcS1_iT_'
+2025-12-19 12:18:32  [TileLang:tilelang.jit.kernel:INFO]: TileLang begins to compile kernel `main` with `out_idx=[-2, -1]`
+ptxas error   : Entry function 'main_kernel' uses too much shared data (0x12400 bytes, 0xc000 max)
 Traceback (most recent call last):
   File "/home/users/chenquanlin/workspace/a0p6b_dsa_stage2/test2.py", line 287, in <module>
     test_sparse_mla_fwd_debug()
@@ -39,7 +39,7 @@ Traceback (most recent call last):
     self.lib_generator.compile_lib()
   File "/usr/local/lib/python3.12/dist-packages/tilelang/jit/adapter/libgen.py", line 164, in compile_lib
     raise RuntimeError(f"Compilation Failed! {command}"
-RuntimeError: Compilation Failed! ['/usr/local/cuda/bin/nvcc', '-std=c++17', '-w', '-Xcudafe', '--diag_suppress=177', '--compiler-options', '-fPIC', '-lineinfo', '--shared', '/tmp/tmpmenk1qvq.cu', '-lcuda', '-gencode', 'arch=compute_90a,code=sm_90a', '-I/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/cutlass/include', '-I/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/../src', '-o', '/tmp/tmpmenk1qvq.so']
+RuntimeError: Compilation Failed! ['/usr/local/cuda/bin/nvcc', '-std=c++17', '-w', '-Xcudafe', '--diag_suppress=177', '--compiler-options', '-fPIC', '-lineinfo', '--shared', '/tmp/tmpvkpsdjzd.cu', '-lcuda', '-gencode', 'arch=compute_90a,code=sm_90a', '-I/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/cutlass/include', '-I/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/../src', '-o', '/tmp/tmpvkpsdjzd.so']
  #include <math_constants.h>
 #include <tl_templates/cuda/gemm.h>
 #include <tl_templates/cuda/copy.h>
@@ -58,19 +58,18 @@ extern "C" __global__ void __launch_bounds__(256, 1) main_kernel(int* __restrict
   float sumexp[2];
   float m_i[2];
   signed char mask[2];
-  __shared__ signed char smem[64];
   float acc_s[4];
-  __shared__ float smem_1[1024];
+  __shared__ float smem[1024];
   float m_i_prev[2];
   float alpha[2];
   float sumexp_i[2];
+  __shared__ float smem_1[16];
   __shared__ float smem_2[16];
   __shared__ float smem_3[16];
-  __shared__ float smem_4[16];
-  __shared__ float smem_5[1024];
+  __shared__ float smem_4[1024];
+  __shared__ float smem_5[8192];
   __shared__ float smem_6[8192];
-  __shared__ float smem_7[8192];
-  __shared__ float smem_8[16];
+  __shared__ float smem_7[16];
   #pragma unroll
   for (int i = 0; i < 16; ++i) {
     *(float2*)(acc_o + (i * 2)) = make_float2(0x0p+0f/*0.000000e+00*/, 0x0p+0f/*0.000000e+00*/);
@@ -145,35 +144,15 @@ extern "C" __global__ void __launch_bounds__(256, 1) main_kernel(int* __restrict
       }
     }
   }
-  if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
-    if (((((int)threadIdx.x) & 31) >> 2) == 0) {
-      char2 __3;
-      ushort2 __4;
-      char2 v__2 = *(char2*)(mask + 0);
-      __4.x = (bool)(v__2.x);
-      __4.y = (bool)(v__2.y);
-      __3.x=((signed char)(__4.x));
-      __3.y=((signed char)(__4.y));
-      *(char2*)(smem + (((((int)threadIdx.x) >> 5) * 8) + ((((int)threadIdx.x) & 3) * 2))) = __3;
-    }
-  }
-  __syncthreads();
-  if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
-    if (((int)threadIdx.x) == 0) {
-      for (int i_10 = 0; i_10 < 64; ++i_10) {
-        debug_print_buffer_value("[DEBUG] mask:", "mask", i_10, ((bool)smem[i_10]));
-      }
-    }
-  }
   #pragma unroll
-  for (int i_11 = 0; i_11 < 4; ++i_11) {
+  for (int i_10 = 0; i_10 < 4; ++i_10) {
     float condval;
-    if (((bool)mask[(i_11 & 1)])) {
+    if (((bool)mask[(i_10 & 1)])) {
       condval = 0x0p+0f/*0.000000e+00*/;
     } else {
       condval = -CUDART_INF_F;
     }
-    acc_s[i_11] = condval;
+    acc_s[i_10] = condval;
   }
   tl::fence_proxy_async();
   tl::cp_async_wait<0>();
@@ -184,128 +163,128 @@ extern "C" __global__ void __launch_bounds__(256, 1) main_kernel(int* __restrict
   tl::gemm_ss<16, 64, 64, 1, 8, 0, 1, 0, 64, 64, 0, 0, false>((&(((bfloat16_t*)buf_dyn_shmem)[8192])), (&(((bfloat16_t*)buf_dyn_shmem)[9216])), (&(acc_s[0])));
   if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
     #pragma unroll
-    for (int i_12 = 0; i_12 < 2; ++i_12) {
-      *(float2*)(smem_1 + ((((i_12 * 512) + (((((int)threadIdx.x) & 31) >> 2) * 64)) + ((((int)threadIdx.x) >> 5) * 8)) + ((((int)threadIdx.x) & 3) * 2))) = *(float2*)(acc_s + (i_12 * 2));
+    for (int i_11 = 0; i_11 < 2; ++i_11) {
+      *(float2*)(smem + ((((i_11 * 512) + (((((int)threadIdx.x) & 31) >> 2) * 64)) + ((((int)threadIdx.x) >> 5) * 8)) + ((((int)threadIdx.x) & 3) * 2))) = *(float2*)(acc_s + (i_11 * 2));
     }
   }
   __syncthreads();
   if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
     if (((int)threadIdx.x) == 0) {
-      for (int i_13 = 0; i_13 < 1024; ++i_13) {
-        debug_print_buffer_value("[DEBUG] acc_s after GEMM (QK^T):", "acc_s", i_13, smem_1[i_13]);
+      for (int i_12 = 0; i_12 < 1024; ++i_12) {
+        debug_print_buffer_value("[DEBUG] acc_s after GEMM (QK^T):", "acc_s", i_12, smem[i_12]);
       }
     }
   }
   #pragma unroll
-  for (int i_14 = 0; i_14 < 2; ++i_14) {
-    m_i_prev[i_14] = m_i[i_14];
+  for (int i_13 = 0; i_13 < 2; ++i_13) {
+    m_i_prev[i_13] = m_i[i_13];
   }
   __syncthreads();
   #pragma unroll
-  for (int i_15 = 0; i_15 < 2; ++i_15) {
+  for (int i_14 = 0; i_14 < 2; ++i_14) {
     #pragma unroll
     for (int rv = 0; rv < 2; ++rv) {
-      m_i[i_15] = max(m_i[i_15], acc_s[((i_15 * 2) + rv)]);
+      m_i[i_14] = max(m_i[i_14], acc_s[((i_14 * 2) + rv)]);
     }
-    m_i[i_15] = tl::AllReduce<tl::MaxOp, 256, 32, 0, 256>::run_hopper(m_i[i_15], (&(((float*)buf_dyn_shmem)[0])));
-    m_i[i_15] = tl::AllReduce<tl::MaxOp, 4, 1, 0, 256>::run_hopper(m_i[i_15]);
+    m_i[i_14] = tl::AllReduce<tl::MaxOp, 256, 32, 0, 256>::run_hopper(m_i[i_14], (&(((float*)buf_dyn_shmem)[0])));
+    m_i[i_14] = tl::AllReduce<tl::MaxOp, 4, 1, 0, 256>::run_hopper(m_i[i_14]);
+  }
+  #pragma unroll
+  for (int i_15 = 0; i_15 < 2; ++i_15) {
+    m_i[i_15] = max(m_i[i_15], m_i_prev[i_15]);
   }
   #pragma unroll
   for (int i_16 = 0; i_16 < 2; ++i_16) {
-    m_i[i_16] = max(m_i[i_16], m_i_prev[i_16]);
+    alpha[i_16] = exp2f(((m_i_prev[i_16] - m_i[i_16]) * 0x1.ec709dbe8903ep-5f/*6.011229e-02*/));
   }
   #pragma unroll
-  for (int i_17 = 0; i_17 < 2; ++i_17) {
-    alpha[i_17] = exp2f(((m_i_prev[i_17] - m_i[i_17]) * 0x1.ec709dbe8903ep-5f/*6.011229e-02*/));
-  }
-  #pragma unroll
-  for (int i_18 = 0; i_18 < 4; ++i_18) {
-    acc_s[i_18] = exp2f(((acc_s[i_18] * 0x1.ec709dbe8903ep-5f/*6.011229e-02*/) - (m_i[(i_18 >> 1)] * 0x1.ec709dbe8903ep-5f/*6.011229e-02*/)));
+  for (int i_17 = 0; i_17 < 4; ++i_17) {
+    acc_s[i_17] = exp2f(((acc_s[i_17] * 0x1.ec709dbe8903ep-5f/*6.011229e-02*/) - (m_i[(i_17 >> 1)] * 0x1.ec709dbe8903ep-5f/*6.011229e-02*/)));
   }
   __syncthreads();
   #pragma unroll
-  for (int i_19 = 0; i_19 < 2; ++i_19) {
-    sumexp_i[i_19] = 0x0p+0f/*0.000000e+00*/;
+  for (int i_18 = 0; i_18 < 2; ++i_18) {
+    sumexp_i[i_18] = 0x0p+0f/*0.000000e+00*/;
     #pragma unroll
     for (int rv_1 = 0; rv_1 < 2; ++rv_1) {
-      sumexp_i[i_19] = (sumexp_i[i_19] + acc_s[((i_19 * 2) + rv_1)]);
+      sumexp_i[i_18] = (sumexp_i[i_18] + acc_s[((i_18 * 2) + rv_1)]);
     }
-    sumexp_i[i_19] = tl::AllReduce<tl::SumOp, 256, 32, 0, 256>::run_hopper(sumexp_i[i_19], (&(((float*)buf_dyn_shmem)[0])));
-    sumexp_i[i_19] = tl::AllReduce<tl::SumOp, 4, 1, 0, 256>::run_hopper(sumexp_i[i_19]);
+    sumexp_i[i_18] = tl::AllReduce<tl::SumOp, 256, 32, 0, 256>::run_hopper(sumexp_i[i_18], (&(((float*)buf_dyn_shmem)[0])));
+    sumexp_i[i_18] = tl::AllReduce<tl::SumOp, 4, 1, 0, 256>::run_hopper(sumexp_i[i_18]);
   }
   #pragma unroll
-  for (int i_20 = 0; i_20 < 2; ++i_20) {
-    sumexp[i_20] = ((sumexp[i_20] * alpha[i_20]) + sumexp_i[i_20]);
+  for (int i_19 = 0; i_19 < 2; ++i_19) {
+    sumexp[i_19] = ((sumexp[i_19] * alpha[i_19]) + sumexp_i[i_19]);
   }
   if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
     if ((((((int)threadIdx.x) & 3) * 8) + (((int)threadIdx.x) >> 5)) == 0) {
       #pragma unroll
-      for (int i_21 = 0; i_21 < 2; ++i_21) {
-        smem_2[((i_21 * 8) + ((((int)threadIdx.x) & 31) >> 2))] = m_i[i_21];
+      for (int i_20 = 0; i_20 < 2; ++i_20) {
+        smem_1[((i_20 * 8) + ((((int)threadIdx.x) & 31) >> 2))] = m_i[i_20];
       }
     }
   }
   __syncthreads();
   if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
     if (((int)threadIdx.x) == 0) {
-      for (int i_22 = 0; i_22 < 16; ++i_22) {
-        debug_print_buffer_value("[DEBUG] m_i (row max):", "m_i", i_22, smem_2[i_22]);
+      for (int i_21 = 0; i_21 < 16; ++i_21) {
+        debug_print_buffer_value("[DEBUG] m_i (row max):", "m_i", i_21, smem_1[i_21]);
       }
     }
   }
   if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
     if ((((((int)threadIdx.x) & 3) * 8) + (((int)threadIdx.x) >> 5)) == 0) {
       #pragma unroll
-      for (int i_23 = 0; i_23 < 2; ++i_23) {
-        smem_3[((i_23 * 8) + ((((int)threadIdx.x) & 31) >> 2))] = alpha[i_23];
+      for (int i_22 = 0; i_22 < 2; ++i_22) {
+        smem_2[((i_22 * 8) + ((((int)threadIdx.x) & 31) >> 2))] = alpha[i_22];
       }
     }
   }
   __syncthreads();
   if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
     if (((int)threadIdx.x) == 0) {
-      for (int i_24 = 0; i_24 < 16; ++i_24) {
-        debug_print_buffer_value("[DEBUG] alpha (rescale factor):", "alpha", i_24, smem_3[i_24]);
+      for (int i_23 = 0; i_23 < 16; ++i_23) {
+        debug_print_buffer_value("[DEBUG] alpha (rescale factor):", "alpha", i_23, smem_2[i_23]);
       }
     }
   }
   if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
     if ((((((int)threadIdx.x) & 3) * 8) + (((int)threadIdx.x) >> 5)) == 0) {
       #pragma unroll
-      for (int i_25 = 0; i_25 < 2; ++i_25) {
-        smem_4[((i_25 * 8) + ((((int)threadIdx.x) & 31) >> 2))] = sumexp[i_25];
+      for (int i_24 = 0; i_24 < 2; ++i_24) {
+        smem_3[((i_24 * 8) + ((((int)threadIdx.x) & 31) >> 2))] = sumexp[i_24];
       }
     }
   }
   __syncthreads();
   if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
     if (((int)threadIdx.x) == 0) {
-      for (int i_26 = 0; i_26 < 16; ++i_26) {
-        debug_print_buffer_value("[DEBUG] sumexp (sum of exp):", "sumexp", i_26, smem_4[i_26]);
+      for (int i_25 = 0; i_25 < 16; ++i_25) {
+        debug_print_buffer_value("[DEBUG] sumexp (sum of exp):", "sumexp", i_25, smem_3[i_25]);
       }
     }
   }
   if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
     #pragma unroll
-    for (int i_27 = 0; i_27 < 2; ++i_27) {
-      *(float2*)(smem_5 + ((((i_27 * 512) + (((((int)threadIdx.x) & 31) >> 2) * 64)) + ((((int)threadIdx.x) >> 5) * 8)) + ((((int)threadIdx.x) & 3) * 2))) = *(float2*)(acc_s + (i_27 * 2));
+    for (int i_26 = 0; i_26 < 2; ++i_26) {
+      *(float2*)(smem_4 + ((((i_26 * 512) + (((((int)threadIdx.x) & 31) >> 2) * 64)) + ((((int)threadIdx.x) >> 5) * 8)) + ((((int)threadIdx.x) & 3) * 2))) = *(float2*)(acc_s + (i_26 * 2));
     }
   }
   __syncthreads();
   if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
     if (((int)threadIdx.x) == 0) {
-      for (int i_28 = 0; i_28 < 1024; ++i_28) {
-        debug_print_buffer_value("[DEBUG] acc_s after softmax (P):", "acc_s", i_28, smem_5[i_28]);
+      for (int i_27 = 0; i_27 < 1024; ++i_27) {
+        debug_print_buffer_value("[DEBUG] acc_s after softmax (P):", "acc_s", i_27, smem_4[i_27]);
       }
     }
   }
   #pragma unroll
-  for (int i_29 = 0; i_29 < 32; ++i_29) {
-    acc_o[i_29] = (acc_o[i_29] * alpha[((i_29 & 3) >> 1)]);
+  for (int i_28 = 0; i_28 < 32; ++i_28) {
+    acc_o[i_28] = (acc_o[i_28] * alpha[((i_28 & 3) >> 1)]);
   }
   __syncthreads();
   #pragma unroll
-  for (int i_30 = 0; i_30 < 1; ++i_30) {
+  for (int i_29 = 0; i_29 < 1; ++i_29) {
     tl::ptx_stmatrix_x2((&(((bfloat16_t*)buf_dyn_shmem)[(((((((int)threadIdx.x) & 15) * 64) + ((((((int)threadIdx.x) >> 7) + ((((int)threadIdx.x) & 7) >> 2)) & 1) * 32)) + (((((((int)threadIdx.x) & 127) >> 6) + ((((int)threadIdx.x) & 3) >> 1)) & 1) * 16)) + (((((((int)threadIdx.x) & 63) >> 5) + (((int)threadIdx.x) & 1)) & 1) * 8))])), __pack_half2(((bfloat16_t)acc_s[0]), ((bfloat16_t)acc_s[1])), __pack_half2(((bfloat16_t)acc_s[2]), ((bfloat16_t)acc_s[3])));
   }
   tl::fence_proxy_async();
@@ -314,61 +293,61 @@ extern "C" __global__ void __launch_bounds__(256, 1) main_kernel(int* __restrict
   tl::gemm_ss<16, 512, 64, 1, 8, 0, 0, 0, 64, 512, 0, 0, false>((&(((bfloat16_t*)buf_dyn_shmem)[0])), (&(((bfloat16_t*)buf_dyn_shmem)[17408])), (&(acc_o[0])));
   if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
     #pragma unroll
-    for (int i_31 = 0; i_31 < 16; ++i_31) {
-      *(float2*)(smem_6 + ((((((i_31 & 1) * 4096) + (((((int)threadIdx.x) & 31) >> 2) * 512)) + ((i_31 >> 1) * 64)) + ((((int)threadIdx.x) >> 5) * 8)) + ((((int)threadIdx.x) & 3) * 2))) = *(float2*)(acc_o + (i_31 * 2));
+    for (int i_30 = 0; i_30 < 16; ++i_30) {
+      *(float2*)(smem_5 + ((((((i_30 & 1) * 4096) + (((((int)threadIdx.x) & 31) >> 2) * 512)) + ((i_30 >> 1) * 64)) + ((((int)threadIdx.x) >> 5) * 8)) + ((((int)threadIdx.x) & 3) * 2))) = *(float2*)(acc_o + (i_30 * 2));
     }
   }
   __syncthreads();
   if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
     if (((int)threadIdx.x) == 0) {
-      for (int i_32 = 0; i_32 < 8192; ++i_32) {
-        debug_print_buffer_value("[DEBUG] acc_o after PV GEMM (first iter):", "acc_o", i_32, smem_6[i_32]);
+      for (int i_31 = 0; i_31 < 8192; ++i_31) {
+        debug_print_buffer_value("[DEBUG] acc_o after PV GEMM (first iter):", "acc_o", i_31, smem_5[i_31]);
       }
     }
   }
   #pragma unroll
-  for (int i_33 = 0; i_33 < 32; ++i_33) {
-    acc_o[i_33] = (acc_o[i_33] / sumexp[((i_33 & 3) >> 1)]);
+  for (int i_32 = 0; i_32 < 32; ++i_32) {
+    acc_o[i_32] = (acc_o[i_32] / sumexp[((i_32 & 3) >> 1)]);
   }
   #pragma unroll
-  for (int i_34 = 0; i_34 < 2; ++i_34) {
-    sumexp[i_34] = (log2f(sumexp[i_34]) + (m_i[i_34] * 0x1.ec709dbe8903ep-5f/*6.011229e-02*/));
+  for (int i_33 = 0; i_33 < 2; ++i_33) {
+    sumexp[i_33] = (log2f(sumexp[i_33]) + (m_i[i_33] * 0x1.ec709dbe8903ep-5f/*6.011229e-02*/));
   }
   if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
     #pragma unroll
-    for (int i_35 = 0; i_35 < 16; ++i_35) {
-      *(float2*)(smem_7 + ((((((i_35 & 1) * 4096) + (((((int)threadIdx.x) & 31) >> 2) * 512)) + ((i_35 >> 1) * 64)) + ((((int)threadIdx.x) >> 5) * 8)) + ((((int)threadIdx.x) & 3) * 2))) = *(float2*)(acc_o + (i_35 * 2));
+    for (int i_34 = 0; i_34 < 16; ++i_34) {
+      *(float2*)(smem_6 + ((((((i_34 & 1) * 4096) + (((((int)threadIdx.x) & 31) >> 2) * 512)) + ((i_34 >> 1) * 64)) + ((((int)threadIdx.x) >> 5) * 8)) + ((((int)threadIdx.x) & 3) * 2))) = *(float2*)(acc_o + (i_34 * 2));
     }
     __syncthreads();
     if (((int)threadIdx.x) == 0) {
-      for (int i_36 = 0; i_36 < 8192; ++i_36) {
-        debug_print_buffer_value("[DEBUG] acc_o (final output after rescale):", "acc_o", i_36, smem_7[i_36]);
+      for (int i_35 = 0; i_35 < 8192; ++i_35) {
+        debug_print_buffer_value("[DEBUG] acc_o (final output after rescale):", "acc_o", i_35, smem_6[i_35]);
       }
     }
     if ((((((int)threadIdx.x) & 3) * 8) + (((int)threadIdx.x) >> 5)) == 0) {
       #pragma unroll
-      for (int i_37 = 0; i_37 < 2; ++i_37) {
-        smem_8[((i_37 * 8) + ((((int)threadIdx.x) & 31) >> 2))] = sumexp[i_37];
+      for (int i_36 = 0; i_36 < 2; ++i_36) {
+        smem_7[((i_36 * 8) + ((((int)threadIdx.x) & 31) >> 2))] = sumexp[i_36];
       }
     }
     __syncthreads();
     if (((int)threadIdx.x) == 0) {
-      for (int i_38 = 0; i_38 < 16; ++i_38) {
-        debug_print_buffer_value("[DEBUG] sumexp (final LSE):", "sumexp", i_38, smem_8[i_38]);
+      for (int i_37 = 0; i_37 < 16; ++i_37) {
+        debug_print_buffer_value("[DEBUG] sumexp (final LSE):", "sumexp", i_37, smem_7[i_37]);
       }
     }
   }
   #pragma unroll
-  for (int i_39 = 0; i_39 < 16; ++i_39) {
-    uint1 __5;
-    float2 v__3 = *(float2*)(acc_o + (i_39 * 2));
-    *reinterpret_cast<__nv_bfloat162*>(&(__5)) = __float22bfloat162_rn(*(float2*)(&(v__3)));
-    *(uint1*)(Output + (((((((((int64_t)((int)blockIdx.x)) * (int64_t)8192) + ((((int64_t)((int)blockIdx.y)) * ((int64_t)seq_len)) * (int64_t)8192)) + ((((int64_t)i_39) & (int64_t)1) * (int64_t)4096)) + (((((int64_t)((int)threadIdx.x)) & (int64_t)31) >> (int64_t)2) * (int64_t)512)) + ((((int64_t)i_39) >> (int64_t)1) * (int64_t)64)) + ((((int64_t)((int)threadIdx.x)) >> (int64_t)5) * (int64_t)8)) + ((((int64_t)((int)threadIdx.x)) & (int64_t)3) * (int64_t)2))) = __5;
+  for (int i_38 = 0; i_38 < 16; ++i_38) {
+    uint1 __3;
+    float2 v__2 = *(float2*)(acc_o + (i_38 * 2));
+    *reinterpret_cast<__nv_bfloat162*>(&(__3)) = __float22bfloat162_rn(*(float2*)(&(v__2)));
+    *(uint1*)(Output + (((((((((int64_t)((int)blockIdx.x)) * (int64_t)8192) + ((((int64_t)((int)blockIdx.y)) * ((int64_t)seq_len)) * (int64_t)8192)) + ((((int64_t)i_38) & (int64_t)1) * (int64_t)4096)) + (((((int64_t)((int)threadIdx.x)) & (int64_t)31) >> (int64_t)2) * (int64_t)512)) + ((((int64_t)i_38) >> (int64_t)1) * (int64_t)64)) + ((((int64_t)((int)threadIdx.x)) >> (int64_t)5) * (int64_t)8)) + ((((int64_t)((int)threadIdx.x)) & (int64_t)3) * (int64_t)2))) = __3;
   }
   if ((((((int)threadIdx.x) & 3) * 8) + (((int)threadIdx.x) >> 5)) == 0) {
     #pragma unroll
-    for (int i_40 = 0; i_40 < 2; ++i_40) {
-      Lse[((((((int64_t)((int)blockIdx.x)) * (int64_t)16) + ((((int64_t)((int)blockIdx.y)) * ((int64_t)seq_len)) * (int64_t)16)) + (((int64_t)i_40) * (int64_t)8)) + ((((int64_t)((int)threadIdx.x)) & (int64_t)31) >> (int64_t)2))] = sumexp[i_40];
+    for (int i_39 = 0; i_39 < 2; ++i_39) {
+      Lse[((((((int64_t)((int)blockIdx.x)) * (int64_t)16) + ((((int64_t)((int)blockIdx.y)) * ((int64_t)seq_len)) * (int64_t)16)) + (((int64_t)i_39) * (int64_t)8)) + ((((int64_t)((int)threadIdx.x)) & (int64_t)31) >> (int64_t)2))] = sumexp[i_39];
     }
   }
 }
