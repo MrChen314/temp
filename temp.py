@@ -624,73 +624,73 @@ def test_performance(
         traceback.print_exc()
         results.append({"name": "基础版本", "time_ms": float('inf'), "success": False})
 
-    # ========================================================================
-    # 2. 流水线版本
-    # ========================================================================
-    print("\n[2] 流水线版本 (sparse_mla_fwd_pipelined)")
-    print("-" * 40)
-    try:
-        # 流水线版本使用固定参数
-        kv_stride = 1
-        q_start_s_index = 0
-        CP0 = (q_start_s_index == 0)
+    # # ========================================================================
+    # # 2. 流水线版本
+    # # ========================================================================
+    # print("\n[2] 流水线版本 (sparse_mla_fwd_pipelined)")
+    # print("-" * 40)
+    # try:
+    #     # 流水线版本使用固定参数
+    #     kv_stride = 1
+    #     q_start_s_index = 0
+    #     CP0 = (q_start_s_index == 0)
         
-        kernel_pipelined = sparse_mla_fwd_pipelined(
-            batch=B,
-            seq_len=S,
-            seq_len_kv=SKV,
-            heads=H,
-            dim=DV,
-            tail_dim=tail_dim,
-            topk=topk,
-            kv_stride=kv_stride,
-            kv_group=HKV,
-            sm_scale=None,
-            is_causal=True,
-            CP0=CP0,
-            block_I=block_I,
-            num_stages=0,  # 流水线版本使用手动 staging
-            threads=384,   # 流水线版本使用 384 threads
-        )
+    #     kernel_pipelined = sparse_mla_fwd_pipelined(
+    #         batch=B,
+    #         seq_len=S,
+    #         seq_len_kv=SKV,
+    #         heads=H,
+    #         dim=DV,
+    #         tail_dim=tail_dim,
+    #         topk=topk,
+    #         kv_stride=kv_stride,
+    #         kv_group=HKV,
+    #         sm_scale=None,
+    #         is_causal=True,
+    #         CP0=CP0,
+    #         block_I=block_I,
+    #         num_stages=0,  # 流水线版本使用手动 staging
+    #         threads=384,   # 流水线版本使用 384 threads
+    #     )
         
-        q_start_index_t = torch.tensor([q_start_s_index], dtype=torch.int32, device="cuda")
+    #     q_start_index_t = torch.tensor([q_start_s_index], dtype=torch.int32, device="cuda")
         
-        # 运行一次
-        out_pipelined, lse_pipelined = kernel_pipelined(q, kv, indices, q_start_index_t)
-        if q_start_s_index == 0 and kv_stride > 1:
-            out_pipelined[:, :kv_stride - 1, :, :] = 0
+    #     # 运行一次
+    #     out_pipelined, lse_pipelined = kernel_pipelined(q, kv, indices, q_start_index_t)
+    #     if q_start_s_index == 0 and kv_stride > 1:
+    #         out_pipelined[:, :kv_stride - 1, :, :] = 0
         
-        # 正确性验证
-        if check_correctness:
-            if ref_out is None:
-                ref_out = ref_sparse_mla_fwd(q, kv, indices, d_v=DV)
-            try:
-                torch.testing.assert_close(out_pipelined, ref_out, rtol=1e-2, atol=1e-2)
-                print("  ✓ 正确性验证通过")
-            except AssertionError:
-                max_diff = (out_pipelined - ref_out).abs().max().item()
-                print(f"  ✗ 正确性验证失败，最大差异: {max_diff:.6f}")
+    #     # 正确性验证
+    #     if check_correctness:
+    #         if ref_out is None:
+    #             ref_out = ref_sparse_mla_fwd(q, kv, indices, d_v=DV)
+    #         try:
+    #             torch.testing.assert_close(out_pipelined, ref_out, rtol=1e-2, atol=1e-2)
+    #             print("  ✓ 正确性验证通过")
+    #         except AssertionError:
+    #             max_diff = (out_pipelined - ref_out).abs().max().item()
+    #             print(f"  ✗ 正确性验证失败，最大差异: {max_diff:.6f}")
         
-        # 性能测试
-        def fn_pipelined():
-            out, lse = kernel_pipelined(q, kv, indices, q_start_index_t)
-            return out, lse
+    #     # 性能测试
+    #     def fn_pipelined():
+    #         out, lse = kernel_pipelined(q, kv, indices, q_start_index_t)
+    #         return out, lse
         
-        from tilelang.profiler import do_bench
-        ms_pipelined = do_bench(fn_pipelined, rep=rep, warmup=warmup)
+    #     from tilelang.profiler import do_bench
+    #     ms_pipelined = do_bench(fn_pipelined, rep=rep, warmup=warmup)
         
-        results.append({
-            "name": "流水线版本 (sparse_mla_fwd_pipelined)",
-            "time_ms": ms_pipelined,
-            "success": True,
-        })
-        print(f"  平均时间: {ms_pipelined:.4f} ms")
+    #     results.append({
+    #         "name": "流水线版本 (sparse_mla_fwd_pipelined)",
+    #         "time_ms": ms_pipelined,
+    #         "success": True,
+    #     })
+    #     print(f"  平均时间: {ms_pipelined:.4f} ms")
         
-    except Exception as e:
-        import traceback
-        print(f"  ✗ 错误: {e}")
-        traceback.print_exc()
-        results.append({"name": "流水线版本", "time_ms": float('inf'), "success": False})
+    # except Exception as e:
+    #     import traceback
+    #     print(f"  ✗ 错误: {e}")
+    #     traceback.print_exc()
+    #     results.append({"name": "流水线版本", "time_ms": float('inf'), "success": False})
 
     # ========================================================================
     # 3. PyTorch 参考实现
@@ -766,16 +766,17 @@ if __name__ == "__main__":
     parser.add_argument("--no-check", action="store_true", help="跳过正确性检查")
     parser.add_argument("--warmup", type=int, default=50, help="预热次数")
     parser.add_argument("--rep", type=int, default=100, help="重复次数")
-    parser.add_argument("--S", type=int, default=4096, help="Sequence length")
-    parser.add_argument("--SKV", type=int, default=4096, help="KV sequence length")
     args = parser.parse_args()
     
+    seq_len = 16
+    TP = 32
+
     # 使用 sparse_mla_fwd.py 的测试配置
     test_performance(
         B=1,
-        S=args.S,
-        SKV=args.SKV,
-        H=128,
+        S=seq_len*1024,
+        SKV=seq_len*1024,
+        H=128/TP,
         HKV=1,
         DQK=576,
         DV=512,
