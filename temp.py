@@ -1,380 +1,973 @@
-============================================================
-Testing sparse_mla_fwd_debug with small parameters
-B=1, S=4, SKV=8, H=16, HKV=1
-DQK=576, DV=512, topk=64
-============================================================
+# ruff: noqa
+"""
+Sparse MLA Forward - 优化版本对比
+针对 NVIDIA H20 GPU 优化 (78 SMs, 227KB shared memory per block with opt-in)
 
-[INFO] Running kernel with T.print debug statements...
-============================================================
-2025-12-19 12:18:32  [TileLang:tilelang.jit.kernel:INFO]: TileLang begins to compile kernel `main` with `out_idx=[-2, -1]`
-ptxas error   : Entry function 'main_kernel' uses too much shared data (0x12400 bytes, 0xc000 max)
-Traceback (most recent call last):
-  File "/home/users/chenquanlin/workspace/a0p6b_dsa_stage2/test2.py", line 287, in <module>
-    test_sparse_mla_fwd_debug()
-  File "/home/users/chenquanlin/workspace/a0p6b_dsa_stage2/test2.py", line 271, in test_sparse_mla_fwd_debug
-    tl_out, tl_lse = sparse_mla_fwd_debug_interface(
-                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/users/chenquanlin/workspace/a0p6b_dsa_stage2/test2.py", line 225, in sparse_mla_fwd_debug_interface
-    kernel = sparse_mla_fwd_debug(
-             ^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py", line 205, in wrapper
-    kernel_result = compile(
-                    ^^^^^^^^
-  File "/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py", line 70, in compile
-    return cached(
-           ^^^^^^^
-  File "/usr/local/lib/python3.12/dist-packages/tilelang/cache/__init__.py", line 29, in cached
-    return _kernel_cache_instance.cached(
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/local/lib/python3.12/dist-packages/tilelang/cache/kernel_cache.py", line 185, in cached
-    kernel = JITKernel(
-             ^^^^^^^^^^
-  File "/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py", line 121, in __init__
-    adapter = self._compile_and_create_adapter(func, out_idx)
-              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py", line 250, in _compile_and_create_adapter
-    adapter = CythonKernelAdapter(
-              ^^^^^^^^^^^^^^^^^^^^
-  File "/usr/local/lib/python3.12/dist-packages/tilelang/jit/adapter/cython/adapter.py", line 128, in __init__
-    self.lib_generator.compile_lib()
-  File "/usr/local/lib/python3.12/dist-packages/tilelang/jit/adapter/libgen.py", line 164, in compile_lib
-    raise RuntimeError(f"Compilation Failed! {command}"
-RuntimeError: Compilation Failed! ['/usr/local/cuda/bin/nvcc', '-std=c++17', '-w', '-Xcudafe', '--diag_suppress=177', '--compiler-options', '-fPIC', '-lineinfo', '--shared', '/tmp/tmpvkpsdjzd.cu', '-lcuda', '-gencode', 'arch=compute_90a,code=sm_90a', '-I/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/cutlass/include', '-I/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/../src', '-o', '/tmp/tmpvkpsdjzd.so']
- #include <math_constants.h>
-#include <tl_templates/cuda/gemm.h>
-#include <tl_templates/cuda/copy.h>
-#include <tl_templates/cuda/reduce.h>
-#include <tl_templates/cuda/ldsm.h>
-#include <tl_templates/cuda/threadblock_swizzle.h>
-#include <tl_templates/cuda/debug.h>
-#ifdef ENABLE_BF16
-#include <tl_templates/cuda/cuda_bf16_fallbacks.cuh>
-#endif
+输入配置 (来自 sparse_mal_fwd_input.txt):
+- heads=2, dim=256, tail_dim=64, topk=2048, kv_group=1
+- q.shape:[1, 2048, 2, 320], kv.shape:[1, 2048, 1, 320]
 
-extern "C" __global__ void main_kernel(int* __restrict__ Indices, bfloat16_t* __restrict__ KV, float* __restrict__ Lse, bfloat16_t* __restrict__ Output, bfloat16_t* __restrict__ Q, int batch, int seq_len, int seq_len_kv);
-extern "C" __global__ void __launch_bounds__(256, 1) main_kernel(int* __restrict__ Indices, bfloat16_t* __restrict__ KV, float* __restrict__ Lse, bfloat16_t* __restrict__ Output, bfloat16_t* __restrict__ Q, int batch, int seq_len, int seq_len_kv) {
-  extern __shared__ __align__(1024) uchar buf_dyn_shmem[];
-  float acc_o[32];
-  float sumexp[2];
-  float m_i[2];
-  signed char mask[2];
-  float acc_s[4];
-  __shared__ float smem[1024];
-  float m_i_prev[2];
-  float alpha[2];
-  float sumexp_i[2];
-  __shared__ float smem_1[16];
-  __shared__ float smem_2[16];
-  __shared__ float smem_3[16];
-  __shared__ float smem_4[1024];
-  __shared__ float smem_5[8192];
-  __shared__ float smem_6[8192];
-  __shared__ float smem_7[16];
-  #pragma unroll
-  for (int i = 0; i < 16; ++i) {
-    *(float2*)(acc_o + (i * 2)) = make_float2(0x0p+0f/*0.000000e+00*/, 0x0p+0f/*0.000000e+00*/);
-  }
-  #pragma unroll
-  for (int i_1 = 0; i_1 < 2; ++i_1) {
-    sumexp[i_1] = 0x0p+0f/*0.000000e+00*/;
-  }
-  #pragma unroll
-  for (int i_2 = 0; i_2 < 2; ++i_2) {
-    m_i[i_2] = -0x1p+30f/*-1.073742e+09*/;
-  }
-  #pragma unroll
-  for (int i_3 = 0; i_3 < 4; ++i_3) {
-    *(uint4*)(((bfloat16_t*)buf_dyn_shmem) + ((((((((((int)threadIdx.x) & 63) >> 3) * 1024) + (i_3 * 256)) + ((((int)threadIdx.x) >> 6) * 64)) + (((((((int)threadIdx.x) & 7) >> 2) + (i_3 & 1)) & 1) * 32)) + ((((((int)threadIdx.x) >> 7) + ((((int)threadIdx.x) & 3) >> 1)) & 1) * 16)) + (((((((int)threadIdx.x) & 127) >> 6) + (((int)threadIdx.x) & 1)) & 1) * 8))) = *(uint4*)(Q + (((((((int64_t)((int)blockIdx.x)) * (int64_t)9216) + ((((int64_t)((int)blockIdx.y)) * ((int64_t)seq_len)) * (int64_t)9216)) + (((int64_t)i_3) * (int64_t)2304)) + ((((int64_t)((int)threadIdx.x)) >> (int64_t)6) * (int64_t)576)) + ((((int64_t)((int)threadIdx.x)) & (int64_t)63) * (int64_t)8)));
-  }
-  *(uint2*)(((bfloat16_t*)buf_dyn_shmem) + (((((((((int)threadIdx.x) >> 4) * 64) + (((((((int)threadIdx.x) & 127) >> 6) + ((((int)threadIdx.x) & 15) >> 3)) & 1) * 32)) + (((((((int)threadIdx.x) & 63) >> 5) + ((((int)threadIdx.x) & 7) >> 2)) & 1) * 16)) + (((((((int)threadIdx.x) & 31) >> 4) + ((((int)threadIdx.x) & 3) >> 1)) & 1) * 8)) + ((((int)threadIdx.x) & 1) * 4)) + 8192)) = *(uint2*)(Q + (((((((int64_t)((int)blockIdx.x)) * (int64_t)9216) + ((((int64_t)((int)blockIdx.y)) * ((int64_t)seq_len)) * (int64_t)9216)) + ((((int64_t)((int)threadIdx.x)) >> (int64_t)4) * (int64_t)576)) + ((((int64_t)((int)threadIdx.x)) & (int64_t)15) * (int64_t)4)) + (int64_t)512));
-  __syncthreads();
-  if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
-    debug_print_var("[DEBUG] b_i:", ((int)blockIdx.y));
-    debug_print_var("[DEBUG] s_i:", ((int)blockIdx.x));
-    debug_print_var("[DEBUG] H0:", 0);
-    debug_print_var("[DEBUG] H1:", 16);
-    if (((int)threadIdx.x) == 0) {
-      for (int i_4 = 0; i_4 < 8192; ++i_4) {
-        debug_print_buffer_value("[DEBUG] Q_shared after copy:", "Q_shared", i_4, ((bfloat16_t*)buf_dyn_shmem)[((((((((i_4 & 511) >> 6) * 1024) + ((i_4 >> 9) * 64)) + (((((i_4 & 4095) >> 11) + ((i_4 & 63) >> 5)) & 1) * 32)) + (((((i_4 & 2047) >> 10) + ((i_4 & 31) >> 4)) & 1) * 16)) + (((((i_4 & 1023) >> 9) + ((i_4 & 15) >> 3)) & 1) * 8)) + (i_4 & 7))]);
-      }
-      for (int i_5 = 0; i_5 < 1024; ++i_5) {
-        debug_print_buffer_value("[DEBUG] Q_tail_shared after copy:", "Q_tail_shared", i_5, ((bfloat16_t*)buf_dyn_shmem)[(((((((i_5 >> 6) * 64) + (((((i_5 & 511) >> 8) + ((i_5 & 63) >> 5)) & 1) * 32)) + (((((i_5 & 255) >> 7) + ((i_5 & 31) >> 4)) & 1) * 16)) + (((((i_5 & 127) >> 6) + ((i_5 & 15) >> 3)) & 1) * 8)) + (i_5 & 7)) + 8192)]);
-      }
-    }
-  }
-  #pragma unroll
-  for (int i_6 = 0; i_6 < 2; ++i_6) {
-    tl::cp_async_gs_conditional<16>(buf_dyn_shmem+((((((i_6 * 4096) + ((((int)threadIdx.x) >> 3) * 128)) + (((((((int)threadIdx.x) & 63) >> 5) + ((((int)threadIdx.x) & 7) >> 2)) & 1) * 64)) + (((((((int)threadIdx.x) & 31) >> 4) + ((((int)threadIdx.x) & 3) >> 1)) & 1) * 32)) + (((((((int)threadIdx.x) & 15) >> 3) + (((int)threadIdx.x) & 1)) & 1) * 16)) + 18432), KV+((((((int64_t)Indices[((((((int64_t)((int)blockIdx.x)) * (int64_t)64) + ((((int64_t)((int)blockIdx.y)) * ((int64_t)seq_len)) * (int64_t)64)) + (((int64_t)i_6) * (int64_t)32)) + (((int64_t)((int)threadIdx.x)) >> (int64_t)3))]) * (int64_t)576) + ((((int64_t)((int)blockIdx.y)) * ((int64_t)seq_len_kv)) * (int64_t)576)) + ((((int64_t)((int)threadIdx.x)) & (int64_t)7) * (int64_t)8)) + (int64_t)512), ((0 <= Indices[((((((int64_t)((int)blockIdx.x)) * (int64_t)64) + ((((int64_t)((int)blockIdx.y)) * ((int64_t)seq_len)) * (int64_t)64)) + (((int64_t)i_6) * (int64_t)32)) + (((int64_t)((int)threadIdx.x)) >> (int64_t)3))]) && (Indices[((((((int64_t)((int)blockIdx.x)) * (int64_t)64) + ((((int64_t)((int)blockIdx.y)) * ((int64_t)seq_len)) * (int64_t)64)) + (((int64_t)i_6) * (int64_t)32)) + (((int64_t)((int)threadIdx.x)) >> (int64_t)3))] < seq_len_kv)));
-  }
-  tl::cp_async_commit();
-  #pragma unroll
-  for (int i_7 = 0; i_7 < 16; ++i_7) {
-    tl::cp_async_gs_conditional<16>(buf_dyn_shmem+(((((((((((int)threadIdx.x) & 63) >> 3) * 8192) + (i_7 * 512)) + ((((int)threadIdx.x) >> 6) * 128)) + (((((((int)threadIdx.x) & 7) >> 2) + (i_7 & 1)) & 1) * 64)) + ((((((int)threadIdx.x) >> 7) + ((((int)threadIdx.x) & 3) >> 1)) & 1) * 32)) + (((((((int)threadIdx.x) & 127) >> 6) + (((int)threadIdx.x) & 1)) & 1) * 16)) + 34816), KV+(((((int64_t)Indices[((((((int64_t)((int)blockIdx.x)) * (int64_t)64) + ((((int64_t)((int)blockIdx.y)) * ((int64_t)seq_len)) * (int64_t)64)) + (((int64_t)i_7) * (int64_t)4)) + (((int64_t)((int)threadIdx.x)) >> (int64_t)6))]) * (int64_t)576) + ((((int64_t)((int)blockIdx.y)) * ((int64_t)seq_len_kv)) * (int64_t)576)) + ((((int64_t)((int)threadIdx.x)) & (int64_t)63) * (int64_t)8)), ((0 <= Indices[((((((int64_t)((int)blockIdx.x)) * (int64_t)64) + ((((int64_t)((int)blockIdx.y)) * ((int64_t)seq_len)) * (int64_t)64)) + (((int64_t)i_7) * (int64_t)4)) + (((int64_t)((int)threadIdx.x)) >> (int64_t)6))]) && (Indices[((((((int64_t)((int)blockIdx.x)) * (int64_t)64) + ((((int64_t)((int)blockIdx.y)) * ((int64_t)seq_len)) * (int64_t)64)) + (((int64_t)i_7) * (int64_t)4)) + (((int64_t)((int)threadIdx.x)) >> (int64_t)6))] < seq_len_kv)));
-  }
-  tl::cp_async_commit();
-  tl::fence_proxy_async();
-  tl::fence_proxy_async();
-  char2 __1;
-  ushort2 __2;
-    int2 v_ = *(int2*)(Indices + ((((((int64_t)((int)blockIdx.x)) * (int64_t)64) + ((((int64_t)((int)blockIdx.y)) * ((int64_t)seq_len)) * (int64_t)64)) + ((((int64_t)((int)threadIdx.x)) >> (int64_t)5) * (int64_t)8)) + ((((int64_t)((int)threadIdx.x)) & (int64_t)3) * (int64_t)2)));
-    int2 v__1 = make_int2(((int)blockIdx.x), ((int)blockIdx.x));
-    __2.x = (v_.x<=v__1.x);
-    __2.y = (v_.y<=v__1.y);
-  __1.x=((signed char)(__2.x));
-  __1.y=((signed char)(__2.y));
-  *(char2*)(mask + 0) = __1;
-  if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
-    debug_print_var("[DEBUG] i_i (iteration):", 0);
-  }
-  tl::cp_async_wait<0>();
-  __syncthreads();
-  if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
-    if (((int)threadIdx.x) == 0) {
-      for (int i_8 = 0; i_8 < 32768; ++i_8) {
-        debug_print_buffer_value("[DEBUG] KV_shared after copy:", "KV_shared", i_8, ((bfloat16_t*)buf_dyn_shmem)[(((((((((i_8 & 511) >> 6) * 4096) + ((i_8 >> 9) * 64)) + (((((i_8 & 4095) >> 11) + ((i_8 & 63) >> 5)) & 1) * 32)) + (((((i_8 & 2047) >> 10) + ((i_8 & 31) >> 4)) & 1) * 16)) + (((((i_8 & 1023) >> 9) + ((i_8 & 15) >> 3)) & 1) * 8)) + (i_8 & 7)) + 17408)]);
-      }
-    }
-  }
-  tl::cp_async_wait<1>();
-  __syncthreads();
-  if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
-    if (((int)threadIdx.x) == 0) {
-      for (int i_9 = 0; i_9 < 4096; ++i_9) {
-        debug_print_buffer_value("[DEBUG] K_tail_shared after copy:", "K_tail_shared", i_9, ((bfloat16_t*)buf_dyn_shmem)[(((((((i_9 >> 6) * 64) + (((((i_9 & 511) >> 8) + ((i_9 & 63) >> 5)) & 1) * 32)) + (((((i_9 & 255) >> 7) + ((i_9 & 31) >> 4)) & 1) * 16)) + (((((i_9 & 127) >> 6) + ((i_9 & 15) >> 3)) & 1) * 8)) + (i_9 & 7)) + 9216)]);
-      }
-    }
-  }
-  #pragma unroll
-  for (int i_10 = 0; i_10 < 4; ++i_10) {
-    float condval;
-    if (((bool)mask[(i_10 & 1)])) {
-      condval = 0x0p+0f/*0.000000e+00*/;
-    } else {
-      condval = -CUDART_INF_F;
-    }
-    acc_s[i_10] = condval;
-  }
-  tl::fence_proxy_async();
-  tl::cp_async_wait<0>();
-  __syncthreads();
-  tl::gemm_ss<16, 64, 512, 1, 8, 0, 1, 0, 512, 512, 0, 0, false>((&(((bfloat16_t*)buf_dyn_shmem)[0])), (&(((bfloat16_t*)buf_dyn_shmem)[17408])), (&(acc_s[0])));
-  tl::cp_async_wait<1>();
-  __syncthreads();
-  tl::gemm_ss<16, 64, 64, 1, 8, 0, 1, 0, 64, 64, 0, 0, false>((&(((bfloat16_t*)buf_dyn_shmem)[8192])), (&(((bfloat16_t*)buf_dyn_shmem)[9216])), (&(acc_s[0])));
-  if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
-    #pragma unroll
-    for (int i_11 = 0; i_11 < 2; ++i_11) {
-      *(float2*)(smem + ((((i_11 * 512) + (((((int)threadIdx.x) & 31) >> 2) * 64)) + ((((int)threadIdx.x) >> 5) * 8)) + ((((int)threadIdx.x) & 3) * 2))) = *(float2*)(acc_s + (i_11 * 2));
-    }
-  }
-  __syncthreads();
-  if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
-    if (((int)threadIdx.x) == 0) {
-      for (int i_12 = 0; i_12 < 1024; ++i_12) {
-        debug_print_buffer_value("[DEBUG] acc_s after GEMM (QK^T):", "acc_s", i_12, smem[i_12]);
-      }
-    }
-  }
-  #pragma unroll
-  for (int i_13 = 0; i_13 < 2; ++i_13) {
-    m_i_prev[i_13] = m_i[i_13];
-  }
-  __syncthreads();
-  #pragma unroll
-  for (int i_14 = 0; i_14 < 2; ++i_14) {
-    #pragma unroll
-    for (int rv = 0; rv < 2; ++rv) {
-      m_i[i_14] = max(m_i[i_14], acc_s[((i_14 * 2) + rv)]);
-    }
-    m_i[i_14] = tl::AllReduce<tl::MaxOp, 256, 32, 0, 256>::run_hopper(m_i[i_14], (&(((float*)buf_dyn_shmem)[0])));
-    m_i[i_14] = tl::AllReduce<tl::MaxOp, 4, 1, 0, 256>::run_hopper(m_i[i_14]);
-  }
-  #pragma unroll
-  for (int i_15 = 0; i_15 < 2; ++i_15) {
-    m_i[i_15] = max(m_i[i_15], m_i_prev[i_15]);
-  }
-  #pragma unroll
-  for (int i_16 = 0; i_16 < 2; ++i_16) {
-    alpha[i_16] = exp2f(((m_i_prev[i_16] - m_i[i_16]) * 0x1.ec709dbe8903ep-5f/*6.011229e-02*/));
-  }
-  #pragma unroll
-  for (int i_17 = 0; i_17 < 4; ++i_17) {
-    acc_s[i_17] = exp2f(((acc_s[i_17] * 0x1.ec709dbe8903ep-5f/*6.011229e-02*/) - (m_i[(i_17 >> 1)] * 0x1.ec709dbe8903ep-5f/*6.011229e-02*/)));
-  }
-  __syncthreads();
-  #pragma unroll
-  for (int i_18 = 0; i_18 < 2; ++i_18) {
-    sumexp_i[i_18] = 0x0p+0f/*0.000000e+00*/;
-    #pragma unroll
-    for (int rv_1 = 0; rv_1 < 2; ++rv_1) {
-      sumexp_i[i_18] = (sumexp_i[i_18] + acc_s[((i_18 * 2) + rv_1)]);
-    }
-    sumexp_i[i_18] = tl::AllReduce<tl::SumOp, 256, 32, 0, 256>::run_hopper(sumexp_i[i_18], (&(((float*)buf_dyn_shmem)[0])));
-    sumexp_i[i_18] = tl::AllReduce<tl::SumOp, 4, 1, 0, 256>::run_hopper(sumexp_i[i_18]);
-  }
-  #pragma unroll
-  for (int i_19 = 0; i_19 < 2; ++i_19) {
-    sumexp[i_19] = ((sumexp[i_19] * alpha[i_19]) + sumexp_i[i_19]);
-  }
-  if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
-    if ((((((int)threadIdx.x) & 3) * 8) + (((int)threadIdx.x) >> 5)) == 0) {
-      #pragma unroll
-      for (int i_20 = 0; i_20 < 2; ++i_20) {
-        smem_1[((i_20 * 8) + ((((int)threadIdx.x) & 31) >> 2))] = m_i[i_20];
-      }
-    }
-  }
-  __syncthreads();
-  if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
-    if (((int)threadIdx.x) == 0) {
-      for (int i_21 = 0; i_21 < 16; ++i_21) {
-        debug_print_buffer_value("[DEBUG] m_i (row max):", "m_i", i_21, smem_1[i_21]);
-      }
-    }
-  }
-  if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
-    if ((((((int)threadIdx.x) & 3) * 8) + (((int)threadIdx.x) >> 5)) == 0) {
-      #pragma unroll
-      for (int i_22 = 0; i_22 < 2; ++i_22) {
-        smem_2[((i_22 * 8) + ((((int)threadIdx.x) & 31) >> 2))] = alpha[i_22];
-      }
-    }
-  }
-  __syncthreads();
-  if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
-    if (((int)threadIdx.x) == 0) {
-      for (int i_23 = 0; i_23 < 16; ++i_23) {
-        debug_print_buffer_value("[DEBUG] alpha (rescale factor):", "alpha", i_23, smem_2[i_23]);
-      }
-    }
-  }
-  if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
-    if ((((((int)threadIdx.x) & 3) * 8) + (((int)threadIdx.x) >> 5)) == 0) {
-      #pragma unroll
-      for (int i_24 = 0; i_24 < 2; ++i_24) {
-        smem_3[((i_24 * 8) + ((((int)threadIdx.x) & 31) >> 2))] = sumexp[i_24];
-      }
-    }
-  }
-  __syncthreads();
-  if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
-    if (((int)threadIdx.x) == 0) {
-      for (int i_25 = 0; i_25 < 16; ++i_25) {
-        debug_print_buffer_value("[DEBUG] sumexp (sum of exp):", "sumexp", i_25, smem_3[i_25]);
-      }
-    }
-  }
-  if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
-    #pragma unroll
-    for (int i_26 = 0; i_26 < 2; ++i_26) {
-      *(float2*)(smem_4 + ((((i_26 * 512) + (((((int)threadIdx.x) & 31) >> 2) * 64)) + ((((int)threadIdx.x) >> 5) * 8)) + ((((int)threadIdx.x) & 3) * 2))) = *(float2*)(acc_s + (i_26 * 2));
-    }
-  }
-  __syncthreads();
-  if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
-    if (((int)threadIdx.x) == 0) {
-      for (int i_27 = 0; i_27 < 1024; ++i_27) {
-        debug_print_buffer_value("[DEBUG] acc_s after softmax (P):", "acc_s", i_27, smem_4[i_27]);
-      }
-    }
-  }
-  #pragma unroll
-  for (int i_28 = 0; i_28 < 32; ++i_28) {
-    acc_o[i_28] = (acc_o[i_28] * alpha[((i_28 & 3) >> 1)]);
-  }
-  __syncthreads();
-  #pragma unroll
-  for (int i_29 = 0; i_29 < 1; ++i_29) {
-    tl::ptx_stmatrix_x2((&(((bfloat16_t*)buf_dyn_shmem)[(((((((int)threadIdx.x) & 15) * 64) + ((((((int)threadIdx.x) >> 7) + ((((int)threadIdx.x) & 7) >> 2)) & 1) * 32)) + (((((((int)threadIdx.x) & 127) >> 6) + ((((int)threadIdx.x) & 3) >> 1)) & 1) * 16)) + (((((((int)threadIdx.x) & 63) >> 5) + (((int)threadIdx.x) & 1)) & 1) * 8))])), __pack_half2(((bfloat16_t)acc_s[0]), ((bfloat16_t)acc_s[1])), __pack_half2(((bfloat16_t)acc_s[2]), ((bfloat16_t)acc_s[3])));
-  }
-  tl::fence_proxy_async();
-  tl::cp_async_wait<0>();
-  __syncthreads();
-  tl::gemm_ss<16, 512, 64, 1, 8, 0, 0, 0, 64, 512, 0, 0, false>((&(((bfloat16_t*)buf_dyn_shmem)[0])), (&(((bfloat16_t*)buf_dyn_shmem)[17408])), (&(acc_o[0])));
-  if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
-    #pragma unroll
-    for (int i_30 = 0; i_30 < 16; ++i_30) {
-      *(float2*)(smem_5 + ((((((i_30 & 1) * 4096) + (((((int)threadIdx.x) & 31) >> 2) * 512)) + ((i_30 >> 1) * 64)) + ((((int)threadIdx.x) >> 5) * 8)) + ((((int)threadIdx.x) & 3) * 2))) = *(float2*)(acc_o + (i_30 * 2));
-    }
-  }
-  __syncthreads();
-  if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
-    if (((int)threadIdx.x) == 0) {
-      for (int i_31 = 0; i_31 < 8192; ++i_31) {
-        debug_print_buffer_value("[DEBUG] acc_o after PV GEMM (first iter):", "acc_o", i_31, smem_5[i_31]);
-      }
-    }
-  }
-  #pragma unroll
-  for (int i_32 = 0; i_32 < 32; ++i_32) {
-    acc_o[i_32] = (acc_o[i_32] / sumexp[((i_32 & 3) >> 1)]);
-  }
-  #pragma unroll
-  for (int i_33 = 0; i_33 < 2; ++i_33) {
-    sumexp[i_33] = (log2f(sumexp[i_33]) + (m_i[i_33] * 0x1.ec709dbe8903ep-5f/*6.011229e-02*/));
-  }
-  if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
-    #pragma unroll
-    for (int i_34 = 0; i_34 < 16; ++i_34) {
-      *(float2*)(smem_6 + ((((((i_34 & 1) * 4096) + (((((int)threadIdx.x) & 31) >> 2) * 512)) + ((i_34 >> 1) * 64)) + ((((int)threadIdx.x) >> 5) * 8)) + ((((int)threadIdx.x) & 3) * 2))) = *(float2*)(acc_o + (i_34 * 2));
-    }
-    __syncthreads();
-    if (((int)threadIdx.x) == 0) {
-      for (int i_35 = 0; i_35 < 8192; ++i_35) {
-        debug_print_buffer_value("[DEBUG] acc_o (final output after rescale):", "acc_o", i_35, smem_6[i_35]);
-      }
-    }
-    if ((((((int)threadIdx.x) & 3) * 8) + (((int)threadIdx.x) >> 5)) == 0) {
-      #pragma unroll
-      for (int i_36 = 0; i_36 < 2; ++i_36) {
-        smem_7[((i_36 * 8) + ((((int)threadIdx.x) & 31) >> 2))] = sumexp[i_36];
-      }
-    }
-    __syncthreads();
-    if (((int)threadIdx.x) == 0) {
-      for (int i_37 = 0; i_37 < 16; ++i_37) {
-        debug_print_buffer_value("[DEBUG] sumexp (final LSE):", "sumexp", i_37, smem_7[i_37]);
-      }
-    }
-  }
-  #pragma unroll
-  for (int i_38 = 0; i_38 < 16; ++i_38) {
-    uint1 __3;
-    float2 v__2 = *(float2*)(acc_o + (i_38 * 2));
-    *reinterpret_cast<__nv_bfloat162*>(&(__3)) = __float22bfloat162_rn(*(float2*)(&(v__2)));
-    *(uint1*)(Output + (((((((((int64_t)((int)blockIdx.x)) * (int64_t)8192) + ((((int64_t)((int)blockIdx.y)) * ((int64_t)seq_len)) * (int64_t)8192)) + ((((int64_t)i_38) & (int64_t)1) * (int64_t)4096)) + (((((int64_t)((int)threadIdx.x)) & (int64_t)31) >> (int64_t)2) * (int64_t)512)) + ((((int64_t)i_38) >> (int64_t)1) * (int64_t)64)) + ((((int64_t)((int)threadIdx.x)) >> (int64_t)5) * (int64_t)8)) + ((((int64_t)((int)threadIdx.x)) & (int64_t)3) * (int64_t)2))) = __3;
-  }
-  if ((((((int)threadIdx.x) & 3) * 8) + (((int)threadIdx.x) >> 5)) == 0) {
-    #pragma unroll
-    for (int i_39 = 0; i_39 < 2; ++i_39) {
-      Lse[((((((int64_t)((int)blockIdx.x)) * (int64_t)16) + ((((int64_t)((int)blockIdx.y)) * ((int64_t)seq_len)) * (int64_t)16)) + (((int64_t)i_39) * (int64_t)8)) + ((((int64_t)((int)threadIdx.x)) & (int64_t)31) >> (int64_t)2))] = sumexp[i_39];
-    }
-  }
-}
+优化方案:
+- 原始方案: 基于 sparse_mla_fwd.py，使用优化1配置 (block_I=64, num_stages=1, threads=128)
+- 优化2: 减少同步开销
+- 优化3: 预加载 Indices 到 shared memory
+- 优化4: 针对小 H 的特化
+"""
+import torch
+import tilelang
+from tilelang import language as T
 
-
-#define ERROR_BUF_SIZE 1024
-static char error_buf[ERROR_BUF_SIZE];
-
-extern "C" const char* get_last_error() {
-    return error_buf;
-}
-
-extern "C" int init() {
-    error_buf[0] = '\0';
+# ============================================================================
+# 原始方案: 使用优化1配置 (block_I=64, num_stages=1, threads=128)
+# ============================================================================
+@tilelang.jit(
+    out_idx=[-2, -1],
+    pass_configs={
+        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+    },
+)
+def sparse_mla_fwd_baseline(
+    heads,
+    dim,
+    tail_dim,
+    topk,
+    kv_group=1,
+    sm_scale=None,
+    is_causal=True,
+    block_I=64,
+    num_stages=1,  # 优化1: 从默认2改为1
+    threads=128,   # 优化1: 从默认256改为128
+):
+    """原始方案: 使用优化1的配置"""
+    assert dim == tilelang.math.next_power_of_2(dim)
+    assert tail_dim == tilelang.math.next_power_of_2(tail_dim)
+    assert is_causal == True
+    assert topk % block_I == 0
     
-    cudaError_t result_main_kernel = cudaFuncSetAttribute(main_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 165888);
-    if (result_main_kernel != cudaSuccess) {
-        snprintf(error_buf, ERROR_BUF_SIZE, "Failed to set the allowed dynamic shared memory size to %d with error: %s", 165888, cudaGetErrorString(result_main_kernel));
-        return -1;
-    }
+    if sm_scale is None:
+        sm_scale = (1.0 / (dim + tail_dim)) ** 0.5 * 1.44269504
+    else:
+        sm_scale = sm_scale * 1.44269504
 
-    return 0;
-}
+    batch = T.symbolic("batch")
+    seq_len = T.symbolic("seq_len")
+    seq_len_kv = T.symbolic("seq_len_kv")
 
-extern "C" int call(bfloat16_t* __restrict__ Q, bfloat16_t* __restrict__ KV, int* __restrict__ Indices, bfloat16_t* __restrict__ Output, float* __restrict__ Lse, int batch, int seq_len, int seq_len_kv, cudaStream_t stream=cudaStreamDefault) {
-        main_kernel<<<dim3(seq_len, batch, 1), dim3(256, 1, 1), 165888, stream>>>(Indices, KV, Lse, Output, Q, batch, seq_len, seq_len_kv);
-        TILELANG_CHECK_LAST_ERROR("main_kernel");
+    head_kv = heads // kv_group
+    q_shape = [batch, seq_len, heads, dim + tail_dim]
+    kv_shape = [batch, seq_len_kv, kv_group, dim + tail_dim]
+    o_shape = [batch, seq_len, heads, dim]
+    indices_shape = [batch, seq_len, kv_group, topk]
+    lse_shape = [batch, seq_len, heads]
+    indices_dtype = T.int32
+    dtype = T.bfloat16
+    accum_dtype = T.float32
 
-        return 0;
-}
+    H = head_kv
+    padded_H = max(tilelang.math.next_power_of_2(head_kv), 16)
+    BI = block_I
+    NI = tilelang.cdiv(topk, block_I)
+    D = dim
+    D_tail = tail_dim
+
+    REPLICATE_H = head_kv // 64 if head_kv > 64 else 1
+    H_per_block = padded_H if REPLICATE_H == 1 else 64
+
+    @T.prim_func
+    def main(
+        Q: T.Tensor(q_shape, dtype),
+        KV: T.Tensor(kv_shape, dtype),
+        Indices: T.Tensor(indices_shape, indices_dtype),
+        Output: T.Tensor(o_shape, dtype),
+        Lse: T.Tensor(lse_shape, accum_dtype),
+    ):
+        with T.Kernel(seq_len * REPLICATE_H, batch, kv_group, threads=threads) as (bx, by, bz):
+            Q_shared = T.alloc_shared([H_per_block, D], dtype)
+            Q_tail_shared = T.alloc_shared([H_per_block, D_tail], dtype)
+            KV_shared = T.alloc_shared([BI, D], dtype)
+            K_tail_shared = T.alloc_shared([BI, D_tail], dtype)
+            O_shared = T.alloc_shared([H_per_block, D], dtype)
+            Lse_shared = T.alloc_shared([H_per_block], accum_dtype)
+            mask = T.alloc_fragment([BI], "bool")
+
+            acc_o = T.alloc_fragment([H_per_block, D], accum_dtype)
+            acc_s = T.alloc_fragment([H_per_block, BI], accum_dtype)
+            S_shared = T.alloc_shared([H_per_block, BI], dtype)
+            sumexp = T.alloc_fragment([H_per_block], accum_dtype)
+            sumexp_i = T.alloc_fragment([H_per_block], accum_dtype)
+            alpha = T.alloc_fragment([H_per_block], accum_dtype)
+            m_i = T.alloc_fragment([H_per_block], accum_dtype)
+            m_i_prev = T.alloc_fragment([H_per_block], accum_dtype)
+
+            T.fill(acc_o, 0)
+            T.fill(sumexp, 0)
+            T.fill(m_i, -(2**30))
+
+            b_i, g_i = by, bz
+            s_i = bx if REPLICATE_H == 1 else (bx // REPLICATE_H)
+            q_i = s_i
+            max_kv_i = q_i
+
+            H0 = g_i * padded_H + (0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * 64)
+            H1 = H0 + H_per_block
+
+            T.copy(Q[b_i, s_i, H0:H1, :D], Q_shared)
+            T.copy(Q[b_i, s_i, H0:H1, D:], Q_tail_shared)
+
+            for i_i in T.Pipelined(NI, num_stages=num_stages):
+                for bi_i in T.Parallel(BI):
+                    mask[bi_i] = Indices[b_i, s_i, g_i, i_i * BI + bi_i] <= max_kv_i
+
+                for bi_i, d_i in T.Parallel(BI, D):
+                    KV_shared[bi_i, d_i] = KV[b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, d_i]
+                for bi_i, d_i in T.Parallel(BI, D_tail):
+                    K_tail_shared[bi_i, d_i] = KV[b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, D + d_i]
+
+                for h_i, bi_i in T.Parallel(H_per_block, BI):
+                    acc_s[h_i, bi_i] = T.if_then_else(mask[bi_i], 0, -T.infinity(acc_s.dtype))
+                T.gemm(Q_shared, KV_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
+                T.gemm(Q_tail_shared, K_tail_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
+                
+                T.copy(m_i, m_i_prev)
+                T.reduce_max(acc_s, m_i, dim=1, clear=False)
+                for h_i in T.Parallel(H_per_block):
+                    m_i[h_i] = T.max(m_i[h_i], m_i_prev[h_i])
+                for h_i in T.Parallel(H_per_block):
+                    alpha[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale)
+                for h_i, bi_i in T.Parallel(H_per_block, BI):
+                    acc_s[h_i, bi_i] = T.exp2(acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale)
+                T.reduce_sum(acc_s, sumexp_i, dim=1)
+                for h_i in T.Parallel(H_per_block):
+                    sumexp[h_i] = sumexp[h_i] * alpha[h_i] + sumexp_i[h_i]
+                for h_i, d_i in T.Parallel(H_per_block, D):
+                    acc_o[h_i, d_i] = acc_o[h_i, d_i] * alpha[h_i]
+
+                T.copy(acc_s, S_shared)
+                T.gemm(S_shared, KV_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
+
+            # Rescale
+            for h_i, d_i in T.Parallel(H_per_block, D):
+                acc_o[h_i, d_i] /= sumexp[h_i]
+            for h_i in T.Parallel(H_per_block):
+                sumexp[h_i] = T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale
+
+            T.copy(acc_o, O_shared)
+            T.copy(acc_o, Output[b_i, s_i, H0:H1, :])
+            T.copy(sumexp, Lse_shared)
+            T.copy(sumexp, Lse[b_i, s_i, H0:H1])
+
+    return main
+
+
+# ============================================================================
+# 优化7: 批量处理 query - 将多个 seq position 的 Q 合并计算
+# 
+# 原理说明:
+# - 当前配置 H=2, 必须 pad 到 H_per_block=16, 浪费 87.5%
+# - 优化思路: 将 S_per_block=8 个 seq position 的 Q 合并
+# - 合并后 GEMM 维度: [8*2, D] @ [BI, D]^T = [16, BI]，正好填满，无浪费
+# 
+# 约束:
+# - 需要 seq_len 是 S_per_block 的倍数
+# - 相邻 seq positions 共享同一套 indices（使用最后一个的 indices）
+# ============================================================================
+@tilelang.jit(
+    out_idx=[-2, -1],
+    pass_configs={
+        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+    },
+)
+def sparse_mla_fwd_batched_query(
+    heads,
+    dim,
+    tail_dim,
+    topk,
+    kv_group=1,
+    sm_scale=None,
+    is_causal=True,
+    block_I=64,
+    num_stages=1,
+    threads=128,
+    S_per_block=8,  # 每个 block 处理的 seq position 数量
+):
+    """
+    优化7: 批量处理 query
+    
+    将 S_per_block 个相邻 seq position 的 Q 合并计算:
+    - 原始: GEMM [H_per_block, D] @ [BI, D]^T, H_per_block=16 但实际 H=2
+    - 优化: GEMM [S_per_block * H, D] @ [BI, D]^T, 8*2=16 正好填满
+    
+    每个 seq position 有独立的 mask (基于各自的 max_kv_i)
+    共享同一套 indices (使用 block 内最后一个 seq position 的 indices)
+    """
+    assert dim == tilelang.math.next_power_of_2(dim)
+    assert tail_dim == tilelang.math.next_power_of_2(tail_dim)
+    assert is_causal == True
+    assert topk % block_I == 0
+    
+    if sm_scale is None:
+        sm_scale = (1.0 / (dim + tail_dim)) ** 0.5 * 1.44269504
+    else:
+        sm_scale = sm_scale * 1.44269504
+
+    batch = T.symbolic("batch")
+    seq_len = T.symbolic("seq_len")
+    seq_len_kv = T.symbolic("seq_len_kv")
+
+    head_kv = heads // kv_group
+    q_shape = [batch, seq_len, heads, dim + tail_dim]
+    kv_shape = [batch, seq_len_kv, kv_group, dim + tail_dim]
+    o_shape = [batch, seq_len, heads, dim]
+    indices_shape = [batch, seq_len, kv_group, topk]
+    lse_shape = [batch, seq_len, heads]
+    indices_dtype = T.int32
+    dtype = T.bfloat16
+    accum_dtype = T.float32
+
+    H = head_kv
+    BI = block_I
+    NI = tilelang.cdiv(topk, block_I)
+    D = dim
+    D_tail = tail_dim
+    
+    # 计算合并后的维度
+    # 将 S_per_block 个 seq position 的 H 个 head 合并
+    # 例如: S_per_block=8, H=2 -> merged_H = 16
+    merged_H = S_per_block * H
+    # 确保 merged_H >= 16 以满足 GEMM 要求
+    padded_merged_H = max(tilelang.math.next_power_of_2(merged_H), 16)
+
+    @T.prim_func
+    def main(
+        Q: T.Tensor(q_shape, dtype),
+        KV: T.Tensor(kv_shape, dtype),
+        Indices: T.Tensor(indices_shape, indices_dtype),
+        Output: T.Tensor(o_shape, dtype),
+        Lse: T.Tensor(lse_shape, accum_dtype),
+    ):
+        # Grid: (seq_len / S_per_block, batch, kv_group)
+        with T.Kernel(T.ceildiv(seq_len, S_per_block), batch, kv_group, threads=threads) as (bx, by, bz):
+            # Q shared memory: [S_per_block * H, D] (合并多个 seq position)
+            Q_shared = T.alloc_shared([padded_merged_H, D], dtype)
+            Q_tail_shared = T.alloc_shared([padded_merged_H, D_tail], dtype)
+            KV_shared = T.alloc_shared([BI, D], dtype)
+            K_tail_shared = T.alloc_shared([BI, D_tail], dtype)
+            O_shared = T.alloc_shared([padded_merged_H, D], dtype)
+            Lse_shared = T.alloc_shared([padded_merged_H], accum_dtype)
+            
+            # mask 现在是 2D: 每个 seq position 有自己的 mask
+            # mask[s, bi] 表示第 s 个 seq position 对第 bi 个 KV 是否有效
+            mask = T.alloc_shared([S_per_block, BI], "bool")
+            
+            # 每个 seq position 的 max_kv_i
+            max_kv_indices = T.alloc_shared([S_per_block], indices_dtype)
+
+            acc_o = T.alloc_fragment([padded_merged_H, D], accum_dtype)
+            acc_s = T.alloc_fragment([padded_merged_H, BI], accum_dtype)
+            S_shared = T.alloc_shared([padded_merged_H, BI], dtype)
+            sumexp = T.alloc_fragment([padded_merged_H], accum_dtype)
+            sumexp_i = T.alloc_fragment([padded_merged_H], accum_dtype)
+            alpha = T.alloc_fragment([padded_merged_H], accum_dtype)
+            m_i = T.alloc_fragment([padded_merged_H], accum_dtype)
+            m_i_prev = T.alloc_fragment([padded_merged_H], accum_dtype)
+
+            T.fill(acc_o, 0)
+            T.fill(sumexp, 0)
+            T.fill(m_i, -(2**30))
+
+            b_i, g_i = by, bz
+            # block 起始的 seq position
+            s_base = bx * S_per_block
+            # 使用 block 内最后一个有效 seq position 的 indices
+            s_for_indices = T.min(s_base + S_per_block - 1, seq_len - 1)
+
+            # 加载多个 seq position 的 Q 到 shared memory
+            # Q_shared 布局: [s0_h0, s0_h1, s1_h0, s1_h1, ..., s7_h0, s7_h1, padding...]
+            for s_offset in T.serial(S_per_block):
+                s_i = s_base + s_offset
+                # 计算该 seq position 在 Q_shared 中的起始位置
+                h_offset = s_offset * H
+                # 设置 max_kv_i (causal mask)
+                max_kv_indices[s_offset] = s_i
+                
+                # 加载 Q (只有有效的 seq position)
+                for h_i in T.serial(H):
+                    for d_i in T.Parallel(D):
+                        Q_shared[h_offset + h_i, d_i] = T.if_then_else(
+                            s_i < seq_len,
+                            Q[b_i, s_i, g_i * H + h_i, d_i],
+                            T.cast(0, dtype)
+                        )
+                    for d_i in T.Parallel(D_tail):
+                        Q_tail_shared[h_offset + h_i, d_i] = T.if_then_else(
+                            s_i < seq_len,
+                            Q[b_i, s_i, g_i * H + h_i, D + d_i],
+                            T.cast(0, dtype)
+                        )
+
+            for i_i in T.Pipelined(NI, num_stages=num_stages):
+                # 计算每个 seq position 的 mask
+                for s_offset, bi_i in T.Parallel(S_per_block, BI):
+                    kv_idx = Indices[b_i, s_for_indices, g_i, i_i * BI + bi_i]
+                    mask[s_offset, bi_i] = kv_idx <= max_kv_indices[s_offset]
+
+                # 加载 KV (使用 block 内最后一个 seq position 的 indices)
+                for bi_i, d_i in T.Parallel(BI, D):
+                    KV_shared[bi_i, d_i] = KV[b_i, Indices[b_i, s_for_indices, g_i, i_i * BI + bi_i], g_i, d_i]
+                for bi_i, d_i in T.Parallel(BI, D_tail):
+                    K_tail_shared[bi_i, d_i] = KV[b_i, Indices[b_i, s_for_indices, g_i, i_i * BI + bi_i], g_i, D + d_i]
+
+                # 初始化 acc_s，应用各自的 mask
+                for sh_i, bi_i in T.Parallel(padded_merged_H, BI):
+                    # 计算对应的 s_offset 和 h_i
+                    s_offset = sh_i // H
+                    # 只有 s_offset < S_per_block 且 mask 有效时才计算
+                    is_valid = T.if_then_else(
+                        s_offset < S_per_block,
+                        mask[s_offset, bi_i],
+                        False
+                    )
+                    acc_s[sh_i, bi_i] = T.if_then_else(is_valid, 0, -T.infinity(acc_s.dtype))
+                
+                T.gemm(Q_shared, KV_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
+                T.gemm(Q_tail_shared, K_tail_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
+                
+                T.copy(m_i, m_i_prev)
+                T.reduce_max(acc_s, m_i, dim=1, clear=False)
+                for sh_i in T.Parallel(padded_merged_H):
+                    m_i[sh_i] = T.max(m_i[sh_i], m_i_prev[sh_i])
+                for sh_i in T.Parallel(padded_merged_H):
+                    alpha[sh_i] = T.exp2((m_i_prev[sh_i] - m_i[sh_i]) * sm_scale)
+                for sh_i, bi_i in T.Parallel(padded_merged_H, BI):
+                    acc_s[sh_i, bi_i] = T.exp2(acc_s[sh_i, bi_i] * sm_scale - m_i[sh_i] * sm_scale)
+                T.reduce_sum(acc_s, sumexp_i, dim=1)
+                for sh_i in T.Parallel(padded_merged_H):
+                    sumexp[sh_i] = sumexp[sh_i] * alpha[sh_i] + sumexp_i[sh_i]
+                for sh_i, d_i in T.Parallel(padded_merged_H, D):
+                    acc_o[sh_i, d_i] = acc_o[sh_i, d_i] * alpha[sh_i]
+
+                T.copy(acc_s, S_shared)
+                T.gemm(S_shared, KV_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
+
+            # Rescale
+            for sh_i, d_i in T.Parallel(padded_merged_H, D):
+                acc_o[sh_i, d_i] /= sumexp[sh_i]
+            for sh_i in T.Parallel(padded_merged_H):
+                sumexp[sh_i] = T.log2(sumexp[sh_i]) + m_i[sh_i] * sm_scale
+
+            T.copy(acc_o, O_shared)
+            T.copy(sumexp, Lse_shared)
+            
+            # 将结果写回各自的 seq position
+            for s_offset in T.serial(S_per_block):
+                s_i = s_base + s_offset
+                h_offset = s_offset * H
+                for h_i in T.serial(H):
+                    # 只写入有效的 seq position
+                    for d_i in T.Parallel(D):
+                        if s_i < seq_len:
+                            Output[b_i, s_i, g_i * H + h_i, d_i] = O_shared[h_offset + h_i, d_i]
+                for h_i in T.serial(H):
+                    if s_i < seq_len:
+                        Lse[b_i, s_i, g_i * H + h_i] = Lse_shared[h_offset + h_i]
+
+    return main
+
+
+# ============================================================================
+# 优化8: 方案4 - 预 Gather + 局部重索引
+# 
+# 原理说明:
+# - 预处理阶段: 计算每组 S_per_block 个 seq positions 的 indices 并集
+# - Kernel 阶段: 一次性 gather 并集 KV，通过 mask 让每个 query attend 正确的 KV
+# 
+# 优点:
+# - 语义完全正确，每个 query 使用自己的 indices
+# - 相比逐个处理，减少了重复的 KV gather（利用重叠）
+# ============================================================================
+
+def preprocess_indices_union(
+    indices: torch.Tensor,  # [B, S, G, topk]
+    S_per_block: int,
+    block_I: int = 64,
+) -> tuple:
+    """
+    预处理 indices，计算每组 S_per_block 个 seq positions 的并集
+    
+    返回:
+    - union_indices: [B, num_blocks, G, max_union_size] 并集后的 indices
+    - local_mapping: [B, S, G, topk] 每个原始 index 在 union 中的位置
+    - valid_counts: [B, num_blocks, G] 每个 block 的有效 union 大小
+    """
+    B, S, G, topk = indices.shape
+    num_blocks = (S + S_per_block - 1) // S_per_block
+    
+    # 最大并集大小：理论上最大是 S_per_block * topk，但通常有重叠
+    # 为了对齐 GEMM，设置为 block_I 的倍数
+    max_union_size = min(S_per_block * topk, topk)  # causal 情况下有上界
+    # 对齐到 block_I
+    max_union_size = ((max_union_size + block_I - 1) // block_I) * block_I
+    
+    device = indices.device
+    union_indices = torch.full((B, num_blocks, G, max_union_size), -1, 
+                               dtype=indices.dtype, device=device)
+    local_mapping = torch.full((B, S, G, topk), -1, 
+                               dtype=torch.int32, device=device)
+    valid_counts = torch.zeros((B, num_blocks, G), dtype=torch.int32, device=device)
+    
+    # CPU 预处理（实际应用中可以用 CUDA kernel 加速）
+    indices_cpu = indices.cpu().numpy()
+    
+    for b in range(B):
+        for g in range(G):
+            for block_idx in range(num_blocks):
+                s_start = block_idx * S_per_block
+                s_end = min(s_start + S_per_block, S)
+                
+                # 收集这个 block 内所有 seq positions 的 indices
+                all_indices_in_block = set()
+                for s in range(s_start, s_end):
+                    max_kv_for_s = s  # causal: 只能 attend 到 [0, s]
+                    for k in range(topk):
+                        idx = indices_cpu[b, s, g, k]
+                        if idx <= max_kv_for_s and idx >= 0:
+                            all_indices_in_block.add(idx)
+                
+                # 排序并存储 union
+                sorted_union = sorted(all_indices_in_block)
+                union_size = len(sorted_union)
+                valid_counts[b, block_idx, g] = union_size
+                
+                # 建立 union index -> position 的映射
+                idx_to_pos = {idx: pos for pos, idx in enumerate(sorted_union)}
+                
+                # 存储 union indices
+                for pos, idx in enumerate(sorted_union):
+                    if pos < max_union_size:
+                        union_indices[b, block_idx, g, pos] = idx
+                
+                # 建立 local mapping
+                for s in range(s_start, s_end):
+                    max_kv_for_s = s
+                    for k in range(topk):
+                        idx = indices_cpu[b, s, g, k]
+                        if idx <= max_kv_for_s and idx >= 0 and idx in idx_to_pos:
+                            local_mapping[b, s, g, k] = idx_to_pos[idx]
+    
+    return union_indices, local_mapping, valid_counts
+
+
+def preprocess_indices_with_mask(
+    indices: torch.Tensor,  # [B, S, G, topk]
+    S_per_block: int,
+    block_I: int = 64,
+) -> tuple:
+    """
+    预处理 indices，生成每个 query 对 union KV 的 attention mask
+    
+    这个版本更适合 kernel 使用：直接生成 mask 矩阵
+    
+    返回:
+    - union_indices: [B, num_blocks, G, union_size] 并集后的 indices (union_size 是 S_per_block * BI 对齐)
+    - attention_mask: [B, num_blocks, G, S_per_block, union_size] 
+                      mask[b, blk, g, s_offset, k] = True 表示该 query 需要 attend 这个 KV
+    - union_size: 每个 block 的 union 大小（固定，便于 kernel 处理）
+    """
+    B, S, G, topk = indices.shape
+    num_blocks = (S + S_per_block - 1) // S_per_block
+    NI = topk // block_I
+    
+    device = indices.device
+    
+    # 固定 union_size = topk（最大情况），保证对齐
+    union_size = topk
+    
+    union_indices = torch.full((B, num_blocks, G, union_size), 0, 
+                               dtype=indices.dtype, device=device)
+    # attention_mask: 每个 query 对每个 union KV position 是否有效
+    attention_mask = torch.zeros((B, num_blocks, G, S_per_block, union_size), 
+                                 dtype=torch.bool, device=device)
+    
+    for b in range(B):
+        for g in range(G):
+            for block_idx in range(num_blocks):
+                s_start = block_idx * S_per_block
+                s_end = min(s_start + S_per_block, S)
+                
+                # 使用最后一个 seq position 的 indices 作为 union
+                # （这是 causal 场景下的合理选择，因为它包含最多的有效 indices）
+                s_last = s_end - 1
+                union_indices[b, block_idx, g, :] = indices[b, s_last, g, :]
+                
+                # 为每个 seq position 生成 mask
+                for s_offset, s in enumerate(range(s_start, s_end)):
+                    max_kv_for_s = s  # causal mask
+                    
+                    # 检查 union 中哪些 indices 对这个 query 有效
+                    for k in range(union_size):
+                        union_kv_idx = union_indices[b, block_idx, g, k].item()
+                        # 有效条件: 1) 在 causal 范围内 2) 在该 query 的原始 indices 中
+                        if union_kv_idx <= max_kv_for_s:
+                            # 检查是否在原始 indices 中
+                            if union_kv_idx in indices[b, s, g, :].tolist():
+                                attention_mask[b, block_idx, g, s_offset, k] = True
+    
+    return union_indices, attention_mask
+
+
+@tilelang.jit(
+    out_idx=[-2, -1],
+    pass_configs={
+        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+    },
+)
+def sparse_mla_fwd_union_indices(
+    heads,
+    dim,
+    tail_dim,
+    topk,
+    kv_group=1,
+    sm_scale=None,
+    is_causal=True,
+    block_I=64,
+    num_stages=1,
+    threads=128,
+    S_per_block=8,  # 每个 block 处理的 seq position 数量
+):
+    """
+    优化8: 方案4 - 预 Gather + 局部重索引
+    
+    使用预处理生成的 union_indices 和 attention_mask:
+    - union_indices: 每个 block 的 KV indices 并集
+    - attention_mask: 每个 query 对 union 中每个 KV 的有效性 mask
+    
+    语义完全正确，每个 query 使用自己的 indices
+    """
+    assert dim == tilelang.math.next_power_of_2(dim)
+    assert tail_dim == tilelang.math.next_power_of_2(tail_dim)
+    assert is_causal == True
+    assert topk % block_I == 0
+    
+    if sm_scale is None:
+        sm_scale = (1.0 / (dim + tail_dim)) ** 0.5 * 1.44269504
+    else:
+        sm_scale = sm_scale * 1.44269504
+
+    batch = T.symbolic("batch")
+    seq_len = T.symbolic("seq_len")
+    seq_len_kv = T.symbolic("seq_len_kv")
+    num_blocks = T.symbolic("num_blocks")
+
+    head_kv = heads // kv_group
+    q_shape = [batch, seq_len, heads, dim + tail_dim]
+    kv_shape = [batch, seq_len_kv, kv_group, dim + tail_dim]
+    o_shape = [batch, seq_len, heads, dim]
+    lse_shape = [batch, seq_len, heads]
+    
+    # 预处理后的输入
+    union_indices_shape = [batch, num_blocks, kv_group, topk]
+    attention_mask_shape = [batch, num_blocks, kv_group, S_per_block, topk]
+    
+    indices_dtype = T.int32
+    dtype = T.bfloat16
+    accum_dtype = T.float32
+
+    H = head_kv
+    BI = block_I
+    NI = tilelang.cdiv(topk, block_I)
+    D = dim
+    D_tail = tail_dim
+    
+    # 计算合并后的维度
+    merged_H = S_per_block * H
+    padded_merged_H = max(tilelang.math.next_power_of_2(merged_H), 16)
+
+    @T.prim_func
+    def main(
+        Q: T.Tensor(q_shape, dtype),
+        KV: T.Tensor(kv_shape, dtype),
+        UnionIndices: T.Tensor(union_indices_shape, indices_dtype),
+        AttentionMask: T.Tensor(attention_mask_shape, "bool"),
+        Output: T.Tensor(o_shape, dtype),
+        Lse: T.Tensor(lse_shape, accum_dtype),
+    ):
+        # Grid: (num_blocks, batch, kv_group)
+        with T.Kernel(num_blocks, batch, kv_group, threads=threads) as (bx, by, bz):
+            # Q shared memory: [S_per_block * H, D]
+            Q_shared = T.alloc_shared([padded_merged_H, D], dtype)
+            Q_tail_shared = T.alloc_shared([padded_merged_H, D_tail], dtype)
+            KV_shared = T.alloc_shared([BI, D], dtype)
+            K_tail_shared = T.alloc_shared([BI, D_tail], dtype)
+            O_shared = T.alloc_shared([padded_merged_H, D], dtype)
+            Lse_shared = T.alloc_shared([padded_merged_H], accum_dtype)
+            
+            # 预加载的 attention mask
+            mask_shared = T.alloc_shared([S_per_block, BI], "bool")
+
+            acc_o = T.alloc_fragment([padded_merged_H, D], accum_dtype)
+            acc_s = T.alloc_fragment([padded_merged_H, BI], accum_dtype)
+            S_shared = T.alloc_shared([padded_merged_H, BI], dtype)
+            sumexp = T.alloc_fragment([padded_merged_H], accum_dtype)
+            sumexp_i = T.alloc_fragment([padded_merged_H], accum_dtype)
+            alpha = T.alloc_fragment([padded_merged_H], accum_dtype)
+            m_i = T.alloc_fragment([padded_merged_H], accum_dtype)
+            m_i_prev = T.alloc_fragment([padded_merged_H], accum_dtype)
+
+            T.fill(acc_o, 0)
+            T.fill(sumexp, 0)
+            T.fill(m_i, -(2**30))
+
+            b_i, g_i = by, bz
+            block_idx = bx
+            s_base = block_idx * S_per_block
+
+            # 加载 Q 到 shared memory
+            for s_offset in T.serial(S_per_block):
+                s_i = s_base + s_offset
+                h_offset = s_offset * H
+                
+                for h_i in T.serial(H):
+                    for d_i in T.Parallel(D):
+                        Q_shared[h_offset + h_i, d_i] = T.if_then_else(
+                            s_i < seq_len,
+                            Q[b_i, s_i, g_i * H + h_i, d_i],
+                            T.cast(0, dtype)
+                        )
+                    for d_i in T.Parallel(D_tail):
+                        Q_tail_shared[h_offset + h_i, d_i] = T.if_then_else(
+                            s_i < seq_len,
+                            Q[b_i, s_i, g_i * H + h_i, D + d_i],
+                            T.cast(0, dtype)
+                        )
+
+            # 使用预处理的 union indices 和 attention mask
+            for i_i in T.Pipelined(NI, num_stages=num_stages):
+                # 加载这个 KV block 的 attention mask
+                for s_offset, bi_i in T.Parallel(S_per_block, BI):
+                    mask_shared[s_offset, bi_i] = AttentionMask[b_i, block_idx, g_i, s_offset, i_i * BI + bi_i]
+
+                # 使用 union indices 加载 KV
+                for bi_i, d_i in T.Parallel(BI, D):
+                    kv_idx = UnionIndices[b_i, block_idx, g_i, i_i * BI + bi_i]
+                    KV_shared[bi_i, d_i] = KV[b_i, kv_idx, g_i, d_i]
+                for bi_i, d_i in T.Parallel(BI, D_tail):
+                    kv_idx = UnionIndices[b_i, block_idx, g_i, i_i * BI + bi_i]
+                    K_tail_shared[bi_i, d_i] = KV[b_i, kv_idx, g_i, D + d_i]
+
+                # 应用 mask 初始化 acc_s
+                for sh_i, bi_i in T.Parallel(padded_merged_H, BI):
+                    s_offset = sh_i // H
+                    is_valid = T.if_then_else(
+                        s_offset < S_per_block,
+                        mask_shared[s_offset, bi_i],
+                        False
+                    )
+                    acc_s[sh_i, bi_i] = T.if_then_else(is_valid, 0, -T.infinity(acc_s.dtype))
+                
+                # GEMM: Q @ K^T
+                T.gemm(Q_shared, KV_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
+                T.gemm(Q_tail_shared, K_tail_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
+                
+                # Online softmax
+                T.copy(m_i, m_i_prev)
+                T.reduce_max(acc_s, m_i, dim=1, clear=False)
+                for sh_i in T.Parallel(padded_merged_H):
+                    m_i[sh_i] = T.max(m_i[sh_i], m_i_prev[sh_i])
+                for sh_i in T.Parallel(padded_merged_H):
+                    alpha[sh_i] = T.exp2((m_i_prev[sh_i] - m_i[sh_i]) * sm_scale)
+                for sh_i, bi_i in T.Parallel(padded_merged_H, BI):
+                    acc_s[sh_i, bi_i] = T.exp2(acc_s[sh_i, bi_i] * sm_scale - m_i[sh_i] * sm_scale)
+                T.reduce_sum(acc_s, sumexp_i, dim=1)
+                for sh_i in T.Parallel(padded_merged_H):
+                    sumexp[sh_i] = sumexp[sh_i] * alpha[sh_i] + sumexp_i[sh_i]
+                for sh_i, d_i in T.Parallel(padded_merged_H, D):
+                    acc_o[sh_i, d_i] = acc_o[sh_i, d_i] * alpha[sh_i]
+
+                # GEMM: S @ V
+                T.copy(acc_s, S_shared)
+                T.gemm(S_shared, KV_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
+
+            # Rescale
+            for sh_i, d_i in T.Parallel(padded_merged_H, D):
+                acc_o[sh_i, d_i] /= sumexp[sh_i]
+            for sh_i in T.Parallel(padded_merged_H):
+                sumexp[sh_i] = T.log2(sumexp[sh_i]) + m_i[sh_i] * sm_scale
+
+            T.copy(acc_o, O_shared)
+            T.copy(sumexp, Lse_shared)
+            
+            # 写回结果
+            for s_offset in T.serial(S_per_block):
+                s_i = s_base + s_offset
+                h_offset = s_offset * H
+                for h_i in T.serial(H):
+                    for d_i in T.Parallel(D):
+                        if s_i < seq_len:
+                            Output[b_i, s_i, g_i * H + h_i, d_i] = O_shared[h_offset + h_i, d_i]
+                for h_i in T.serial(H):
+                    if s_i < seq_len:
+                        Lse[b_i, s_i, g_i * H + h_i] = Lse_shared[h_offset + h_i]
+
+    return main
+
+
+# ============================================================================
+# 参考实现 (用于正确性验证)
+# ============================================================================
+def ref_sparse_mla_fwd(q, kv, indices, sm_scale=None, d_v=None):
+    """参考实现，用于正确性验证"""
+    q = q.float()
+    kv = kv.float()
+    indices = indices.transpose(1, 2)
+    b, sq, h, dim_q = q.shape
+    b, sk, g, dim_plus_tail_dim = kv.shape
+    
+    if d_v is None:
+        if dim_plus_tail_dim == 576:
+            dim = 512
+        elif dim_plus_tail_dim == 320:
+            dim = 256
+        else:
+            raise ValueError(f"无法自动推断 dim，dim_plus_tail_dim={dim_plus_tail_dim}")
+    else:
+        dim = d_v
+    
+    k = kv
+    v = kv[..., :dim]
+
+    b, _, _, dim_v = v.shape
+    g_index = g
+    h_index = h // g
+    compressed_casual_mask = torch.arange(0, sq, dtype=torch.int32, device="cuda").view(-1, 1) >= torch.arange(
+        0, sk, dtype=torch.int32, device="cuda"
+    ).view(1, -1)
+
+    mask = q.new_zeros(b, g_index, sq, sk + 1, dtype=torch.bool).scatter(3, indices.long(), 1)
+    mask = mask[..., :-1]
+    mask = mask & compressed_casual_mask.view(1, 1, sq, sk)
+    mask = mask.view(b, g_index, 1, sq, sk)
+
+    q = q.view(b, sq, g, -1, dim_q)
+    score = torch.einsum("bmghd,bngd->bghmn", q, k)
+    sm_scale = dim_q**-0.5 if sm_scale is None else sm_scale
+    score = score.masked_fill(~mask, float("-inf")).mul(sm_scale)
+    p = score.softmax(dim=-1)
+    p = p.view(b, g_index, h_index, -1, sq, sk)
+    p = p.view(b, g, -1, sq, sk)
+    o = torch.einsum("bghmn,bngd->bmghd", p.type(v.dtype), v)
+    o = o.reshape(b, sq, h, dim_v)
+    return o.to(torch.bfloat16)
+
+
+# ============================================================================
+# 性能测试对比
+# ============================================================================
+def benchmark_comparison(
+    B=1, S=2048, SKV=2048, H=2, HKV=1, DQK=320, DV=256, topk=2048, dtype=torch.bfloat16,
+    check_correctness=True, num_warmup=50, num_rep=100
+):
+    """
+    对比所有优化方案的性能
+    
+    输入配置来自 sparse_mal_fwd_input.txt:
+    - heads=2, dim=256, tail_dim=64, topk=2048, kv_group=1
+    - q.shape:[1, 2048, 2, 320], kv.shape:[1, 2048, 1, 320]
+    """
+    from tilelang.profiler import do_bench
+    
+    print("=" * 80)
+    print("Sparse MLA Forward 优化方案性能对比")
+    print("=" * 80)
+    print(f"配置: B={B}, S={S}, SKV={SKV}, H={H}, HKV={HKV}")
+    print(f"      DQK={DQK}, DV={DV}, topk={topk}")
+    print(f"      block_I=64, num_stages=1, threads=128 (优化1配置)")
+    print("=" * 80)
+    
+    # 生成测试数据
+    torch.random.manual_seed(42)
+    q = torch.randn((B, S, H, DQK), dtype=dtype, device="cuda") / 10
+    kv = torch.randn((B, SKV, HKV, DQK), dtype=dtype, device="cuda") / 10
+    q.clamp_(-10, 10)
+    kv.clamp_(-10, 10)
+    
+    indices = torch.full((B, S, HKV, topk), SKV, dtype=torch.int32, device="cuda")
+    for b in range(B):
+        for t in range(S):
+            for h in range(HKV):
+                i_i = torch.randperm(max(1, t))[:topk]
+                indices[b, t, h, : len(i_i)] = i_i
+    
+    # 计算 tail_dim
+    tail_dim = DQK - DV
+    
+    # 定义所有优化方案 (kernel_func, block_I, threads, S_per_block, use_union)
+    optimizations = [
+        ("原始方案 (优化1配置)", sparse_mla_fwd_baseline, 64, 128, 1, False),
+        ("优化7: 批量Query (共享indices)", sparse_mla_fwd_batched_query, 64, 128, 8, False),
+        ("优化8: 批量Query (独立indices)", sparse_mla_fwd_union_indices, 64, 128, 8, True),
+    ]
+    
+    results = []
+    ref_out = None
+    
+    # 预处理优化8需要的数据
+    S_per_block_for_union = 8
+    union_indices, attention_mask = preprocess_indices_with_mask(
+        indices, S_per_block=S_per_block_for_union, block_I=64
+    )
+    
+    for name, kernel_func, block_i, num_threads, s_per_block, use_union in optimizations:
+        print(f"\n测试: {name}")
+        print("-" * 40)
+        
+        try:
+            # 编译 kernel
+            if use_union:
+                # 优化8: 使用预处理的 union indices
+                kernel = kernel_func(
+                    heads=H,
+                    dim=DV,
+                    tail_dim=tail_dim,
+                    topk=topk,
+                    kv_group=HKV,
+                    sm_scale=None,
+                    is_causal=True,
+                    block_I=block_i,
+                    num_stages=1,
+                    threads=num_threads,
+                    S_per_block=s_per_block,
+                )
+            elif s_per_block > 1:
+                # 优化7: 批量处理（共享 indices）
+                kernel = kernel_func(
+                    heads=H,
+                    dim=DV,
+                    tail_dim=tail_dim,
+                    topk=topk,
+                    kv_group=HKV,
+                    sm_scale=None,
+                    is_causal=True,
+                    block_I=block_i,
+                    num_stages=1,
+                    threads=num_threads,
+                    S_per_block=s_per_block,
+                )
+            else:
+                kernel = kernel_func(
+                    heads=H,
+                    dim=DV,
+                    tail_dim=tail_dim,
+                    topk=topk,
+                    kv_group=HKV,
+                    sm_scale=None,
+                    is_causal=True,
+                    block_I=block_i,
+                    num_stages=1,
+                    threads=num_threads,
+                )
+            
+            # 运行一次获取输出
+            if use_union:
+                out, lse = kernel(q, kv, union_indices, attention_mask)
+            else:
+                out, lse = kernel(q, kv, indices)
+            
+            # 正确性验证
+            if check_correctness:
+                if ref_out is None:
+                    ref_out = ref_sparse_mla_fwd(q, kv, indices, d_v=DV)
+                
+                try:
+                    torch.testing.assert_close(out, ref_out, rtol=1e-2, atol=1e-2)
+                    print(f"  ✓ 正确性验证通过")
+                except AssertionError as e:
+                    max_diff = (out - ref_out).abs().max().item()
+                    print(f"  ✗ 正确性验证失败，最大差异: {max_diff:.6f}")
+            
+            # 性能测试
+            if use_union:
+                def fn():
+                    return kernel(q, kv, union_indices, attention_mask)
+            else:
+                def fn():
+                    return kernel(q, kv, indices)
+            
+            ms = do_bench(fn, rep=num_rep, warmup=num_warmup)
+            
+            # 计算带宽和 TFLOPS
+            io_bytes = B * S * DQK * topk * 2  # 读取 KV 数据
+            bandwidth = io_bytes / (ms * 1e-3) / 1e12
+            flops = B * S * (DQK + DV) * topk * 2 * H
+            tflops = flops / (ms * 1e-3) / 1e12
+            
+            print(f"  平均时间: {ms:.4f} ms")
+            print(f"  带宽: {bandwidth:.2f} TB/s")
+            print(f"  TFLOPS: {tflops:.2f}")
+            
+            results.append({
+                "name": name,
+                "time_ms": ms,
+                "bandwidth_tbs": bandwidth,
+                "tflops": tflops,
+                "success": True,
+            })
+            
+        except Exception as e:
+            print(f"  ✗ 错误: {e}")
+            results.append({
+                "name": name,
+                "time_ms": float('inf'),
+                "bandwidth_tbs": 0,
+                "tflops": 0,
+                "success": False,
+            })
+    
+    # 汇总结果
+    print("\n" + "=" * 80)
+    print("性能汇总")
+    print("=" * 80)
+    print(f"{'方案':<30} {'时间(ms)':<12} {'带宽(TB/s)':<12} {'TFLOPS':<10} {'相对基准':<10}")
+    print("-" * 80)
+    
+    baseline_time = results[0]["time_ms"] if results[0]["success"] else float('inf')
+    for r in results:
+        if r["success"]:
+            speedup = baseline_time / r["time_ms"] if r["time_ms"] > 0 else 0
+            print(f"{r['name']:<30} {r['time_ms']:<12.4f} {r['bandwidth_tbs']:<12.2f} {r['tflops']:<10.2f} {speedup:<10.2f}x")
+        else:
+            print(f"{r['name']:<30} {'失败':<12}")
+    
+    print("=" * 80)
+    
+    return results
+
+
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Sparse MLA Forward 优化方案对比")
+    parser.add_argument("--no-check", action="store_true", help="跳过正确性检查")
+    parser.add_argument("--warmup", type=int, default=50, help="预热次数")
+    parser.add_argument("--rep", type=int, default=100, help="重复次数")
+    args = parser.parse_args()
+    
+    # 使用 sparse_mal_fwd_input.txt 的配置
+    # heads=2, dim=256, tail_dim=64, topk=2048, kv_group=1
+    # q.shape:[1, 2048, 2, 320], kv.shape:[1, 2048, 1, 320]
+    benchmark_comparison(
+        B=1,
+        S=2048,
+        SKV=2048,
+        H=2,
+        HKV=1,
+        DQK=320,  # dim + tail_dim = 256 + 64
+        DV=256,
+        topk=2048,
+        dtype=torch.bfloat16,
+        check_correctness=not args.no_check,
+        num_warmup=args.warmup,
+        num_rep=args.rep,
+    )
