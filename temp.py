@@ -5,11 +5,11 @@
 import torch
 
 
-def ref_sparse_mla_fwd_interface(q, kv, indices, sm_scale=None, is_casual=True):
-    """PyTorch 参考实现"""
+def ref_sparse_mla_fwd_interface(q, kv, indices, sm_scale=None, is_casual=True, chunk_size=256):
+    """PyTorch 参考实现 - 分 chunk 计算避免 OOM"""
     q = q.float()
     kv = kv.float()
-    indices = indices.transpose(1, 2)
+    indices = indices.transpose(1, 2)  # (b, g, sq, topk)
     b, sq, h, dim_q = q.shape
     b, sk, g, _ = kv.shape
 
@@ -21,26 +21,43 @@ def ref_sparse_mla_fwd_interface(q, kv, indices, sm_scale=None, is_casual=True):
     b, _, _, dim_v = v.shape
     g_index = g
     h_index = h // g
-    compressed_casual_mask = torch.arange(0, sq, dtype=torch.int32, device="cuda").view(-1, 1) >= torch.arange(
-        1 - 1, sk * 1, 1, dtype=torch.int32, device="cuda"
-    ).view(1, -1)
-
-    mask = q.new_zeros(b, g_index, sq, sk + 1, dtype=torch.bool).scatter(3, indices.long(), 1)
-    mask = mask[..., :-1]
-    mask = mask & compressed_casual_mask.view(1, 1, sq, sk)
-    mask[:, :, : 1 - 1, 0] = True
-    mask = mask.view(b, g_index, 1, sq, sk)
-
-    q = q.view(b, sq, g, -1, dim_q)
-    score = torch.einsum("bmghd,bngd->bghmn", q, k)
     sm_scale = dim_q**-0.5 if sm_scale is None else sm_scale
-    score = score.masked_fill(~mask, float("-inf")).mul(sm_scale)
-    p = score.softmax(dim=-1)
-    p = p.view(b, g_index, h_index, -1, sq, sk)
-    p = p.view(b, g, -1, sq, sk)
-    o = torch.einsum("bghmn,bngd->bmghd", p.type(v.dtype), v)
-    o = o.reshape(b, sq, h, dim_v)
-    return o.to(torch.bfloat16)
+
+    # 输出张量
+    output = torch.zeros(b, sq, h, dim_v, dtype=q.dtype, device=q.device)
+
+    # 分 chunk 处理，避免大序列 OOM
+    for chunk_start in range(0, sq, chunk_size):
+        chunk_end = min(chunk_start + chunk_size, sq)
+        chunk_len = chunk_end - chunk_start
+
+        # 当前 chunk 的 q 和 indices
+        q_chunk = q[:, chunk_start:chunk_end]  # (b, chunk_len, h, dim_q)
+        indices_chunk = indices[:, :, chunk_start:chunk_end]  # (b, g, chunk_len, topk)
+
+        # causal mask: 对于位置 chunk_start + i，只能看到 [0, chunk_start + i] 的位置
+        chunk_positions = torch.arange(chunk_start, chunk_end, dtype=torch.int32, device=q.device).view(-1, 1)
+        kv_positions = torch.arange(0, sk, dtype=torch.int32, device=q.device).view(1, -1)
+        compressed_casual_mask = chunk_positions >= kv_positions  # (chunk_len, sk)
+
+        # sparse mask from indices
+        mask = q_chunk.new_zeros(b, g_index, chunk_len, sk + 1, dtype=torch.bool).scatter(3, indices_chunk.long(), 1)
+        mask = mask[..., :-1]
+        mask = mask & compressed_casual_mask.view(1, 1, chunk_len, sk)
+        mask = mask.view(b, g_index, 1, chunk_len, sk)
+
+        q_chunk = q_chunk.view(b, chunk_len, g, -1, dim_q)
+        score = torch.einsum("bmghd,bngd->bghmn", q_chunk, k)
+        score = score.masked_fill(~mask, float("-inf")).mul(sm_scale)
+        p = score.softmax(dim=-1)
+        p = p.view(b, g_index, h_index, -1, chunk_len, sk)
+        p = p.view(b, g, -1, chunk_len, sk)
+        o_chunk = torch.einsum("bghmn,bngd->bmghd", p.type(v.dtype), v)
+        o_chunk = o_chunk.reshape(b, chunk_len, h, dim_v)
+
+        output[:, chunk_start:chunk_end] = o_chunk
+
+    return output.to(torch.bfloat16)
 
 
 def do_bench_torch(fn, warmup=25, rep=100):
@@ -75,6 +92,7 @@ def test_ref_sparse_mla_fwd(
     DV=512,
     topk=2048,
     dtype=torch.bfloat16,
+    chunk_size=256,
     warmup=25,
     rep=100,
 ):
@@ -91,6 +109,7 @@ def test_ref_sparse_mla_fwd(
     print(f"  V Dim (DV): {DV}")
     print(f"  TopK: {topk}")
     print(f"  Dtype: {dtype}")
+    print(f"  Chunk Size: {chunk_size}")
     print(f"  Warmup: {warmup}, Rep: {rep}")
     print("-" * 60)
 
@@ -115,7 +134,7 @@ def test_ref_sparse_mla_fwd(
 
     # 定义测试函数
     def fn():
-        return ref_sparse_mla_fwd_interface(q, kv, indices)
+        return ref_sparse_mla_fwd_interface(q, kv, indices, chunk_size=chunk_size)
 
     # 测量耗时
     ms = do_bench_torch(fn, warmup=warmup, rep=rep)
@@ -144,6 +163,7 @@ if __name__ == "__main__":
         DV=512,
         topk=2048,
         dtype=torch.bfloat16,
+        chunk_size=256,  # 调小可减少显存使用，调大可能提升性能
         warmup=25,
         rep=100,
     )
