@@ -1,287 +1,401 @@
-# ruff: noqa
-"""
-Sparse MLA Forward with T.print Debug
-参考 study/lecture4/2调试工具/README.md 添加调试语句
-"""
-import torch
-import tilelang
-from tilelang import language as T
+============================================================
+Testing sparse_mla_fwd_debug with small parameters
+B=1, S=4, SKV=8, H=16, HKV=1
+DQK=576, DV=512, topk=64
+============================================================
 
-
-@tilelang.jit(
-    out_idx=[-2, -1],
-    pass_configs={
-        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-    },
-)
-def sparse_mla_fwd_debug(
-    heads,
-    dim,
-    tail_dim,
-    topk,
-    kv_group=1,
-    sm_scale=None,
-    is_causal=True,
-    CP0=True,
-    block_I=64,
-    num_stages=2,
-    threads=256,
-):
-    assert dim == tilelang.math.next_power_of_2(dim), f"haven't check padding correctness yet, dim={dim}"
-    assert tail_dim == tilelang.math.next_power_of_2(tail_dim), f"haven't check padding correctness yet, dim={tail_dim}"
-    assert is_causal == True, "non-casual is not supported"
-    assert topk % block_I == 0, "otherwise will load some index=0 thus causing wrong kv to be loaded"
-    if sm_scale is None:
-        sm_scale = (1.0 / (dim + tail_dim)) ** 0.5 * 1.44269504  # log2(e)
-    else:
-        sm_scale = sm_scale * 1.44269504  # log2(e)
-
-    batch = T.symbolic("batch")
-    seq_len = T.symbolic("seq_len")
-    seq_len_kv = T.symbolic("seq_len_kv")
-
-    head_kv = heads // kv_group
-    q_shape = [batch, seq_len, heads, dim + tail_dim]
-    kv_shape = [batch, seq_len_kv, kv_group, dim + tail_dim]
-    o_shape = [batch, seq_len, heads, dim]
-    indices_shape = [batch, seq_len, kv_group, topk]
-    lse_shape = [batch, seq_len, heads]
-    indices_dtype = "int32"
-    dtype = "bfloat16"
-    accum_dtype = "float32"
-
-    G = kv_group
-    H = head_kv
-    padded_H = max(tilelang.math.next_power_of_2(head_kv), 16)
-    if padded_H != H:
-        assert kv_group == 1, (
-            "here we solve the H padding automatically, other wise you should handle Q copy and Output copy with your mask (when kv_group == 1, use g_i * padded_H:(g_i+1) * padded_H would be handled automatically)"
-        )
-    BI = block_I
-    NI = tilelang.cdiv(topk, block_I)
-    D = dim
-    D_tail = tail_dim
-
-    if head_kv > 64:
-        assert head_kv % 64 == 0, "head_kv should be a multiple of 64"
-        REPLICATE_H = head_kv // 64
-    else:
-        REPLICATE_H = 1
-
-    H_per_block = padded_H if REPLICATE_H == 1 else 64
-
-    @T.prim_func
-    def main(
-        Q: T.Tensor(q_shape, dtype),  # type: ignore
-        KV: T.Tensor(kv_shape, dtype),  # type: ignore
-        Indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore
-        Output: T.Tensor(o_shape, dtype),  # type: ignore
-        Lse: T.Tensor(lse_shape, accum_dtype),  # type: ignore
-    ):
-        with T.Kernel(seq_len * REPLICATE_H, batch, kv_group, threads=threads) as (
-            bx,
-            by,
-            bz,
-        ):
-            Q_shared = T.alloc_shared([H_per_block, D], dtype)
-            Q_tail_shared = T.alloc_shared([H_per_block, D_tail], dtype)
-            KV_shared = T.alloc_shared([BI, D], dtype)
-            K_tail_shared = T.alloc_shared([BI, D_tail], dtype)
-            mask = T.alloc_fragment([BI], "bool")
-
-            acc_o = T.alloc_fragment([H_per_block, D], accum_dtype)
-            acc_s = T.alloc_fragment([H_per_block, BI], accum_dtype)
-            S_shared = T.alloc_shared([H_per_block, BI], dtype)
-            sumexp = T.alloc_fragment([H_per_block], accum_dtype)
-            sumexp_i = T.alloc_fragment([H_per_block], accum_dtype)
-            alpha = T.alloc_fragment([H_per_block], accum_dtype)
-            m_i = T.alloc_fragment([H_per_block], accum_dtype)
-            m_i_prev = T.alloc_fragment([H_per_block], accum_dtype)
-
-            T.fill(acc_o, 0)
-            T.fill(sumexp, 0)
-            T.fill(m_i, -(2**30))  # avoid -inf - inf to cause nan
-
-            b_i, g_i = by, bz
-            s_i = bx if REPLICATE_H == 1 else (bx // REPLICATE_H)
-            q_i = s_i
-            max_kv_i = q_i
-
-            H0 = g_i * padded_H + (0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * 64)
-            H1 = H0 + H_per_block
-
-            T.copy(Q[b_i, s_i, H0:H1, :D], Q_shared)
-            T.copy(Q[b_i, s_i, H0:H1, D:], Q_tail_shared)
-
-            # ====== DEBUG: 打印加载的Q ======
-            if bx == 0 and by == 0 and bz == 0:
-                T.print(b_i, msg="[DEBUG] b_i:")
-                T.print(s_i, msg="[DEBUG] s_i:")
-                T.print(H0, msg="[DEBUG] H0:")
-                T.print(H1, msg="[DEBUG] H1:")
-                T.print(Q_shared, msg="[DEBUG] Q_shared after copy:")
-                T.print(Q_tail_shared, msg="[DEBUG] Q_tail_shared after copy:")
-
-            for i_i in T.Pipelined(NI, num_stages=num_stages):
-                for bi_i in T.Parallel(BI):
-                    mask[bi_i] = Indices[b_i, s_i, g_i, i_i * BI + bi_i] <= max_kv_i
-
-                for bi_i, d_i in T.Parallel(BI, D):
-                    KV_shared[bi_i, d_i] = KV[b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, d_i]
-                for bi_i, d_i in T.Parallel(BI, D_tail):
-                    K_tail_shared[bi_i, d_i] = KV[b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, D + d_i]
-
-                # ====== DEBUG: 打印加载的KV (只在第一个iteration) ======
-                if bx == 0 and by == 0 and bz == 0 and i_i == 0:
-                    T.print(i_i, msg="[DEBUG] i_i (iteration):")
-                    T.print(KV_shared, msg="[DEBUG] KV_shared after copy:")
-                    T.print(K_tail_shared, msg="[DEBUG] K_tail_shared after copy:")
-                    T.print(mask, msg="[DEBUG] mask:")
-
-                for h_i, bi_i in T.Parallel(H_per_block, BI):
-                    acc_s[h_i, bi_i] = T.if_then_else(mask[bi_i], 0, -T.infinity(acc_s.dtype))
-                T.gemm(
-                    Q_shared,
-                    KV_shared,
-                    acc_s,
-                    transpose_B=True,
-                    policy=T.GemmWarpPolicy.FullRow,
-                )
-                T.gemm(
-                    Q_tail_shared,
-                    K_tail_shared,
-                    acc_s,
-                    transpose_B=True,
-                    policy=T.GemmWarpPolicy.FullRow,
-                )
-
-                # ====== DEBUG: 打印attention score (只在第一个iteration) ======
-                if bx == 0 and by == 0 and bz == 0 and i_i == 0:
-                    T.print(acc_s, msg="[DEBUG] acc_s after GEMM (QK^T):")
-
-                T.copy(m_i, m_i_prev)
-                T.reduce_max(acc_s, m_i, dim=1, clear=False)
-                for h_i in T.Parallel(H_per_block):
-                    m_i[h_i] = T.max(m_i[h_i], m_i_prev[h_i])
-                for h_i in T.Parallel(H_per_block):
-                    alpha[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale)
-                for h_i, bi_i in T.Parallel(H_per_block, BI):
-                    acc_s[h_i, bi_i] = T.exp2(acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale)
-                T.reduce_sum(acc_s, sumexp_i, dim=1)  # is this a accumulate operator?
-                for h_i in T.Parallel(H_per_block):
-                    sumexp[h_i] = sumexp[h_i] * alpha[h_i] + sumexp_i[h_i]
-
-                # ====== DEBUG: 打印softmax中间值 (只在第一个iteration) ======
-                if bx == 0 and by == 0 and bz == 0 and i_i == 0:
-                    T.print(m_i, msg="[DEBUG] m_i (row max):")
-                    T.print(alpha, msg="[DEBUG] alpha (rescale factor):")
-                    T.print(sumexp, msg="[DEBUG] sumexp (sum of exp):")
-                    T.print(acc_s, msg="[DEBUG] acc_s after softmax (P):")
-
-                for h_i, d_i in T.Parallel(H_per_block, D):
-                    acc_o[h_i, d_i] = acc_o[h_i, d_i] * alpha[h_i]
-
-                T.copy(acc_s, S_shared)
-                T.gemm(S_shared, KV_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
-
-                # ====== DEBUG: 打印累积输出 (只在第一个iteration) ======
-                if bx == 0 and by == 0 and bz == 0 and i_i == 0:
-                    T.print(acc_o, msg="[DEBUG] acc_o after PV GEMM (first iter):")
-
-            # Rescale
-            for h_i, d_i in T.Parallel(H_per_block, D):
-                acc_o[h_i, d_i] /= sumexp[h_i]
-            for h_i in T.Parallel(H_per_block):
-                sumexp[h_i] = T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale
-
-            # ====== DEBUG: 打印最终输出 ======
-            if bx == 0 and by == 0 and bz == 0:
-                T.print(acc_o, msg="[DEBUG] acc_o (final output after rescale):")
-                T.print(sumexp, msg="[DEBUG] sumexp (final LSE):")
-
-            T.copy(acc_o, Output[b_i, s_i, H0:H1, :])
-            T.copy(sumexp, Lse[b_i, s_i, H0:H1])
-
-    return main
-
-
-def sparse_mla_fwd_debug_interface(q, kv, indices, sm_scale=None, return_p_sum: bool = False, d_v=512, block_I=64, num_stages=2, threads=256):
-    is_casual = True
-    assert return_p_sum == False, "This kernel file is for fwd only"
-    assert q.is_contiguous() and kv.is_contiguous() and indices.is_contiguous()
-    batch, seq_len, heads, dim_plus_tail_dim = q.shape
-    _, seq_len_kv, kv_group, _ = kv.shape
-
-    assert dim_plus_tail_dim == 576, "you should assign dim otherwise"
-    dim = d_v
-
-    assert kv.shape[-1] == dim_plus_tail_dim
-    tail_dim = dim_plus_tail_dim - dim
-    assert kv.shape[0] == batch
-    _, _, _, topk = indices.shape
-    assert indices.shape == (batch, seq_len, kv_group, topk)
-
-    kernel = sparse_mla_fwd_debug(
-        heads, dim, tail_dim, topk, kv_group, sm_scale, is_casual, block_I=block_I, num_stages=num_stages, threads=threads
-    )
-    out, lse = kernel(q, kv, indices)
-    return out, lse
-
-
-def test_sparse_mla_fwd_debug(
-    B=1,
-    S=4,  # 使用较小的S以减少输出
-    SKV=8,
-    H=16,  # 使用较小的H以减少输出
-    HKV=1,
-    DQK=576,
-    DV=512,
-    topk=64,  # 使用较小的topk以减少输出
-    dtype=torch.bfloat16,
-    block_I=64,
-    num_stages=2,
-    threads=256,
-):
-    """
-    测试带调试信息的 sparse_mla_fwd
-    使用较小的参数以减少调试输出量
-    """
-    print("=" * 60)
-    print("Testing sparse_mla_fwd_debug with small parameters")
-    print(f"B={B}, S={S}, SKV={SKV}, H={H}, HKV={HKV}")
-    print(f"DQK={DQK}, DV={DV}, topk={topk}")
-    print("=" * 60)
-    
-    torch.random.manual_seed(0)
-    q = torch.randn((B, S, H, DQK), dtype=dtype, device="cuda").requires_grad_(False)
-    kv = torch.randn((B, SKV, HKV, DQK), dtype=dtype, device="cuda").requires_grad_(False)
-
-    indices = torch.full((B, S, HKV, topk), SKV, dtype=torch.int32, device="cuda")
-    for b in range(B):
-        for t in range(S):
-            for h in range(HKV):
-                valid_indices = min(topk, max(1, t))
-                i_i = torch.randperm(max(1, t), device="cpu")[:valid_indices]
-                indices[b, t, h, :len(i_i)] = i_i.to("cuda")
-
-    print("\n[INFO] Running kernel with T.print debug statements...")
-    print("=" * 60)
-    
-    tl_out, tl_lse = sparse_mla_fwd_debug_interface(
-        q, kv, indices, 
-        block_I=block_I, 
-        num_stages=num_stages, 
-        threads=threads
-    )
-    
-    print("=" * 60)
-    print("[INFO] Kernel execution completed!")
-    print(f"Output shape: {tl_out.shape}")
-    print(f"LSE shape: {tl_lse.shape}")
-    print(f"Output (first 4 elements): {tl_out[0, 0, 0, :4]}")
-    print(f"LSE (first 4 elements): {tl_lse[0, 0, :4]}")
-
-
-if __name__ == "__main__":
+[INFO] Running kernel with T.print debug statements...
+============================================================
+2025-12-19 12:14:10  [TileLang:tilelang.jit.kernel:INFO]: TileLang begins to compile kernel `main` with `out_idx=[-2, -1]`
+ptxas fatal   : Unresolved extern function '_Z24debug_print_buffer_valueIbEvPKcS1_iT_'
+Traceback (most recent call last):
+  File "/home/users/chenquanlin/workspace/a0p6b_dsa_stage2/test2.py", line 287, in <module>
     test_sparse_mla_fwd_debug()
+  File "/home/users/chenquanlin/workspace/a0p6b_dsa_stage2/test2.py", line 271, in test_sparse_mla_fwd_debug
+    tl_out, tl_lse = sparse_mla_fwd_debug_interface(
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/users/chenquanlin/workspace/a0p6b_dsa_stage2/test2.py", line 225, in sparse_mla_fwd_debug_interface
+    kernel = sparse_mla_fwd_debug(
+             ^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py", line 205, in wrapper
+    kernel_result = compile(
+                    ^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py", line 70, in compile
+    return cached(
+           ^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/cache/__init__.py", line 29, in cached
+    return _kernel_cache_instance.cached(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/cache/kernel_cache.py", line 185, in cached
+    kernel = JITKernel(
+             ^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py", line 121, in __init__
+    adapter = self._compile_and_create_adapter(func, out_idx)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py", line 250, in _compile_and_create_adapter
+    adapter = CythonKernelAdapter(
+              ^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/jit/adapter/cython/adapter.py", line 128, in __init__
+    self.lib_generator.compile_lib()
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/jit/adapter/libgen.py", line 164, in compile_lib
+    raise RuntimeError(f"Compilation Failed! {command}"
+RuntimeError: Compilation Failed! ['/usr/local/cuda/bin/nvcc', '-std=c++17', '-w', '-Xcudafe', '--diag_suppress=177', '--compiler-options', '-fPIC', '-lineinfo', '--shared', '/tmp/tmpmenk1qvq.cu', '-lcuda', '-gencode', 'arch=compute_90a,code=sm_90a', '-I/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/cutlass/include', '-I/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/../src', '-o', '/tmp/tmpmenk1qvq.so']
+ #include <math_constants.h>
+#include <tl_templates/cuda/gemm.h>
+#include <tl_templates/cuda/copy.h>
+#include <tl_templates/cuda/reduce.h>
+#include <tl_templates/cuda/ldsm.h>
+#include <tl_templates/cuda/threadblock_swizzle.h>
+#include <tl_templates/cuda/debug.h>
+#ifdef ENABLE_BF16
+#include <tl_templates/cuda/cuda_bf16_fallbacks.cuh>
+#endif
+
+extern "C" __global__ void main_kernel(int* __restrict__ Indices, bfloat16_t* __restrict__ KV, float* __restrict__ Lse, bfloat16_t* __restrict__ Output, bfloat16_t* __restrict__ Q, int batch, int seq_len, int seq_len_kv);
+extern "C" __global__ void __launch_bounds__(256, 1) main_kernel(int* __restrict__ Indices, bfloat16_t* __restrict__ KV, float* __restrict__ Lse, bfloat16_t* __restrict__ Output, bfloat16_t* __restrict__ Q, int batch, int seq_len, int seq_len_kv) {
+  extern __shared__ __align__(1024) uchar buf_dyn_shmem[];
+  float acc_o[32];
+  float sumexp[2];
+  float m_i[2];
+  signed char mask[2];
+  __shared__ signed char smem[64];
+  float acc_s[4];
+  __shared__ float smem_1[1024];
+  float m_i_prev[2];
+  float alpha[2];
+  float sumexp_i[2];
+  __shared__ float smem_2[16];
+  __shared__ float smem_3[16];
+  __shared__ float smem_4[16];
+  __shared__ float smem_5[1024];
+  __shared__ float smem_6[8192];
+  __shared__ float smem_7[8192];
+  __shared__ float smem_8[16];
+  #pragma unroll
+  for (int i = 0; i < 16; ++i) {
+    *(float2*)(acc_o + (i * 2)) = make_float2(0x0p+0f/*0.000000e+00*/, 0x0p+0f/*0.000000e+00*/);
+  }
+  #pragma unroll
+  for (int i_1 = 0; i_1 < 2; ++i_1) {
+    sumexp[i_1] = 0x0p+0f/*0.000000e+00*/;
+  }
+  #pragma unroll
+  for (int i_2 = 0; i_2 < 2; ++i_2) {
+    m_i[i_2] = -0x1p+30f/*-1.073742e+09*/;
+  }
+  #pragma unroll
+  for (int i_3 = 0; i_3 < 4; ++i_3) {
+    *(uint4*)(((bfloat16_t*)buf_dyn_shmem) + ((((((((((int)threadIdx.x) & 63) >> 3) * 1024) + (i_3 * 256)) + ((((int)threadIdx.x) >> 6) * 64)) + (((((((int)threadIdx.x) & 7) >> 2) + (i_3 & 1)) & 1) * 32)) + ((((((int)threadIdx.x) >> 7) + ((((int)threadIdx.x) & 3) >> 1)) & 1) * 16)) + (((((((int)threadIdx.x) & 127) >> 6) + (((int)threadIdx.x) & 1)) & 1) * 8))) = *(uint4*)(Q + (((((((int64_t)((int)blockIdx.x)) * (int64_t)9216) + ((((int64_t)((int)blockIdx.y)) * ((int64_t)seq_len)) * (int64_t)9216)) + (((int64_t)i_3) * (int64_t)2304)) + ((((int64_t)((int)threadIdx.x)) >> (int64_t)6) * (int64_t)576)) + ((((int64_t)((int)threadIdx.x)) & (int64_t)63) * (int64_t)8)));
+  }
+  *(uint2*)(((bfloat16_t*)buf_dyn_shmem) + (((((((((int)threadIdx.x) >> 4) * 64) + (((((((int)threadIdx.x) & 127) >> 6) + ((((int)threadIdx.x) & 15) >> 3)) & 1) * 32)) + (((((((int)threadIdx.x) & 63) >> 5) + ((((int)threadIdx.x) & 7) >> 2)) & 1) * 16)) + (((((((int)threadIdx.x) & 31) >> 4) + ((((int)threadIdx.x) & 3) >> 1)) & 1) * 8)) + ((((int)threadIdx.x) & 1) * 4)) + 8192)) = *(uint2*)(Q + (((((((int64_t)((int)blockIdx.x)) * (int64_t)9216) + ((((int64_t)((int)blockIdx.y)) * ((int64_t)seq_len)) * (int64_t)9216)) + ((((int64_t)((int)threadIdx.x)) >> (int64_t)4) * (int64_t)576)) + ((((int64_t)((int)threadIdx.x)) & (int64_t)15) * (int64_t)4)) + (int64_t)512));
+  __syncthreads();
+  if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
+    debug_print_var("[DEBUG] b_i:", ((int)blockIdx.y));
+    debug_print_var("[DEBUG] s_i:", ((int)blockIdx.x));
+    debug_print_var("[DEBUG] H0:", 0);
+    debug_print_var("[DEBUG] H1:", 16);
+    if (((int)threadIdx.x) == 0) {
+      for (int i_4 = 0; i_4 < 8192; ++i_4) {
+        debug_print_buffer_value("[DEBUG] Q_shared after copy:", "Q_shared", i_4, ((bfloat16_t*)buf_dyn_shmem)[((((((((i_4 & 511) >> 6) * 1024) + ((i_4 >> 9) * 64)) + (((((i_4 & 4095) >> 11) + ((i_4 & 63) >> 5)) & 1) * 32)) + (((((i_4 & 2047) >> 10) + ((i_4 & 31) >> 4)) & 1) * 16)) + (((((i_4 & 1023) >> 9) + ((i_4 & 15) >> 3)) & 1) * 8)) + (i_4 & 7))]);
+      }
+      for (int i_5 = 0; i_5 < 1024; ++i_5) {
+        debug_print_buffer_value("[DEBUG] Q_tail_shared after copy:", "Q_tail_shared", i_5, ((bfloat16_t*)buf_dyn_shmem)[(((((((i_5 >> 6) * 64) + (((((i_5 & 511) >> 8) + ((i_5 & 63) >> 5)) & 1) * 32)) + (((((i_5 & 255) >> 7) + ((i_5 & 31) >> 4)) & 1) * 16)) + (((((i_5 & 127) >> 6) + ((i_5 & 15) >> 3)) & 1) * 8)) + (i_5 & 7)) + 8192)]);
+      }
+    }
+  }
+  #pragma unroll
+  for (int i_6 = 0; i_6 < 2; ++i_6) {
+    tl::cp_async_gs_conditional<16>(buf_dyn_shmem+((((((i_6 * 4096) + ((((int)threadIdx.x) >> 3) * 128)) + (((((((int)threadIdx.x) & 63) >> 5) + ((((int)threadIdx.x) & 7) >> 2)) & 1) * 64)) + (((((((int)threadIdx.x) & 31) >> 4) + ((((int)threadIdx.x) & 3) >> 1)) & 1) * 32)) + (((((((int)threadIdx.x) & 15) >> 3) + (((int)threadIdx.x) & 1)) & 1) * 16)) + 18432), KV+((((((int64_t)Indices[((((((int64_t)((int)blockIdx.x)) * (int64_t)64) + ((((int64_t)((int)blockIdx.y)) * ((int64_t)seq_len)) * (int64_t)64)) + (((int64_t)i_6) * (int64_t)32)) + (((int64_t)((int)threadIdx.x)) >> (int64_t)3))]) * (int64_t)576) + ((((int64_t)((int)blockIdx.y)) * ((int64_t)seq_len_kv)) * (int64_t)576)) + ((((int64_t)((int)threadIdx.x)) & (int64_t)7) * (int64_t)8)) + (int64_t)512), ((0 <= Indices[((((((int64_t)((int)blockIdx.x)) * (int64_t)64) + ((((int64_t)((int)blockIdx.y)) * ((int64_t)seq_len)) * (int64_t)64)) + (((int64_t)i_6) * (int64_t)32)) + (((int64_t)((int)threadIdx.x)) >> (int64_t)3))]) && (Indices[((((((int64_t)((int)blockIdx.x)) * (int64_t)64) + ((((int64_t)((int)blockIdx.y)) * ((int64_t)seq_len)) * (int64_t)64)) + (((int64_t)i_6) * (int64_t)32)) + (((int64_t)((int)threadIdx.x)) >> (int64_t)3))] < seq_len_kv)));
+  }
+  tl::cp_async_commit();
+  #pragma unroll
+  for (int i_7 = 0; i_7 < 16; ++i_7) {
+    tl::cp_async_gs_conditional<16>(buf_dyn_shmem+(((((((((((int)threadIdx.x) & 63) >> 3) * 8192) + (i_7 * 512)) + ((((int)threadIdx.x) >> 6) * 128)) + (((((((int)threadIdx.x) & 7) >> 2) + (i_7 & 1)) & 1) * 64)) + ((((((int)threadIdx.x) >> 7) + ((((int)threadIdx.x) & 3) >> 1)) & 1) * 32)) + (((((((int)threadIdx.x) & 127) >> 6) + (((int)threadIdx.x) & 1)) & 1) * 16)) + 34816), KV+(((((int64_t)Indices[((((((int64_t)((int)blockIdx.x)) * (int64_t)64) + ((((int64_t)((int)blockIdx.y)) * ((int64_t)seq_len)) * (int64_t)64)) + (((int64_t)i_7) * (int64_t)4)) + (((int64_t)((int)threadIdx.x)) >> (int64_t)6))]) * (int64_t)576) + ((((int64_t)((int)blockIdx.y)) * ((int64_t)seq_len_kv)) * (int64_t)576)) + ((((int64_t)((int)threadIdx.x)) & (int64_t)63) * (int64_t)8)), ((0 <= Indices[((((((int64_t)((int)blockIdx.x)) * (int64_t)64) + ((((int64_t)((int)blockIdx.y)) * ((int64_t)seq_len)) * (int64_t)64)) + (((int64_t)i_7) * (int64_t)4)) + (((int64_t)((int)threadIdx.x)) >> (int64_t)6))]) && (Indices[((((((int64_t)((int)blockIdx.x)) * (int64_t)64) + ((((int64_t)((int)blockIdx.y)) * ((int64_t)seq_len)) * (int64_t)64)) + (((int64_t)i_7) * (int64_t)4)) + (((int64_t)((int)threadIdx.x)) >> (int64_t)6))] < seq_len_kv)));
+  }
+  tl::cp_async_commit();
+  tl::fence_proxy_async();
+  tl::fence_proxy_async();
+  char2 __1;
+  ushort2 __2;
+    int2 v_ = *(int2*)(Indices + ((((((int64_t)((int)blockIdx.x)) * (int64_t)64) + ((((int64_t)((int)blockIdx.y)) * ((int64_t)seq_len)) * (int64_t)64)) + ((((int64_t)((int)threadIdx.x)) >> (int64_t)5) * (int64_t)8)) + ((((int64_t)((int)threadIdx.x)) & (int64_t)3) * (int64_t)2)));
+    int2 v__1 = make_int2(((int)blockIdx.x), ((int)blockIdx.x));
+    __2.x = (v_.x<=v__1.x);
+    __2.y = (v_.y<=v__1.y);
+  __1.x=((signed char)(__2.x));
+  __1.y=((signed char)(__2.y));
+  *(char2*)(mask + 0) = __1;
+  if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
+    debug_print_var("[DEBUG] i_i (iteration):", 0);
+  }
+  tl::cp_async_wait<0>();
+  __syncthreads();
+  if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
+    if (((int)threadIdx.x) == 0) {
+      for (int i_8 = 0; i_8 < 32768; ++i_8) {
+        debug_print_buffer_value("[DEBUG] KV_shared after copy:", "KV_shared", i_8, ((bfloat16_t*)buf_dyn_shmem)[(((((((((i_8 & 511) >> 6) * 4096) + ((i_8 >> 9) * 64)) + (((((i_8 & 4095) >> 11) + ((i_8 & 63) >> 5)) & 1) * 32)) + (((((i_8 & 2047) >> 10) + ((i_8 & 31) >> 4)) & 1) * 16)) + (((((i_8 & 1023) >> 9) + ((i_8 & 15) >> 3)) & 1) * 8)) + (i_8 & 7)) + 17408)]);
+      }
+    }
+  }
+  tl::cp_async_wait<1>();
+  __syncthreads();
+  if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
+    if (((int)threadIdx.x) == 0) {
+      for (int i_9 = 0; i_9 < 4096; ++i_9) {
+        debug_print_buffer_value("[DEBUG] K_tail_shared after copy:", "K_tail_shared", i_9, ((bfloat16_t*)buf_dyn_shmem)[(((((((i_9 >> 6) * 64) + (((((i_9 & 511) >> 8) + ((i_9 & 63) >> 5)) & 1) * 32)) + (((((i_9 & 255) >> 7) + ((i_9 & 31) >> 4)) & 1) * 16)) + (((((i_9 & 127) >> 6) + ((i_9 & 15) >> 3)) & 1) * 8)) + (i_9 & 7)) + 9216)]);
+      }
+    }
+  }
+  if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
+    if (((((int)threadIdx.x) & 31) >> 2) == 0) {
+      char2 __3;
+      ushort2 __4;
+      char2 v__2 = *(char2*)(mask + 0);
+      __4.x = (bool)(v__2.x);
+      __4.y = (bool)(v__2.y);
+      __3.x=((signed char)(__4.x));
+      __3.y=((signed char)(__4.y));
+      *(char2*)(smem + (((((int)threadIdx.x) >> 5) * 8) + ((((int)threadIdx.x) & 3) * 2))) = __3;
+    }
+  }
+  __syncthreads();
+  if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
+    if (((int)threadIdx.x) == 0) {
+      for (int i_10 = 0; i_10 < 64; ++i_10) {
+        debug_print_buffer_value("[DEBUG] mask:", "mask", i_10, ((bool)smem[i_10]));
+      }
+    }
+  }
+  #pragma unroll
+  for (int i_11 = 0; i_11 < 4; ++i_11) {
+    float condval;
+    if (((bool)mask[(i_11 & 1)])) {
+      condval = 0x0p+0f/*0.000000e+00*/;
+    } else {
+      condval = -CUDART_INF_F;
+    }
+    acc_s[i_11] = condval;
+  }
+  tl::fence_proxy_async();
+  tl::cp_async_wait<0>();
+  __syncthreads();
+  tl::gemm_ss<16, 64, 512, 1, 8, 0, 1, 0, 512, 512, 0, 0, false>((&(((bfloat16_t*)buf_dyn_shmem)[0])), (&(((bfloat16_t*)buf_dyn_shmem)[17408])), (&(acc_s[0])));
+  tl::cp_async_wait<1>();
+  __syncthreads();
+  tl::gemm_ss<16, 64, 64, 1, 8, 0, 1, 0, 64, 64, 0, 0, false>((&(((bfloat16_t*)buf_dyn_shmem)[8192])), (&(((bfloat16_t*)buf_dyn_shmem)[9216])), (&(acc_s[0])));
+  if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
+    #pragma unroll
+    for (int i_12 = 0; i_12 < 2; ++i_12) {
+      *(float2*)(smem_1 + ((((i_12 * 512) + (((((int)threadIdx.x) & 31) >> 2) * 64)) + ((((int)threadIdx.x) >> 5) * 8)) + ((((int)threadIdx.x) & 3) * 2))) = *(float2*)(acc_s + (i_12 * 2));
+    }
+  }
+  __syncthreads();
+  if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
+    if (((int)threadIdx.x) == 0) {
+      for (int i_13 = 0; i_13 < 1024; ++i_13) {
+        debug_print_buffer_value("[DEBUG] acc_s after GEMM (QK^T):", "acc_s", i_13, smem_1[i_13]);
+      }
+    }
+  }
+  #pragma unroll
+  for (int i_14 = 0; i_14 < 2; ++i_14) {
+    m_i_prev[i_14] = m_i[i_14];
+  }
+  __syncthreads();
+  #pragma unroll
+  for (int i_15 = 0; i_15 < 2; ++i_15) {
+    #pragma unroll
+    for (int rv = 0; rv < 2; ++rv) {
+      m_i[i_15] = max(m_i[i_15], acc_s[((i_15 * 2) + rv)]);
+    }
+    m_i[i_15] = tl::AllReduce<tl::MaxOp, 256, 32, 0, 256>::run_hopper(m_i[i_15], (&(((float*)buf_dyn_shmem)[0])));
+    m_i[i_15] = tl::AllReduce<tl::MaxOp, 4, 1, 0, 256>::run_hopper(m_i[i_15]);
+  }
+  #pragma unroll
+  for (int i_16 = 0; i_16 < 2; ++i_16) {
+    m_i[i_16] = max(m_i[i_16], m_i_prev[i_16]);
+  }
+  #pragma unroll
+  for (int i_17 = 0; i_17 < 2; ++i_17) {
+    alpha[i_17] = exp2f(((m_i_prev[i_17] - m_i[i_17]) * 0x1.ec709dbe8903ep-5f/*6.011229e-02*/));
+  }
+  #pragma unroll
+  for (int i_18 = 0; i_18 < 4; ++i_18) {
+    acc_s[i_18] = exp2f(((acc_s[i_18] * 0x1.ec709dbe8903ep-5f/*6.011229e-02*/) - (m_i[(i_18 >> 1)] * 0x1.ec709dbe8903ep-5f/*6.011229e-02*/)));
+  }
+  __syncthreads();
+  #pragma unroll
+  for (int i_19 = 0; i_19 < 2; ++i_19) {
+    sumexp_i[i_19] = 0x0p+0f/*0.000000e+00*/;
+    #pragma unroll
+    for (int rv_1 = 0; rv_1 < 2; ++rv_1) {
+      sumexp_i[i_19] = (sumexp_i[i_19] + acc_s[((i_19 * 2) + rv_1)]);
+    }
+    sumexp_i[i_19] = tl::AllReduce<tl::SumOp, 256, 32, 0, 256>::run_hopper(sumexp_i[i_19], (&(((float*)buf_dyn_shmem)[0])));
+    sumexp_i[i_19] = tl::AllReduce<tl::SumOp, 4, 1, 0, 256>::run_hopper(sumexp_i[i_19]);
+  }
+  #pragma unroll
+  for (int i_20 = 0; i_20 < 2; ++i_20) {
+    sumexp[i_20] = ((sumexp[i_20] * alpha[i_20]) + sumexp_i[i_20]);
+  }
+  if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
+    if ((((((int)threadIdx.x) & 3) * 8) + (((int)threadIdx.x) >> 5)) == 0) {
+      #pragma unroll
+      for (int i_21 = 0; i_21 < 2; ++i_21) {
+        smem_2[((i_21 * 8) + ((((int)threadIdx.x) & 31) >> 2))] = m_i[i_21];
+      }
+    }
+  }
+  __syncthreads();
+  if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
+    if (((int)threadIdx.x) == 0) {
+      for (int i_22 = 0; i_22 < 16; ++i_22) {
+        debug_print_buffer_value("[DEBUG] m_i (row max):", "m_i", i_22, smem_2[i_22]);
+      }
+    }
+  }
+  if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
+    if ((((((int)threadIdx.x) & 3) * 8) + (((int)threadIdx.x) >> 5)) == 0) {
+      #pragma unroll
+      for (int i_23 = 0; i_23 < 2; ++i_23) {
+        smem_3[((i_23 * 8) + ((((int)threadIdx.x) & 31) >> 2))] = alpha[i_23];
+      }
+    }
+  }
+  __syncthreads();
+  if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
+    if (((int)threadIdx.x) == 0) {
+      for (int i_24 = 0; i_24 < 16; ++i_24) {
+        debug_print_buffer_value("[DEBUG] alpha (rescale factor):", "alpha", i_24, smem_3[i_24]);
+      }
+    }
+  }
+  if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
+    if ((((((int)threadIdx.x) & 3) * 8) + (((int)threadIdx.x) >> 5)) == 0) {
+      #pragma unroll
+      for (int i_25 = 0; i_25 < 2; ++i_25) {
+        smem_4[((i_25 * 8) + ((((int)threadIdx.x) & 31) >> 2))] = sumexp[i_25];
+      }
+    }
+  }
+  __syncthreads();
+  if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
+    if (((int)threadIdx.x) == 0) {
+      for (int i_26 = 0; i_26 < 16; ++i_26) {
+        debug_print_buffer_value("[DEBUG] sumexp (sum of exp):", "sumexp", i_26, smem_4[i_26]);
+      }
+    }
+  }
+  if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
+    #pragma unroll
+    for (int i_27 = 0; i_27 < 2; ++i_27) {
+      *(float2*)(smem_5 + ((((i_27 * 512) + (((((int)threadIdx.x) & 31) >> 2) * 64)) + ((((int)threadIdx.x) >> 5) * 8)) + ((((int)threadIdx.x) & 3) * 2))) = *(float2*)(acc_s + (i_27 * 2));
+    }
+  }
+  __syncthreads();
+  if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
+    if (((int)threadIdx.x) == 0) {
+      for (int i_28 = 0; i_28 < 1024; ++i_28) {
+        debug_print_buffer_value("[DEBUG] acc_s after softmax (P):", "acc_s", i_28, smem_5[i_28]);
+      }
+    }
+  }
+  #pragma unroll
+  for (int i_29 = 0; i_29 < 32; ++i_29) {
+    acc_o[i_29] = (acc_o[i_29] * alpha[((i_29 & 3) >> 1)]);
+  }
+  __syncthreads();
+  #pragma unroll
+  for (int i_30 = 0; i_30 < 1; ++i_30) {
+    tl::ptx_stmatrix_x2((&(((bfloat16_t*)buf_dyn_shmem)[(((((((int)threadIdx.x) & 15) * 64) + ((((((int)threadIdx.x) >> 7) + ((((int)threadIdx.x) & 7) >> 2)) & 1) * 32)) + (((((((int)threadIdx.x) & 127) >> 6) + ((((int)threadIdx.x) & 3) >> 1)) & 1) * 16)) + (((((((int)threadIdx.x) & 63) >> 5) + (((int)threadIdx.x) & 1)) & 1) * 8))])), __pack_half2(((bfloat16_t)acc_s[0]), ((bfloat16_t)acc_s[1])), __pack_half2(((bfloat16_t)acc_s[2]), ((bfloat16_t)acc_s[3])));
+  }
+  tl::fence_proxy_async();
+  tl::cp_async_wait<0>();
+  __syncthreads();
+  tl::gemm_ss<16, 512, 64, 1, 8, 0, 0, 0, 64, 512, 0, 0, false>((&(((bfloat16_t*)buf_dyn_shmem)[0])), (&(((bfloat16_t*)buf_dyn_shmem)[17408])), (&(acc_o[0])));
+  if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
+    #pragma unroll
+    for (int i_31 = 0; i_31 < 16; ++i_31) {
+      *(float2*)(smem_6 + ((((((i_31 & 1) * 4096) + (((((int)threadIdx.x) & 31) >> 2) * 512)) + ((i_31 >> 1) * 64)) + ((((int)threadIdx.x) >> 5) * 8)) + ((((int)threadIdx.x) & 3) * 2))) = *(float2*)(acc_o + (i_31 * 2));
+    }
+  }
+  __syncthreads();
+  if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
+    if (((int)threadIdx.x) == 0) {
+      for (int i_32 = 0; i_32 < 8192; ++i_32) {
+        debug_print_buffer_value("[DEBUG] acc_o after PV GEMM (first iter):", "acc_o", i_32, smem_6[i_32]);
+      }
+    }
+  }
+  #pragma unroll
+  for (int i_33 = 0; i_33 < 32; ++i_33) {
+    acc_o[i_33] = (acc_o[i_33] / sumexp[((i_33 & 3) >> 1)]);
+  }
+  #pragma unroll
+  for (int i_34 = 0; i_34 < 2; ++i_34) {
+    sumexp[i_34] = (log2f(sumexp[i_34]) + (m_i[i_34] * 0x1.ec709dbe8903ep-5f/*6.011229e-02*/));
+  }
+  if ((((int)blockIdx.x) == 0) && (((int)blockIdx.y) == 0)) {
+    #pragma unroll
+    for (int i_35 = 0; i_35 < 16; ++i_35) {
+      *(float2*)(smem_7 + ((((((i_35 & 1) * 4096) + (((((int)threadIdx.x) & 31) >> 2) * 512)) + ((i_35 >> 1) * 64)) + ((((int)threadIdx.x) >> 5) * 8)) + ((((int)threadIdx.x) & 3) * 2))) = *(float2*)(acc_o + (i_35 * 2));
+    }
+    __syncthreads();
+    if (((int)threadIdx.x) == 0) {
+      for (int i_36 = 0; i_36 < 8192; ++i_36) {
+        debug_print_buffer_value("[DEBUG] acc_o (final output after rescale):", "acc_o", i_36, smem_7[i_36]);
+      }
+    }
+    if ((((((int)threadIdx.x) & 3) * 8) + (((int)threadIdx.x) >> 5)) == 0) {
+      #pragma unroll
+      for (int i_37 = 0; i_37 < 2; ++i_37) {
+        smem_8[((i_37 * 8) + ((((int)threadIdx.x) & 31) >> 2))] = sumexp[i_37];
+      }
+    }
+    __syncthreads();
+    if (((int)threadIdx.x) == 0) {
+      for (int i_38 = 0; i_38 < 16; ++i_38) {
+        debug_print_buffer_value("[DEBUG] sumexp (final LSE):", "sumexp", i_38, smem_8[i_38]);
+      }
+    }
+  }
+  #pragma unroll
+  for (int i_39 = 0; i_39 < 16; ++i_39) {
+    uint1 __5;
+    float2 v__3 = *(float2*)(acc_o + (i_39 * 2));
+    *reinterpret_cast<__nv_bfloat162*>(&(__5)) = __float22bfloat162_rn(*(float2*)(&(v__3)));
+    *(uint1*)(Output + (((((((((int64_t)((int)blockIdx.x)) * (int64_t)8192) + ((((int64_t)((int)blockIdx.y)) * ((int64_t)seq_len)) * (int64_t)8192)) + ((((int64_t)i_39) & (int64_t)1) * (int64_t)4096)) + (((((int64_t)((int)threadIdx.x)) & (int64_t)31) >> (int64_t)2) * (int64_t)512)) + ((((int64_t)i_39) >> (int64_t)1) * (int64_t)64)) + ((((int64_t)((int)threadIdx.x)) >> (int64_t)5) * (int64_t)8)) + ((((int64_t)((int)threadIdx.x)) & (int64_t)3) * (int64_t)2))) = __5;
+  }
+  if ((((((int)threadIdx.x) & 3) * 8) + (((int)threadIdx.x) >> 5)) == 0) {
+    #pragma unroll
+    for (int i_40 = 0; i_40 < 2; ++i_40) {
+      Lse[((((((int64_t)((int)blockIdx.x)) * (int64_t)16) + ((((int64_t)((int)blockIdx.y)) * ((int64_t)seq_len)) * (int64_t)16)) + (((int64_t)i_40) * (int64_t)8)) + ((((int64_t)((int)threadIdx.x)) & (int64_t)31) >> (int64_t)2))] = sumexp[i_40];
+    }
+  }
+}
+
+
+#define ERROR_BUF_SIZE 1024
+static char error_buf[ERROR_BUF_SIZE];
+
+extern "C" const char* get_last_error() {
+    return error_buf;
+}
+
+extern "C" int init() {
+    error_buf[0] = '\0';
+    
+    cudaError_t result_main_kernel = cudaFuncSetAttribute(main_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 165888);
+    if (result_main_kernel != cudaSuccess) {
+        snprintf(error_buf, ERROR_BUF_SIZE, "Failed to set the allowed dynamic shared memory size to %d with error: %s", 165888, cudaGetErrorString(result_main_kernel));
+        return -1;
+    }
+
+    return 0;
+}
+
+extern "C" int call(bfloat16_t* __restrict__ Q, bfloat16_t* __restrict__ KV, int* __restrict__ Indices, bfloat16_t* __restrict__ Output, float* __restrict__ Lse, int batch, int seq_len, int seq_len_kv, cudaStream_t stream=cudaStreamDefault) {
+        main_kernel<<<dim3(seq_len, batch, 1), dim3(256, 1, 1), 165888, stream>>>(Indices, KV, Lse, Output, Q, batch, seq_len, seq_len_kv);
+        TILELANG_CHECK_LAST_ERROR("main_kernel");
+
+        return 0;
+}
