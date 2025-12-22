@@ -10,20 +10,6 @@ Sparse Triton H20优化 性能测试
 理论复杂度: O(seq * topk * head_dim) = O(536,870,912)
 ======================================================================
 Traceback (most recent call last):
-  File "/usr/local/lib/python3.12/dist-packages/triton/language/core.py", line 34, in wrapper
-    return fn(*args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^
-  File "/usr/local/lib/python3.12/dist-packages/triton/language/core.py", line 2579, in multiple_of
-    return semantic.multiple_of(input, values)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/local/lib/python3.12/dist-packages/triton/language/semantic.py", line 1795, in multiple_of
-    if max(1, len(x.shape)) != len(values):
-                  ^^^^^^^
-AttributeError: 'constexpr' object has no attribute 'shape'
-
-The above exception was the direct cause of the following exception:
-
-Traceback (most recent call last):
   File "/home/users/chenquanlin/workspace/chunk_loss/test.py", line 690, in <module>
     test_performance(
   File "/home/users/chenquanlin/workspace/chunk_loss/test.py", line 569, in test_performance
@@ -56,16 +42,18 @@ Traceback (most recent call last):
   File "/usr/local/lib/python3.12/dist-packages/triton/compiler/compiler.py", line 81, in make_ir
     return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-triton.compiler.errors.CompilationError: at 42:16:
-    pid_m = pid_temp % num_per_head
+triton.compiler.errors.CompilationError: at 66:12:
+            idx_base = idx_batch_base + row * stride_is
+            out_base = out_batch_head_base + row * stride_os
 
-    NEG_INF = -1e9
+            # 加载indices
+            indices = tl.load(idx_base + offs_topk * stride_ik).to(tl.int64)
+            causal_mask = indices > row
 
-    # 预计算共享的基地址
-    q_batch_head_base = Q_ptr + pid_batch * stride_qb + pid_head * stride_qh
-    k_batch_base = K_ptr + pid_batch * stride_kb
-    idx_batch_base = Indices_ptr + pid_batch * stride_ib
-    out_batch_head_base = Out_ptr + pid_batch * stride_ob + pid_head * stride_oh
+            # 计算QK - 分块处理head_dim
+            qk = tl.zeros([topk], dtype=tl.float32)
 
-    # 提示编译器stride对齐
-    stride_qd = tl.multiple_of(stride_qd, 8)
+            num_d_blocks: tl.constexpr = tl.cdiv(head_dim, BLOCK_D)
+            for d_idx in tl.static_range(num_d_blocks):
+            ^
+TypeError("'tensor' object cannot be interpreted as an integer")
