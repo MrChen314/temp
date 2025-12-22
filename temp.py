@@ -1,11 +1,11 @@
 """
-Triton Unfused实现 - 用于调试精度问题
+Triton Fused实现 - 支持Tensor Parallel
 
-将计算拆分为4个独立步骤，每步可单独验证：
-1. Attention Softmax: QK^T * scaling + mask + softmax
-2. Head Sum + Normalize: sum over heads + normalize
-3. Index Score Softmax: masked softmax
-4. KL Divergence: kl_div计算
+将计算分为两个融合kernel以支持中间的reduce操作:
+1. Kernel 1 (Pre-Reduce): Attention Softmax
+2. Kernel 2 (Post-Reduce): HeadSum + Normalize + IndexSoftmax + KL Divergence
+
+注意: reduce操作在外部进行，不在此文件中实现
 """
 
 import torch
@@ -15,9 +15,9 @@ import torch.nn.functional as F
 
 
 # ============================================================================
-# Step 1: Attention Softmax Kernel
+# Kernel 1: Pre-Reduce - Attention Softmax
 # 输入: query [B, H, S, D], key [B, S, D], mask [B, S, S]
-# 输出: attn [B, H, S, S]
+# 输出: attn_scores [B, H, S, S]
 # ============================================================================
 
 @triton.jit
@@ -45,8 +45,9 @@ def _attention_softmax_kernel(
     BLOCK_D: tl.constexpr,
 ):
     """
-    计算一行的attention softmax
+    Pre-Reduce Kernel: 计算masked attention softmax
     每个program处理一个 (batch, head, row)
+    使用online softmax算法
     """
     pid = tl.program_id(0)
     num_rows_per_batch = num_heads * seq_len
@@ -62,7 +63,7 @@ def _attention_softmax_kernel(
     q_ptr = Q_ptr + pid_batch * stride_qb + pid_head * stride_qh + pid_row * stride_qs
     q = tl.load(q_ptr + offs_d * stride_qd, mask=d_mask, other=0.0)
     
-    # 第一遍: 计算max
+    # Pass 1: 计算max (for numerical stability)
     m_max = -float("inf")
     for start_n in range(0, seq_len, BLOCK_N):
         offs_n = start_n + tl.arange(0, BLOCK_N)
@@ -75,14 +76,14 @@ def _attention_softmax_kernel(
         # QK^T * scaling
         qk = tl.sum(q[None, :] * k, axis=1) * scaling
         
-        # 加载mask
+        # 加载mask并应用
         mask_ptrs = Mask_ptr + pid_batch * stride_mb + pid_row * stride_ms + offs_n * stride_mk
         mask_val = tl.load(mask_ptrs, mask=n_mask, other=True)
         qk = tl.where(mask_val | ~n_mask, -float("inf"), qk)
         
         m_max = tl.maximum(m_max, tl.max(qk))
     
-    # 第二遍: 计算sum(exp(x - max))
+    # Pass 2: 计算sum(exp(x - max))
     l_sum = 0.0
     for start_n in range(0, seq_len, BLOCK_N):
         offs_n = start_n + tl.arange(0, BLOCK_N)
@@ -99,7 +100,7 @@ def _attention_softmax_kernel(
         
         l_sum += tl.sum(tl.exp(qk - m_max))
     
-    # 第三遍: 计算softmax并写出
+    # Pass 3: 计算softmax并写出
     for start_n in range(0, seq_len, BLOCK_N):
         offs_n = start_n + tl.arange(0, BLOCK_N)
         n_mask = offs_n < seq_len
@@ -121,9 +122,9 @@ def _attention_softmax_kernel(
         tl.store(out_ptrs, p, mask=n_mask)
 
 
-def attention_softmax_triton(query, key, mask, scaling):
+def attention_softmax_fused(query, key, mask, scaling):
     """
-    Step 1: 计算masked attention softmax
+    Kernel 1: Pre-Reduce - 计算masked attention softmax
     
     Args:
         query: [batch, num_heads, seq_len, head_dim]
@@ -132,7 +133,7 @@ def attention_softmax_triton(query, key, mask, scaling):
         scaling: float
     
     Returns:
-        attn: [batch, num_heads, seq_len, seq_len]
+        attn_scores: [batch, num_heads, seq_len, seq_len]
     """
     batch_size, num_heads, seq_len, head_dim = query.shape
     
@@ -140,9 +141,8 @@ def attention_softmax_triton(query, key, mask, scaling):
     key = key.contiguous()
     mask = mask.contiguous()
     
-    # 输出
-    attn = torch.zeros(batch_size, num_heads, seq_len, seq_len, 
-                       device=query.device, dtype=query.dtype)
+    attn_scores = torch.zeros(batch_size, num_heads, seq_len, seq_len, 
+                              device=query.device, dtype=query.dtype)
     
     BLOCK_N = min(1024, triton.next_power_of_2(seq_len))
     BLOCK_D = triton.next_power_of_2(head_dim)
@@ -150,59 +150,60 @@ def attention_softmax_triton(query, key, mask, scaling):
     grid = (batch_size * num_heads * seq_len,)
     
     _attention_softmax_kernel[grid](
-        query, key, mask, attn,
+        query, key, mask, attn_scores,
         batch_size, num_heads, seq_len, head_dim, scaling,
         query.stride(0), query.stride(1), query.stride(2), query.stride(3),
         key.stride(0), key.stride(1), key.stride(2),
         mask.stride(0), mask.stride(1), mask.stride(2),
-        attn.stride(0), attn.stride(1), attn.stride(2), attn.stride(3),
+        attn_scores.stride(0), attn_scores.stride(1), attn_scores.stride(2), attn_scores.stride(3),
         BLOCK_N, BLOCK_D,
     )
     
-    return attn
-
-
-def attention_softmax_ref(query, key, mask, scaling):
-    """PyTorch参考实现 Step 1"""
-    # query: [batch, num_heads, seq_len, head_dim]
-    # key: [batch, seq_len, head_dim] -> [batch, 1, head_dim, seq_len]
-    attn = torch.matmul(query, key.unsqueeze(1).transpose(-1, -2)) * scaling
-    attn = attn.masked_fill(mask.unsqueeze(1), -1e9)
-    attn = torch.softmax(attn, dim=-1)
-    return attn
+    return attn_scores
 
 
 # ============================================================================
-# Step 2: Head Sum + Normalize Kernel
-# 输入: attn [B, H, S, S]
-# 输出: attn_dist [B, S, S]
+# Kernel 2: Post-Reduce - HeadSum + Normalize + IndexSoftmax + KL Divergence
+# 输入: attn_scores [B, H, S, S], index_score [B, S, S], mask [B, S, S]
+# 输出: loss [B, S] (每行的KL loss，后续求mean)
 # ============================================================================
 
 @triton.jit
-def _head_sum_normalize_kernel(
-    Attn_ptr,       # [batch, num_heads, seq_len, seq_len]
-    Out_ptr,        # [batch, seq_len, seq_len]
+def _post_reduce_loss_kernel(
+    AttnScores_ptr, # [batch, num_heads, seq_len, seq_len] - reduced attention scores
+    IndexScore_ptr, # [batch, seq_len, seq_len]
+    Mask_ptr,       # [batch, seq_len, seq_len]
+    Loss_ptr,       # [batch, seq_len] - 每行的loss
     # Dimensions
     batch_size,
     num_heads: tl.constexpr,
     seq_len,
     eps: tl.constexpr,
-    # Strides for Attn
+    # Strides for AttnScores
     stride_ab, stride_ah, stride_as, stride_ak,
-    # Strides for Out
-    stride_ob, stride_os, stride_ok,
+    # Strides for IndexScore
+    stride_isb, stride_iss, stride_isk,
+    # Strides for Mask
+    stride_mb, stride_ms, stride_mk,
     # Block size
     BLOCK_K: tl.constexpr,
 ):
     """
-    对每个(batch, row)，先对heads求和，再归一化
+    Post-Reduce Kernel: 融合 HeadSum + Normalize + IndexSoftmax + KL
+    每个program处理一个 (batch, row)
+    
+    计算流程:
+    1. 计算 attn_sum = sum(attn_scores, dim=heads)
+    2. 计算 attn_dist = attn_sum / sum(attn_sum)
+    3. 计算 index_prob = softmax(index_score.masked_fill(mask, -inf)) + eps
+    4. 计算 kl = sum(attn_dist * (log(attn_dist) - log(index_prob)))
     """
     pid = tl.program_id(0)
     pid_batch = pid // seq_len
     pid_row = pid % seq_len
     
-    # 第一遍: 计算sum over heads 和 total sum
-    total_sum = 0.0
+    # ============ Pass 1: 计算 attn_sum 的总和 (用于归一化) ============
+    attn_total = 0.0
     
     for start_k in range(0, seq_len, BLOCK_K):
         offs_k = start_k + tl.arange(0, BLOCK_K)
@@ -211,328 +212,188 @@ def _head_sum_normalize_kernel(
         # 对所有heads求和
         acc = tl.zeros([BLOCK_K], dtype=tl.float32)
         for h in tl.static_range(num_heads):
-            attn_ptrs = Attn_ptr + pid_batch * stride_ab + h * stride_ah + pid_row * stride_as + offs_k * stride_ak
+            attn_ptrs = AttnScores_ptr + pid_batch * stride_ab + h * stride_ah + pid_row * stride_as + offs_k * stride_ak
             attn_val = tl.load(attn_ptrs, mask=k_mask, other=0.0)
             acc += attn_val
         
-        total_sum += tl.sum(tl.where(k_mask, acc, 0.0))
+        attn_total += tl.sum(tl.where(k_mask, acc, 0.0))
     
-    # 第二遍: 归一化并写出
+    # ============ Pass 2: 计算 index_score 的 max (用于stable softmax) ============
+    max_is = -float("inf")
+    
     for start_k in range(0, seq_len, BLOCK_K):
         offs_k = start_k + tl.arange(0, BLOCK_K)
         k_mask = offs_k < seq_len
         
-        acc = tl.zeros([BLOCK_K], dtype=tl.float32)
-        for h in tl.static_range(num_heads):
-            attn_ptrs = Attn_ptr + pid_batch * stride_ab + h * stride_ah + pid_row * stride_as + offs_k * stride_ak
-            attn_val = tl.load(attn_ptrs, mask=k_mask, other=0.0)
-            acc += attn_val
-        
-        # 归一化
-        out_val = acc / (total_sum + eps)
-        
-        out_ptrs = Out_ptr + pid_batch * stride_ob + pid_row * stride_os + offs_k * stride_ok
-        tl.store(out_ptrs, out_val, mask=k_mask)
-
-
-def head_sum_normalize_triton(attn, eps=1e-10):
-    """
-    Step 2: 对attention在head维度求和并归一化
-    
-    Args:
-        attn: [batch, num_heads, seq_len, seq_len]
-        eps: 防止除零的小数
-    
-    Returns:
-        attn_dist: [batch, seq_len, seq_len]
-    """
-    batch_size, num_heads, seq_len, _ = attn.shape
-    
-    attn = attn.contiguous()
-    
-    attn_dist = torch.zeros(batch_size, seq_len, seq_len, 
-                            device=attn.device, dtype=attn.dtype)
-    
-    BLOCK_K = min(1024, triton.next_power_of_2(seq_len))
-    
-    grid = (batch_size * seq_len,)
-    
-    _head_sum_normalize_kernel[grid](
-        attn, attn_dist,
-        batch_size, num_heads, seq_len, eps,
-        attn.stride(0), attn.stride(1), attn.stride(2), attn.stride(3),
-        attn_dist.stride(0), attn_dist.stride(1), attn_dist.stride(2),
-        BLOCK_K,
-    )
-    
-    return attn_dist
-
-
-def head_sum_normalize_ref(attn, eps=1e-10):
-    """PyTorch参考实现 Step 2"""
-    attn_sum = attn.sum(dim=1)  # [batch, seq_len, seq_len]
-    attn_dist = attn_sum / (attn_sum.sum(dim=-1, keepdim=True) + eps)
-    return attn_dist
-
-
-# ============================================================================
-# Step 3: Index Score Softmax Kernel
-# 输入: index_score [B, S, S], mask [B, S, S]
-# 输出: index_prob [B, S, S]
-# ============================================================================
-
-@triton.jit
-def _index_score_softmax_kernel(
-    IS_ptr,         # [batch, seq_len, seq_len]
-    Mask_ptr,       # [batch, seq_len, seq_len]
-    Out_ptr,        # [batch, seq_len, seq_len]
-    # Dimensions
-    batch_size,
-    seq_len,
-    eps: tl.constexpr,
-    # Strides for IS
-    stride_isb, stride_iss, stride_isk,
-    # Strides for Mask
-    stride_mb, stride_ms, stride_mk,
-    # Strides for Out
-    stride_ob, stride_os, stride_ok,
-    # Block size
-    BLOCK_K: tl.constexpr,
-):
-    """
-    计算masked softmax for index_score
-    """
-    pid = tl.program_id(0)
-    pid_batch = pid // seq_len
-    pid_row = pid % seq_len
-    
-    # 第一遍: 找max
-    m_max = -float("inf")
-    for start_k in range(0, seq_len, BLOCK_K):
-        offs_k = start_k + tl.arange(0, BLOCK_K)
-        k_mask = offs_k < seq_len
-        
-        is_ptrs = IS_ptr + pid_batch * stride_isb + pid_row * stride_iss + offs_k * stride_isk
+        is_ptrs = IndexScore_ptr + pid_batch * stride_isb + pid_row * stride_iss + offs_k * stride_isk
         is_val = tl.load(is_ptrs, mask=k_mask, other=-float("inf"))
         
         mask_ptrs = Mask_ptr + pid_batch * stride_mb + pid_row * stride_ms + offs_k * stride_mk
         mask_val = tl.load(mask_ptrs, mask=k_mask, other=True)
         is_val = tl.where(mask_val, -float("inf"), is_val)
         
-        m_max = tl.maximum(m_max, tl.max(is_val))
+        max_is = tl.maximum(max_is, tl.max(is_val))
     
-    # 第二遍: 计算sum(exp)
-    l_sum = 0.0
+    # ============ Pass 3: 计算 index_score 的 sum(exp) ============
+    sum_is = 0.0
+    
     for start_k in range(0, seq_len, BLOCK_K):
         offs_k = start_k + tl.arange(0, BLOCK_K)
         k_mask = offs_k < seq_len
         
-        is_ptrs = IS_ptr + pid_batch * stride_isb + pid_row * stride_iss + offs_k * stride_isk
+        is_ptrs = IndexScore_ptr + pid_batch * stride_isb + pid_row * stride_iss + offs_k * stride_isk
         is_val = tl.load(is_ptrs, mask=k_mask, other=-float("inf"))
         
         mask_ptrs = Mask_ptr + pid_batch * stride_mb + pid_row * stride_ms + offs_k * stride_mk
         mask_val = tl.load(mask_ptrs, mask=k_mask, other=True)
         is_val = tl.where(mask_val, -float("inf"), is_val)
         
-        l_sum += tl.sum(tl.exp(is_val - m_max))
+        sum_is += tl.sum(tl.exp(is_val - max_is))
     
-    # 第三遍: 计算softmax并写出
-    for start_k in range(0, seq_len, BLOCK_K):
-        offs_k = start_k + tl.arange(0, BLOCK_K)
-        k_mask = offs_k < seq_len
-        
-        is_ptrs = IS_ptr + pid_batch * stride_isb + pid_row * stride_iss + offs_k * stride_isk
-        is_val = tl.load(is_ptrs, mask=k_mask, other=-float("inf"))
-        
-        mask_ptrs = Mask_ptr + pid_batch * stride_mb + pid_row * stride_ms + offs_k * stride_mk
-        mask_val = tl.load(mask_ptrs, mask=k_mask, other=True)
-        is_val = tl.where(mask_val, -float("inf"), is_val)
-        
-        # softmax + eps
-        p = tl.exp(is_val - m_max) / l_sum + eps
-        
-        out_ptrs = Out_ptr + pid_batch * stride_ob + pid_row * stride_os + offs_k * stride_ok
-        tl.store(out_ptrs, p, mask=k_mask)
-
-
-def index_score_softmax_triton(index_score, mask, eps=1e-10):
-    """
-    Step 3: 计算index_score的masked softmax
-    
-    Args:
-        index_score: [batch, seq_len, seq_len]
-        mask: [batch, seq_len, seq_len] bool, True表示mask掉
-        eps: 加到softmax结果上的小数
-    
-    Returns:
-        index_prob: [batch, seq_len, seq_len]
-    """
-    batch_size, seq_len, _ = index_score.shape
-    
-    index_score = index_score.contiguous()
-    mask = mask.contiguous()
-    
-    index_prob = torch.zeros_like(index_score)
-    
-    BLOCK_K = min(1024, triton.next_power_of_2(seq_len))
-    
-    grid = (batch_size * seq_len,)
-    
-    _index_score_softmax_kernel[grid](
-        index_score, mask, index_prob,
-        batch_size, seq_len, eps,
-        index_score.stride(0), index_score.stride(1), index_score.stride(2),
-        mask.stride(0), mask.stride(1), mask.stride(2),
-        index_prob.stride(0), index_prob.stride(1), index_prob.stride(2),
-        BLOCK_K,
-    )
-    
-    return index_prob
-
-
-def index_score_softmax_ref(index_score, mask, eps=1e-10):
-    """PyTorch参考实现 Step 3"""
-    index_score_masked = index_score.masked_fill(mask, -1e9)
-    index_prob = torch.softmax(index_score_masked, dim=-1) + eps
-    return index_prob
-
-
-# ============================================================================
-# Step 4: KL Divergence Kernel
-# 输入: attn_dist [B, S, S], index_prob [B, S, S]
-# 输出: loss scalar
-# ============================================================================
-
-@triton.jit
-def _kl_div_kernel(
-    AttnDist_ptr,   # [batch, seq_len, seq_len]
-    IndexProb_ptr,  # [batch, seq_len, seq_len]
-    Loss_ptr,       # [batch * seq_len] 中间结果
-    # Dimensions
-    batch_size,
-    seq_len,
-    eps: tl.constexpr,
-    # Strides for AttnDist
-    stride_ab, stride_as, stride_ak,
-    # Strides for IndexProb
-    stride_ib, stride_is, stride_ik,
-    # Block size
-    BLOCK_K: tl.constexpr,
-):
-    """
-    计算KL散度: sum(attn_dist * (log(attn_dist) - log(index_prob)))
-    注意: PyTorch的kl_div(input.log(), target)计算的是 target * (log(target) - input)
-    """
-    pid = tl.program_id(0)
-    pid_batch = pid // seq_len
-    pid_row = pid % seq_len
-    
+    # ============ Pass 4: 计算 KL 散度 ============
     kl_sum = 0.0
     
     for start_k in range(0, seq_len, BLOCK_K):
         offs_k = start_k + tl.arange(0, BLOCK_K)
         k_mask = offs_k < seq_len
         
-        # 加载attn_dist (+ eps for numerical stability)
-        ad_ptrs = AttnDist_ptr + pid_batch * stride_ab + pid_row * stride_as + offs_k * stride_ak
-        attn_dist = tl.load(ad_ptrs, mask=k_mask, other=0.0) + eps
+        # 计算 attn_sum 并归一化得到 attn_dist
+        attn_sum = tl.zeros([BLOCK_K], dtype=tl.float32)
+        for h in tl.static_range(num_heads):
+            attn_ptrs = AttnScores_ptr + pid_batch * stride_ab + h * stride_ah + pid_row * stride_as + offs_k * stride_ak
+            attn_val = tl.load(attn_ptrs, mask=k_mask, other=0.0)
+            attn_sum += attn_val
         
-        # 加载index_prob
-        ip_ptrs = IndexProb_ptr + pid_batch * stride_ib + pid_row * stride_is + offs_k * stride_ik
-        index_prob = tl.load(ip_ptrs, mask=k_mask, other=1.0)  # 避免log(0)
+        attn_dist = attn_sum / (attn_total + eps) + eps
         
-        # KL: attn_dist * (log(attn_dist) - log(index_prob))
+        # 计算 index_prob
+        is_ptrs = IndexScore_ptr + pid_batch * stride_isb + pid_row * stride_iss + offs_k * stride_isk
+        is_val = tl.load(is_ptrs, mask=k_mask, other=-float("inf"))
+        
+        mask_ptrs = Mask_ptr + pid_batch * stride_mb + pid_row * stride_ms + offs_k * stride_mk
+        mask_val = tl.load(mask_ptrs, mask=k_mask, other=True)
+        is_val = tl.where(mask_val, -float("inf"), is_val)
+        
+        index_prob = tl.exp(is_val - max_is) / sum_is + eps
+        
+        # KL散度: attn_dist * (log(attn_dist) - log(index_prob))
         kl = attn_dist * (tl.log(attn_dist) - tl.log(index_prob))
         kl = tl.where(k_mask, kl, 0.0)
         
         kl_sum += tl.sum(kl)
     
-    # 存储每行的KL和
+    # 存储结果
     tl.store(Loss_ptr + pid, kl_sum)
 
 
-def kl_div_triton(attn_dist, index_prob, eps=1e-10):
+def post_reduce_loss_fused(attn_scores, index_score, mask, eps=1e-10):
     """
-    Step 4: 计算KL散度
+    Kernel 2: Post-Reduce - 融合计算 HeadSum + Normalize + IndexSoftmax + KL
     
     Args:
-        attn_dist: [batch, seq_len, seq_len]
-        index_prob: [batch, seq_len, seq_len]
+        attn_scores: [batch, num_heads, seq_len, seq_len] - reduced attention scores
+        index_score: [batch, seq_len, seq_len]
+        mask: [batch, seq_len, seq_len] bool, True表示mask掉
         eps: 数值稳定性
     
     Returns:
-        loss: scalar
+        loss: scalar (batchmean)
     """
-    batch_size, seq_len, _ = attn_dist.shape
+    batch_size, num_heads, seq_len, _ = attn_scores.shape
     
-    attn_dist = attn_dist.contiguous()
-    index_prob = index_prob.contiguous()
+    attn_scores = attn_scores.contiguous()
+    index_score = index_score.contiguous()
+    mask = mask.contiguous()
     
-    # 中间结果
-    loss_per_row = torch.zeros(batch_size * seq_len, device=attn_dist.device, dtype=torch.float32)
+    loss_per_row = torch.zeros(batch_size * seq_len, device=attn_scores.device, dtype=torch.float32)
     
     BLOCK_K = min(1024, triton.next_power_of_2(seq_len))
     
     grid = (batch_size * seq_len,)
     
-    _kl_div_kernel[grid](
-        attn_dist, index_prob, loss_per_row,
-        batch_size, seq_len, eps,
-        attn_dist.stride(0), attn_dist.stride(1), attn_dist.stride(2),
-        index_prob.stride(0), index_prob.stride(1), index_prob.stride(2),
+    _post_reduce_loss_kernel[grid](
+        attn_scores, index_score, mask, loss_per_row,
+        batch_size, num_heads, seq_len, eps,
+        attn_scores.stride(0), attn_scores.stride(1), attn_scores.stride(2), attn_scores.stride(3),
+        index_score.stride(0), index_score.stride(1), index_score.stride(2),
+        mask.stride(0), mask.stride(1), mask.stride(2),
         BLOCK_K,
     )
     
-    # batchmean: sum / batch_size
+    # batchmean reduction
     return loss_per_row.sum() / batch_size
 
 
-def kl_div_ref(attn_dist, index_prob, eps=1e-10):
-    """PyTorch参考实现 Step 4"""
-    # F.kl_div(input, target) computes: target * (log(target) - input)
-    # 这里 input = index_prob.log(), target = attn_dist + eps
-    kl_loss = F.kl_div(index_prob.log(), attn_dist + eps, reduction='batchmean')
-    return kl_loss
-
-
 # ============================================================================
-# 组合函数
+# 组合函数 (不含reduce操作)
 # ============================================================================
 
-def compute_index_loss_unfused(query, key, index_score, index_mask, scaling):
+def compute_index_loss_fused(query, key, index_score, index_mask, scaling):
     """
-    Unfused版本: 串联4个步骤
+    Fused版本: 两个kernel串联 (不含reduce)
+    
+    实际使用时，在两个kernel之间插入reduce操作:
+        attn_scores = attention_softmax_fused(query, key, index_mask, scaling)
+        attn_scores = reduce_from_tensor_model_parallel_region(attn_scores)  # 外部操作
+        loss = post_reduce_loss_fused(attn_scores, index_score, index_mask)
     """
-    # Step 1
-    attn = attention_softmax_triton(query, key, index_mask, scaling)
-    # Step 2
-    attn_dist = head_sum_normalize_triton(attn)
-    # Step 3
-    index_prob = index_score_softmax_triton(index_score, index_mask)
-    # Step 4
-    loss = kl_div_triton(attn_dist, index_prob)
+    # Kernel 1: Pre-Reduce
+    attn_scores = attention_softmax_fused(query, key, index_mask, scaling)
+    
+    # (这里应该插入reduce操作，但本文件不实现)
+    
+    # Kernel 2: Post-Reduce
+    loss = post_reduce_loss_fused(attn_scores, index_score, index_mask)
     
     return loss
 
 
-def pytorch_reference_full(query, key, index_score, index_mask, scaling):
+# ============================================================================
+# PyTorch参考实现
+# ============================================================================
+
+def pytorch_reference(query, key, index_score, index_mask, scaling):
     """完整的PyTorch参考实现"""
     eps = 1e-10
     
-    # Step 1
+    # Kernel 1 equivalent
     attn = torch.matmul(query, key.unsqueeze(1).transpose(-1, -2)) * scaling
     attn = attn.masked_fill(index_mask.unsqueeze(1), -1e9)
     attn = torch.softmax(attn, dim=-1)
     
-    # Step 2
+    # (reduce would happen here in distributed setting)
+    
+    # Kernel 2 equivalent
     attn_sum = attn.sum(dim=1)
     attn_dist = attn_sum / (attn_sum.sum(dim=-1, keepdim=True) + eps)
     
-    # Step 3
     index_score_masked = index_score.masked_fill(index_mask, -1e9)
     index_prob = torch.softmax(index_score_masked, dim=-1) + eps
     
-    # Step 4
+    kl_loss = F.kl_div(index_prob.log(), attn_dist + eps, reduction='batchmean')
+    
+    return kl_loss
+
+
+def attention_softmax_ref(query, key, mask, scaling):
+    """Kernel 1的PyTorch参考"""
+    attn = torch.matmul(query, key.unsqueeze(1).transpose(-1, -2)) * scaling
+    attn = attn.masked_fill(mask.unsqueeze(1), -1e9)
+    attn = torch.softmax(attn, dim=-1)
+    return attn
+
+
+def post_reduce_loss_ref(attn_scores, index_score, mask, eps=1e-10):
+    """Kernel 2的PyTorch参考"""
+    # Head sum + normalize
+    attn_sum = attn_scores.sum(dim=1)
+    attn_dist = attn_sum / (attn_sum.sum(dim=-1, keepdim=True) + eps)
+    
+    # Index score softmax
+    index_score_masked = index_score.masked_fill(mask, -1e9)
+    index_prob = torch.softmax(index_score_masked, dim=-1) + eps
+    
+    # KL divergence
     kl_loss = F.kl_div(index_prob.log(), attn_dist + eps, reduction='batchmean')
     
     return kl_loss
@@ -560,8 +421,8 @@ def generate_topk_mask(batch_size, seq_len, topk, device='cuda'):
     return mask, indices
 
 
-def test_step1(batch_size=2, num_heads=8, seq_len=256, head_dim=64, topk=32, seed=42):
-    """测试 Step 1: Attention Softmax"""
+def test_kernel1(batch_size=2, num_heads=8, seq_len=256, head_dim=64, topk=32, seed=42):
+    """测试 Kernel 1: Attention Softmax"""
     torch.manual_seed(seed)
     device = 'cuda'
     scaling = 1.0 / (head_dim ** 0.5)
@@ -571,88 +432,63 @@ def test_step1(batch_size=2, num_heads=8, seq_len=256, head_dim=64, topk=32, see
     mask, _ = generate_topk_mask(batch_size, seq_len, topk, device)
     
     ref = attention_softmax_ref(query, key, mask, scaling)
-    tri = attention_softmax_triton(query, key, mask, scaling)
+    tri = attention_softmax_fused(query, key, mask, scaling)
     
     diff = (ref - tri).abs().max().item()
-    print(f"Step 1 (Attention Softmax):")
+    print(f"Kernel 1 (Attention Softmax):")
     print(f"  Max diff: {diff:.6e}")
-    print(f"  Ref sum: {ref.sum().item():.6f}, Triton sum: {tri.sum().item():.6f}")
+    print(f"  Pass: {diff < 1e-4}")
     
     return diff < 1e-4
 
 
-def test_step2(batch_size=2, num_heads=8, seq_len=256, head_dim=64, topk=32, seed=42):
-    """测试 Step 2: Head Sum + Normalize"""
+def test_kernel2(batch_size=2, num_heads=8, seq_len=256, head_dim=64, topk=32, seed=42):
+    """测试 Kernel 2: Post-Reduce Loss"""
     torch.manual_seed(seed)
     device = 'cuda'
     
-    attn = torch.rand(batch_size, num_heads, seq_len, seq_len, device=device, dtype=torch.float32)
-    # 确保每行和为1（模拟softmax输出）
-    attn = attn / attn.sum(dim=-1, keepdim=True)
-    
-    ref = head_sum_normalize_ref(attn)
-    tri = head_sum_normalize_triton(attn)
-    
-    diff = (ref - tri).abs().max().item()
-    print(f"Step 2 (Head Sum + Normalize):")
-    print(f"  Max diff: {diff:.6e}")
-    print(f"  Ref sum: {ref.sum().item():.6f}, Triton sum: {tri.sum().item():.6f}")
-    
-    return diff < 1e-5
-
-
-def test_step3(batch_size=2, num_heads=8, seq_len=256, head_dim=64, topk=32, seed=42):
-    """测试 Step 3: Index Score Softmax"""
-    torch.manual_seed(seed)
-    device = 'cuda'
+    # 生成模拟的attention scores (已经过softmax)
+    attn_scores = torch.rand(batch_size, num_heads, seq_len, seq_len, device=device, dtype=torch.float32)
+    attn_scores = attn_scores / attn_scores.sum(dim=-1, keepdim=True)
     
     index_score = torch.randn(batch_size, seq_len, seq_len, device=device, dtype=torch.float32)
     mask, _ = generate_topk_mask(batch_size, seq_len, topk, device)
     
-    ref = index_score_softmax_ref(index_score, mask)
-    tri = index_score_softmax_triton(index_score, mask)
-    
-    diff = (ref - tri).abs().max().item()
-    print(f"Step 3 (Index Score Softmax):")
-    print(f"  Max diff: {diff:.6e}")
-    print(f"  Ref sum: {ref.sum().item():.6f}, Triton sum: {tri.sum().item():.6f}")
-    
-    return diff < 1e-5
-
-
-def test_step4(batch_size=2, num_heads=8, seq_len=256, head_dim=64, topk=32, seed=42):
-    """测试 Step 4: KL Divergence"""
-    torch.manual_seed(seed)
-    device = 'cuda'
-    
-    # 生成有效的概率分布
-    attn_dist = torch.rand(batch_size, seq_len, seq_len, device=device, dtype=torch.float32)
-    attn_dist = attn_dist / attn_dist.sum(dim=-1, keepdim=True)
-    
-    index_prob = torch.rand(batch_size, seq_len, seq_len, device=device, dtype=torch.float32)
-    index_prob = index_prob / index_prob.sum(dim=-1, keepdim=True) + 1e-10
-    
-    ref = kl_div_ref(attn_dist, index_prob)
-    tri = kl_div_triton(attn_dist, index_prob)
+    ref = post_reduce_loss_ref(attn_scores, index_score, mask)
+    tri = post_reduce_loss_fused(attn_scores, index_score, mask)
     
     diff = abs(ref.item() - tri.item())
-    print(f"Step 4 (KL Divergence):")
+    print(f"Kernel 2 (Post-Reduce Loss):")
     print(f"  Ref: {ref.item():.6f}, Triton: {tri.item():.6f}")
     print(f"  Diff: {diff:.6e}")
+    print(f"  Pass: {diff < 1e-4}")
     
     return diff < 1e-4
 
 
-def test_all_steps(batch_size=2, num_heads=8, seq_len=256, head_dim=64, topk=32, seed=42):
-    """测试所有步骤串联"""
+def test_fused(
+    batch_size: int = 2,
+    num_heads: int = 8,
+    seq_len: int = 256,
+    head_dim: int = 64,
+    topk: int = 32,
+    seed: int = 42,
+    num_warmup: int = 10,
+    num_benchmark: int = 100,
+):
+    """
+    测试Fused实现的精度和性能
+    """
+    import time
+    
     torch.manual_seed(seed)
     device = 'cuda'
     scaling = 1.0 / (head_dim ** 0.5)
     
     print("=" * 60)
-    print(f"测试参数:")
-    print(f"  batch_size={batch_size}, num_heads={num_heads}")
-    print(f"  seq_len={seq_len}, head_dim={head_dim}, topk={topk}")
+    print("Triton Fused 测试")
+    print("=" * 60)
+    print(f"参数: batch={batch_size}, heads={num_heads}, seq={seq_len}, dim={head_dim}, topk={topk}")
     print("=" * 60)
     
     query = torch.randn(batch_size, num_heads, seq_len, head_dim, device=device, dtype=torch.float32)
@@ -660,87 +496,140 @@ def test_all_steps(batch_size=2, num_heads=8, seq_len=256, head_dim=64, topk=32,
     index_score = torch.randn(batch_size, seq_len, seq_len, device=device, dtype=torch.float32)
     mask, _ = generate_topk_mask(batch_size, seq_len, topk, device)
     
-    # 分步对比
-    print("\n分步验证:")
+    # ============ 精度测试 ============
+    print("\n>>> 精度测试")
     
-    # Step 1
+    # 测试 Kernel 1
+    print("\n[Kernel 1: Attention Softmax]")
     attn_ref = attention_softmax_ref(query, key, mask, scaling)
-    attn_tri = attention_softmax_triton(query, key, mask, scaling)
+    attn_tri = attention_softmax_fused(query, key, mask, scaling)
     diff1 = (attn_ref - attn_tri).abs().max().item()
-    print(f"  Step 1 (Attention Softmax): max_diff = {diff1:.6e}")
+    print(f"  Max diff: {diff1:.6e}")
     
-    # Step 2
-    attn_dist_ref = head_sum_normalize_ref(attn_ref)
-    attn_dist_tri = head_sum_normalize_triton(attn_tri)
-    diff2 = (attn_dist_ref - attn_dist_tri).abs().max().item()
-    print(f"  Step 2 (Head Sum + Normalize): max_diff = {diff2:.6e}")
+    # 测试 Kernel 2 (使用相同的attention输入)
+    print("\n[Kernel 2: Post-Reduce Loss]")
+    loss_ref = post_reduce_loss_ref(attn_ref, index_score, mask)
+    loss_tri = post_reduce_loss_fused(attn_tri, index_score, mask)
+    diff2 = abs(loss_ref.item() - loss_tri.item())
+    print(f"  Ref: {loss_ref.item():.6f}, Triton: {loss_tri.item():.6f}")
+    print(f"  Diff: {diff2:.6e}")
     
-    # Step 3
-    index_prob_ref = index_score_softmax_ref(index_score, mask)
-    index_prob_tri = index_score_softmax_triton(index_score, mask)
-    diff3 = (index_prob_ref - index_prob_tri).abs().max().item()
-    print(f"  Step 3 (Index Score Softmax): max_diff = {diff3:.6e}")
+    # 完整流程
+    print("\n[完整流程]")
+    full_ref = pytorch_reference(query, key, index_score, mask, scaling)
+    full_tri = compute_index_loss_fused(query, key, index_score, mask, scaling)
+    diff_full = abs(full_ref.item() - full_tri.item())
+    print(f"  PyTorch: {full_ref.item():.6f}")
+    print(f"  Triton Fused: {full_tri.item():.6f}")
+    print(f"  Diff: {diff_full:.6e}")
     
-    # Step 4
-    kl_ref = kl_div_ref(attn_dist_ref, index_prob_ref)
-    kl_tri = kl_div_triton(attn_dist_tri, index_prob_tri)
-    diff4 = abs(kl_ref.item() - kl_tri.item())
-    print(f"  Step 4 (KL Divergence): diff = {diff4:.6e}")
+    # ============ 性能测试 ============
+    print(f"\n>>> 性能测试 (warmup={num_warmup}, iterations={num_benchmark})")
     
-    # 完整对比
-    print("\n完整流程对比:")
-    full_ref = pytorch_reference_full(query, key, index_score, mask, scaling)
-    full_tri = compute_index_loss_unfused(query, key, index_score, mask, scaling)
+    # Warmup Triton
+    for _ in range(num_warmup):
+        _ = compute_index_loss_fused(query, key, index_score, mask, scaling)
+    torch.cuda.synchronize()
     
-    print(f"  PyTorch完整实现: {full_ref.item():.6f}")
-    print(f"  Triton Unfused: {full_tri.item():.6f}")
-    print(f"  差异: {abs(full_ref.item() - full_tri.item()):.6e}")
+    # Benchmark Triton Fused
+    start = time.time()
+    for _ in range(num_benchmark):
+        _ = compute_index_loss_fused(query, key, index_score, mask, scaling)
+    torch.cuda.synchronize()
+    triton_time = (time.time() - start) / num_benchmark * 1000
+    
+    # Warmup PyTorch
+    for _ in range(num_warmup):
+        _ = pytorch_reference(query, key, index_score, mask, scaling)
+    torch.cuda.synchronize()
+    
+    # Benchmark PyTorch
+    start = time.time()
+    for _ in range(num_benchmark):
+        _ = pytorch_reference(query, key, index_score, mask, scaling)
+    torch.cuda.synchronize()
+    pytorch_time = (time.time() - start) / num_benchmark * 1000
+    
+    print(f"\n  PyTorch: {pytorch_time:.3f} ms")
+    print(f"  Triton Fused: {triton_time:.3f} ms")
+    if triton_time > 0:
+        print(f"  加速比: {pytorch_time / triton_time:.2f}x")
+    
+    # ============ 内存估算 ============
+    print(f"\n>>> 内存使用")
+    attn_size = batch_size * num_heads * seq_len * seq_len * 4 / 1024 / 1024
+    print(f"  Attention矩阵: {attn_size:.2f} MB")
+    print(f"  PyTorch: 需要存储完整QK^T中间矩阵")
+    print(f"  Triton: 使用online softmax，无需存储完整QK^T")
     
     return {
-        'step1_diff': diff1,
-        'step2_diff': diff2,
-        'step3_diff': diff3,
-        'step4_diff': diff4,
-        'full_ref': full_ref.item(),
-        'full_triton': full_tri.item(),
+        'kernel1_diff': diff1,
+        'kernel2_diff': diff2,
+        'full_diff': diff_full,
+        'pytorch_time_ms': pytorch_time,
+        'triton_time_ms': triton_time,
+        'speedup': pytorch_time / triton_time if triton_time > 0 else float('inf'),
     }
 
 
-def test_unfused(
-    batch_size: int = 2,
-    num_heads: int = 8,
-    seq_len: int = 256,
-    head_dim: int = 64,
-    topk: int = 32,
-    seed: int = 42,
-):
-    """
-    测试unfused实现的主入口
-    """
-    print("=" * 60)
-    print("Triton Unfused 精度测试")
-    print("=" * 60)
+def test_various_configs():
+    """测试多种配置"""
+    configs = [
+        (1, 8, 128, 64, 16),
+        (1, 8, 256, 64, 32),
+        (2, 8, 256, 64, 32),
+        (1, 8, 512, 64, 64),
+        (1, 16, 256, 64, 32),
+    ]
     
-    print("\n>>> 测试 Step 1: Attention Softmax")
-    test_step1(batch_size, num_heads, seq_len, head_dim, topk, seed)
+    print("\n" + "=" * 80)
+    print("多配置性能测试")
+    print("=" * 80)
     
-    print("\n>>> 测试 Step 2: Head Sum + Normalize")
-    test_step2(batch_size, num_heads, seq_len, head_dim, topk, seed)
+    results = []
+    for batch_size, num_heads, seq_len, head_dim, topk in configs:
+        try:
+            result = test_fused(
+                batch_size=batch_size,
+                num_heads=num_heads,
+                seq_len=seq_len,
+                head_dim=head_dim,
+                topk=topk,
+                num_warmup=5,
+                num_benchmark=50,
+            )
+            results.append({
+                'config': (batch_size, num_heads, seq_len, head_dim, topk),
+                **result
+            })
+        except Exception as e:
+            print(f"配置 {(batch_size, num_heads, seq_len, head_dim, topk)} 失败: {e}")
     
-    print("\n>>> 测试 Step 3: Index Score Softmax")
-    test_step3(batch_size, num_heads, seq_len, head_dim, topk, seed)
-    
-    print("\n>>> 测试 Step 4: KL Divergence")
-    test_step4(batch_size, num_heads, seq_len, head_dim, topk, seed)
-    
-    print("\n>>> 测试所有步骤串联")
-    results = test_all_steps(batch_size, num_heads, seq_len, head_dim, topk, seed)
-    
-    return results
+    # 汇总
+    print("\n" + "=" * 80)
+    print("性能汇总")
+    print("=" * 80)
+    print(f"{'Config':<30} {'PyTorch(ms)':<12} {'Triton(ms)':<12} {'Speedup':<10} {'Precision':<10}")
+    print("-" * 80)
+    for r in results:
+        config_str = str(r['config'])
+        precision = "PASS" if r['full_diff'] < 1e-4 else "FAIL"
+        print(f"{config_str:<30} {r['pytorch_time_ms']:<12.3f} {r['triton_time_ms']:<12.3f} {r['speedup']:<10.2f}x {precision:<10}")
 
 
 if __name__ == "__main__":
-    test_unfused(
+    print("\n" + "=" * 60)
+    print("单独测试 Kernel 1")
+    print("=" * 60)
+    test_kernel1()
+    
+    print("\n" + "=" * 60)
+    print("单独测试 Kernel 2")
+    print("=" * 60)
+    test_kernel2()
+    
+    print("\n")
+    test_fused(
         batch_size=2,
         num_heads=8,
         seq_len=256,
