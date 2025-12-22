@@ -1,10 +1,10 @@
 """
-Triton Fused实现 - 支持Tensor Parallel (高性能版本)
+Triton Fused Optimized - Sparse Attention实现
 
-优化策略:
-1. 使用Online Softmax算法，减少遍历次数
-2. 利用tl.dot进行高效矩阵乘法
-3. Tile-based处理，最大化数据复用
+关键优化: 使用indices直接索引KV，只计算topk个位置
+复杂度从 O(seq_len * seq_len) 降为 O(seq_len * topk)
+
+当topk固定时，耗时与seq_len成线性关系
 """
 
 import torch
@@ -14,37 +14,41 @@ import torch.nn.functional as F
 
 
 # ============================================================================
-# Kernel 1: Pre-Reduce - Attention Softmax (高性能版本)
+# Kernel 1: Sparse Attention Softmax
+# 只计算indices指定的topk个位置的attention
+# 输入: Q [B, H, S, D], K [B, S, D], indices [B, S, topk]
+# 输出: attn_scores [B, H, S, topk]
 # ============================================================================
 
 @triton.jit
-def _attention_softmax_kernel_v2(
+def _sparse_attention_softmax_kernel(
     Q_ptr,          # [batch, num_heads, seq_len, head_dim]
     K_ptr,          # [batch, seq_len, head_dim]
-    Mask_ptr,       # [batch, seq_len, seq_len]
-    Out_ptr,        # [batch, num_heads, seq_len, seq_len]
+    Indices_ptr,    # [batch, seq_len, topk] - int32/int64
+    Out_ptr,        # [batch, num_heads, seq_len, topk]
     # Dimensions
     batch_size,
     num_heads,
     seq_len,
     head_dim: tl.constexpr,
+    topk,
     scaling,
     # Strides for Q: [batch, num_heads, seq_len, head_dim]
     stride_qb, stride_qh, stride_qs, stride_qd,
     # Strides for K: [batch, seq_len, head_dim]
     stride_kb, stride_ks, stride_kd,
-    # Strides for Mask: [batch, seq_len, seq_len]
-    stride_mb, stride_ms, stride_mk,
-    # Strides for Out: [batch, num_heads, seq_len, seq_len]
+    # Strides for Indices: [batch, seq_len, topk]
+    stride_ib, stride_is, stride_ik,
+    # Strides for Out: [batch, num_heads, seq_len, topk]
     stride_ob, stride_oh, stride_os, stride_ok,
     # Block sizes
     BLOCK_M: tl.constexpr,  # 每个program处理的query行数
-    BLOCK_N: tl.constexpr,  # key的tile大小
+    BLOCK_K: tl.constexpr,  # topk的tile大小
     BLOCK_D: tl.constexpr,  # head_dim的block大小
 ):
     """
-    高性能Attention Softmax Kernel (使用循环处理head_dim)
-    数值稳定版本
+    Sparse Attention Kernel: 只计算indices指定的topk个位置
+    复杂度 O(seq_len * topk) 而不是 O(seq_len * seq_len)
     """
     pid = tl.program_id(0)
     num_m_blocks = tl.cdiv(seq_len, BLOCK_M)
@@ -60,72 +64,88 @@ def _attention_softmax_kernel_v2(
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     m_mask = offs_m < seq_len
     
-    # 使用一个很小但不是-inf的值作为初始max，避免nan
-    NEG_INF = -1e9  # 使用有限值而非-inf
+    NEG_INF = -1e9
     
     # 初始化online softmax状态
     m_i = tl.full([BLOCK_M], value=NEG_INF, dtype=tl.float32)
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
     
-    # Pass 1: 计算每行的max和sum
-    for start_n in range(0, seq_len, BLOCK_N):
-        offs_n = start_n + tl.arange(0, BLOCK_N)
-        n_mask = offs_n < seq_len
+    # Pass 1: 计算max和sum (遍历topk，不是seq_len)
+    for start_k in range(0, topk, BLOCK_K):
+        offs_k = start_k + tl.arange(0, BLOCK_K)
+        k_mask = offs_k < topk
         
-        # 分块计算QK^T (处理大head_dim)
-        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        # 加载indices: [BLOCK_M, BLOCK_K]
+        idx_ptrs = Indices_ptr + pid_batch * stride_ib + \
+                   offs_m[:, None] * stride_is + offs_k[None, :] * stride_ik
+        indices = tl.load(idx_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0)
+        
+        # 创建causal mask: indices > query位置的要mask掉
+        causal_mask = indices > offs_m[:, None]
+        
+        # 分块计算QK^T
+        qk = tl.zeros([BLOCK_M, BLOCK_K], dtype=tl.float32)
         for start_d in range(0, head_dim, BLOCK_D):
             offs_d = start_d + tl.arange(0, BLOCK_D)
             d_mask = offs_d < head_dim
             
-            # 加载Q块: [BLOCK_M, BLOCK_D]
+            # 加载Q: [BLOCK_M, BLOCK_D]
             q_ptrs = Q_ptr + pid_batch * stride_qb + pid_head * stride_qh + \
                      offs_m[:, None] * stride_qs + offs_d[None, :] * stride_qd
             q = tl.load(q_ptrs, mask=m_mask[:, None] & d_mask[None, :], other=0.0).to(tl.float32)
             
-            # 加载K块: [BLOCK_N, BLOCK_D]
-            k_ptrs = K_ptr + pid_batch * stride_kb + \
-                     offs_n[:, None] * stride_ks + offs_d[None, :] * stride_kd
-            k = tl.load(k_ptrs, mask=n_mask[:, None] & d_mask[None, :], other=0.0).to(tl.float32)
+            # 使用indices gather K: [BLOCK_M, BLOCK_K, BLOCK_D]
+            # 这里需要对每个(m, k)位置加载对应的K向量
+            # indices[m, k] 指向K的位置
+            k_gathered = tl.zeros([BLOCK_M, BLOCK_K, BLOCK_D], dtype=tl.float32)
+            for mi in range(BLOCK_M):
+                for ki in range(BLOCK_K):
+                    if mi < seq_len and ki < topk:
+                        idx = tl.load(Indices_ptr + pid_batch * stride_ib + 
+                                      (offs_m[mi]) * stride_is + (offs_k[ki]) * stride_ik)
+                        for di in range(BLOCK_D):
+                            if start_d + di < head_dim:
+                                k_val = tl.load(K_ptr + pid_batch * stride_kb + 
+                                               idx * stride_ks + (start_d + di) * stride_kd)
+                                k_gathered[mi, ki, di] = k_val
             
-            # 累加 QK^T
-            qk += tl.dot(q, tl.trans(k))
+            # 计算点积
+            for mi in range(BLOCK_M):
+                for ki in range(BLOCK_K):
+                    dot_sum = 0.0
+                    for di in range(BLOCK_D):
+                        dot_sum += q[mi, di] * k_gathered[mi, ki, di]
+                    qk[mi, ki] += dot_sum
         
         qk = qk * scaling
         
-        # 加载Mask: [BLOCK_M, BLOCK_N]
-        mask_ptrs = Mask_ptr + pid_batch * stride_mb + \
-                    offs_m[:, None] * stride_ms + offs_n[None, :] * stride_mk
-        mask_load = m_mask[:, None] & n_mask[None, :]
-        mask_val = tl.load(mask_ptrs, mask=mask_load, other=True)
-        
-        # 应用mask和边界 (使用有限值)
-        qk = tl.where(mask_val | ~n_mask[None, :] | ~m_mask[:, None], NEG_INF, qk)
+        # 应用causal mask
+        qk = tl.where(causal_mask | ~k_mask[None, :] | ~m_mask[:, None], NEG_INF, qk)
         
         # Online softmax更新
-        m_ij = tl.max(qk, axis=1)  # [BLOCK_M]
+        m_ij = tl.max(qk, axis=1)
         m_new = tl.maximum(m_i, m_ij)
-        
-        # 计算alpha (rescale factor)
         alpha = tl.exp(m_i - m_new)
-        
-        # 计算exp(qk - m_new)，被mask的位置会是exp(NEG_INF - m_new) ≈ 0
         p = tl.exp(qk - m_new[:, None])
-        
-        # 更新l_i
         l_i = l_i * alpha + tl.sum(p, axis=1)
         m_i = m_new
     
-    # 处理l_i为0的情况（整行被mask，虽然用NEG_INF后不太可能发生）
     l_i = tl.where(l_i < 1e-9, 1.0, l_i)
     
     # Pass 2: 计算softmax并写出
-    for start_n in range(0, seq_len, BLOCK_N):
-        offs_n = start_n + tl.arange(0, BLOCK_N)
-        n_mask = offs_n < seq_len
+    for start_k in range(0, topk, BLOCK_K):
+        offs_k = start_k + tl.arange(0, BLOCK_K)
+        k_mask = offs_k < topk
         
-        # 分块计算QK^T
-        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        # 加载indices
+        idx_ptrs = Indices_ptr + pid_batch * stride_ib + \
+                   offs_m[:, None] * stride_is + offs_k[None, :] * stride_ik
+        indices = tl.load(idx_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0)
+        
+        causal_mask = indices > offs_m[:, None]
+        
+        # 重新计算QK^T
+        qk = tl.zeros([BLOCK_M, BLOCK_K], dtype=tl.float32)
         for start_d in range(0, head_dim, BLOCK_D):
             offs_d = start_d + tl.arange(0, BLOCK_D)
             d_mask = offs_d < head_dim
@@ -134,240 +154,511 @@ def _attention_softmax_kernel_v2(
                      offs_m[:, None] * stride_qs + offs_d[None, :] * stride_qd
             q = tl.load(q_ptrs, mask=m_mask[:, None] & d_mask[None, :], other=0.0).to(tl.float32)
             
-            k_ptrs = K_ptr + pid_batch * stride_kb + \
-                     offs_n[:, None] * stride_ks + offs_d[None, :] * stride_kd
-            k = tl.load(k_ptrs, mask=n_mask[:, None] & d_mask[None, :], other=0.0).to(tl.float32)
+            # Gather K using indices
+            k_gathered = tl.zeros([BLOCK_M, BLOCK_K, BLOCK_D], dtype=tl.float32)
+            for mi in range(BLOCK_M):
+                for ki in range(BLOCK_K):
+                    if mi < seq_len and ki < topk:
+                        idx = tl.load(Indices_ptr + pid_batch * stride_ib + 
+                                      (offs_m[mi]) * stride_is + (offs_k[ki]) * stride_ik)
+                        for di in range(BLOCK_D):
+                            if start_d + di < head_dim:
+                                k_val = tl.load(K_ptr + pid_batch * stride_kb + 
+                                               idx * stride_ks + (start_d + di) * stride_kd)
+                                k_gathered[mi, ki, di] = k_val
             
-            qk += tl.dot(q, tl.trans(k))
+            for mi in range(BLOCK_M):
+                for ki in range(BLOCK_K):
+                    dot_sum = 0.0
+                    for di in range(BLOCK_D):
+                        dot_sum += q[mi, di] * k_gathered[mi, ki, di]
+                    qk[mi, ki] += dot_sum
         
         qk = qk * scaling
+        qk = tl.where(causal_mask | ~k_mask[None, :] | ~m_mask[:, None], NEG_INF, qk)
         
-        # 应用Mask
-        mask_ptrs = Mask_ptr + pid_batch * stride_mb + \
-                    offs_m[:, None] * stride_ms + offs_n[None, :] * stride_mk
-        mask_load = m_mask[:, None] & n_mask[None, :]
-        mask_val = tl.load(mask_ptrs, mask=mask_load, other=True)
-        qk = tl.where(mask_val | ~n_mask[None, :] | ~m_mask[:, None], NEG_INF, qk)
-        
-        # Softmax: exp(qk - m_i) / l_i
+        # Softmax
         p = tl.exp(qk - m_i[:, None]) / l_i[:, None]
-        
-        # 确保输出在有效范围内
-        p = tl.where(m_mask[:, None] & n_mask[None, :], p, 0.0)
+        p = tl.where(m_mask[:, None] & k_mask[None, :], p, 0.0)
         
         # 写出
         out_ptrs = Out_ptr + pid_batch * stride_ob + pid_head * stride_oh + \
-                   offs_m[:, None] * stride_os + offs_n[None, :] * stride_ok
-        out_mask = m_mask[:, None] & n_mask[None, :]
+                   offs_m[:, None] * stride_os + offs_k[None, :] * stride_ok
+        out_mask = m_mask[:, None] & k_mask[None, :]
         tl.store(out_ptrs, p.to(Out_ptr.dtype.element_ty), mask=out_mask)
 
 
-def attention_softmax_fused(query, key, mask, scaling):
+# 更高效的实现：使用tl.load with indices
+@triton.jit
+def _sparse_attention_softmax_kernel_v2(
+    Q_ptr,          # [batch, num_heads, seq_len, head_dim]
+    K_ptr,          # [batch, seq_len, head_dim]
+    Indices_ptr,    # [batch, seq_len, topk] - int64
+    Out_ptr,        # [batch, num_heads, seq_len, topk]
+    # Dimensions
+    batch_size,
+    num_heads,
+    seq_len,
+    head_dim: tl.constexpr,
+    topk,
+    scaling,
+    # Strides for Q: [batch, num_heads, seq_len, head_dim]
+    stride_qb, stride_qh, stride_qs, stride_qd,
+    # Strides for K: [batch, seq_len, head_dim]
+    stride_kb, stride_ks, stride_kd,
+    # Strides for Indices: [batch, seq_len, topk]
+    stride_ib, stride_is, stride_ik,
+    # Strides for Out: [batch, num_heads, seq_len, topk]
+    stride_ob, stride_oh, stride_os, stride_ok,
+    # Block sizes
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
     """
-    Kernel 1: Pre-Reduce - 高性能masked attention softmax
+    Sparse Attention V2: 向量化gather
+    每个program处理一个(batch, head, query_row)
+    """
+    pid = tl.program_id(0)
+    num_programs_per_head = seq_len
+    num_programs_per_batch = num_heads * num_programs_per_head
+    
+    pid_batch = pid // num_programs_per_batch
+    pid_remainder = pid % num_programs_per_batch
+    pid_head = pid_remainder // num_programs_per_head
+    pid_row = pid_remainder % num_programs_per_head
+    
+    NEG_INF = -1e9
+    
+    # 初始化
+    m_max = NEG_INF
+    l_sum = 0.0
+    
+    # 加载这一行的query: [head_dim]
+    offs_d = tl.arange(0, BLOCK_D)
+    
+    # Pass 1: 计算max和sum
+    for start_k in range(0, topk, BLOCK_K):
+        offs_k = start_k + tl.arange(0, BLOCK_K)
+        k_mask = offs_k < topk
+        
+        # 加载indices: [BLOCK_K]
+        idx_ptrs = Indices_ptr + pid_batch * stride_ib + pid_row * stride_is + offs_k * stride_ik
+        indices = tl.load(idx_ptrs, mask=k_mask, other=0)
+        
+        # Causal mask
+        causal_mask = indices > pid_row
+        
+        # 计算QK^T: 对每个topk位置
+        qk = tl.zeros([BLOCK_K], dtype=tl.float32)
+        
+        for start_d in range(0, head_dim, BLOCK_D):
+            offs_d_local = start_d + tl.arange(0, BLOCK_D)
+            d_mask = offs_d_local < head_dim
+            
+            # 加载Q: [BLOCK_D]
+            q_ptrs = Q_ptr + pid_batch * stride_qb + pid_head * stride_qh + \
+                     pid_row * stride_qs + offs_d_local * stride_qd
+            q = tl.load(q_ptrs, mask=d_mask, other=0.0).to(tl.float32)
+            
+            # 对每个topk位置，加载对应的K并计算点积
+            for ki in range(BLOCK_K):
+                if ki < topk - start_k:
+                    idx = tl.load(Indices_ptr + pid_batch * stride_ib + 
+                                  pid_row * stride_is + (start_k + ki) * stride_ik)
+                    # 加载K[idx]: [BLOCK_D]
+                    k_ptrs = K_ptr + pid_batch * stride_kb + idx * stride_ks + offs_d_local * stride_kd
+                    k = tl.load(k_ptrs, mask=d_mask, other=0.0).to(tl.float32)
+                    
+                    # 点积
+                    qk_partial = tl.sum(q * k)
+                    qk = tl.where(tl.arange(0, BLOCK_K) == ki, qk + qk_partial, qk)
+        
+        qk = qk * scaling
+        
+        # 应用mask
+        qk = tl.where(causal_mask | ~k_mask, NEG_INF, qk)
+        
+        # Online softmax
+        block_max = tl.max(qk)
+        m_new = max(m_max, block_max)
+        alpha = tl.exp(m_max - m_new)
+        l_sum = l_sum * alpha + tl.sum(tl.exp(qk - m_new))
+        m_max = m_new
+    
+    l_sum = max(l_sum, 1e-9)
+    
+    # Pass 2: 计算softmax并写出
+    for start_k in range(0, topk, BLOCK_K):
+        offs_k = start_k + tl.arange(0, BLOCK_K)
+        k_mask = offs_k < topk
+        
+        idx_ptrs = Indices_ptr + pid_batch * stride_ib + pid_row * stride_is + offs_k * stride_ik
+        indices = tl.load(idx_ptrs, mask=k_mask, other=0)
+        causal_mask = indices > pid_row
+        
+        qk = tl.zeros([BLOCK_K], dtype=tl.float32)
+        
+        for start_d in range(0, head_dim, BLOCK_D):
+            offs_d_local = start_d + tl.arange(0, BLOCK_D)
+            d_mask = offs_d_local < head_dim
+            
+            q_ptrs = Q_ptr + pid_batch * stride_qb + pid_head * stride_qh + \
+                     pid_row * stride_qs + offs_d_local * stride_qd
+            q = tl.load(q_ptrs, mask=d_mask, other=0.0).to(tl.float32)
+            
+            for ki in range(BLOCK_K):
+                if ki < topk - start_k:
+                    idx = tl.load(Indices_ptr + pid_batch * stride_ib + 
+                                  pid_row * stride_is + (start_k + ki) * stride_ik)
+                    k_ptrs = K_ptr + pid_batch * stride_kb + idx * stride_ks + offs_d_local * stride_kd
+                    k = tl.load(k_ptrs, mask=d_mask, other=0.0).to(tl.float32)
+                    qk_partial = tl.sum(q * k)
+                    qk = tl.where(tl.arange(0, BLOCK_K) == ki, qk + qk_partial, qk)
+        
+        qk = qk * scaling
+        qk = tl.where(causal_mask | ~k_mask, NEG_INF, qk)
+        
+        p = tl.exp(qk - m_max) / l_sum
+        p = tl.where(k_mask, p, 0.0)
+        
+        out_ptrs = Out_ptr + pid_batch * stride_ob + pid_head * stride_oh + \
+                   pid_row * stride_os + offs_k * stride_ok
+        tl.store(out_ptrs, p.to(Out_ptr.dtype.element_ty), mask=k_mask)
+
+
+# V3: 更高效的gather实现
+@triton.jit
+def _sparse_attention_softmax_kernel_v3(
+    Q_ptr,          # [batch, num_heads, seq_len, head_dim]
+    K_ptr,          # [batch, seq_len, head_dim]
+    Indices_ptr,    # [batch, seq_len, topk]
+    Out_ptr,        # [batch, num_heads, seq_len, topk]
+    # Dimensions
+    batch_size,
+    num_heads,
+    seq_len,
+    head_dim: tl.constexpr,
+    topk: tl.constexpr,
+    scaling,
+    # Strides
+    stride_qb, stride_qh, stride_qs, stride_qd,
+    stride_kb, stride_ks, stride_kd,
+    stride_ib, stride_is, stride_ik,
+    stride_ob, stride_oh, stride_os, stride_ok,
+    # Block sizes
+    BLOCK_K: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """
+    Sparse Attention V3: 每个program处理一个(batch, head, row)
+    使用向量化加载和简化的循环结构
+    """
+    pid = tl.program_id(0)
+    num_programs_per_head = seq_len
+    num_programs_per_batch = num_heads * num_programs_per_head
+    
+    pid_batch = pid // num_programs_per_batch
+    pid_remainder = pid % num_programs_per_batch
+    pid_head = pid_remainder // num_programs_per_head
+    pid_row = pid_remainder % num_programs_per_head
+    
+    NEG_INF = -1e9
+    
+    # 初始化softmax状态
+    m_i = NEG_INF
+    l_i = 0.0
+    
+    # Pass 1: 计算max和sum
+    for start_k in range(0, topk, BLOCK_K):
+        offs_k = start_k + tl.arange(0, BLOCK_K)
+        k_mask = offs_k < topk
+        
+        # 加载这个block的indices: [BLOCK_K]
+        idx_ptrs = Indices_ptr + pid_batch * stride_ib + pid_row * stride_is + offs_k * stride_ik
+        indices = tl.load(idx_ptrs, mask=k_mask, other=0).to(tl.int64)
+        
+        # Causal mask
+        causal_mask = indices > pid_row
+        
+        # 计算QK^T
+        qk = tl.zeros([BLOCK_K], dtype=tl.float32)
+        
+        for start_d in range(0, head_dim, BLOCK_D):
+            offs_d = start_d + tl.arange(0, BLOCK_D)
+            d_mask = offs_d < head_dim
+            
+            # 加载Q: [BLOCK_D]
+            q_ptrs = Q_ptr + pid_batch * stride_qb + pid_head * stride_qh + \
+                     pid_row * stride_qs + offs_d * stride_qd
+            q = tl.load(q_ptrs, mask=d_mask, other=0.0).to(tl.float32)
+            
+            # 对每个topk位置gather K并计算点积
+            # K base pointer for this batch
+            k_base = K_ptr + pid_batch * stride_kb
+            
+            for ki in tl.static_range(BLOCK_K):
+                if start_k + ki < topk:
+                    # 获取这个位置的index
+                    idx = tl.load(Indices_ptr + pid_batch * stride_ib + 
+                                  pid_row * stride_is + (start_k + ki) * stride_ik).to(tl.int64)
+                    
+                    # 加载K[idx, :]: [BLOCK_D]
+                    k_ptrs = k_base + idx * stride_ks + offs_d * stride_kd
+                    k = tl.load(k_ptrs, mask=d_mask, other=0.0).to(tl.float32)
+                    
+                    # 点积累加
+                    dot = tl.sum(q * k)
+                    qk = tl.where(offs_k == start_k + ki, qk + dot, qk)
+        
+        qk = qk * scaling
+        qk = tl.where(causal_mask | ~k_mask, NEG_INF, qk)
+        
+        # Online softmax
+        m_ij = tl.max(qk)
+        m_new = tl.maximum(m_i, m_ij)
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(qk - m_new)
+        l_i = l_i * alpha + tl.sum(p)
+        m_i = m_new
+    
+    l_i = tl.where(l_i < 1e-9, 1.0, l_i)
+    
+    # Pass 2: 写出softmax结果
+    for start_k in range(0, topk, BLOCK_K):
+        offs_k = start_k + tl.arange(0, BLOCK_K)
+        k_mask = offs_k < topk
+        
+        idx_ptrs = Indices_ptr + pid_batch * stride_ib + pid_row * stride_is + offs_k * stride_ik
+        indices = tl.load(idx_ptrs, mask=k_mask, other=0).to(tl.int64)
+        causal_mask = indices > pid_row
+        
+        qk = tl.zeros([BLOCK_K], dtype=tl.float32)
+        
+        for start_d in range(0, head_dim, BLOCK_D):
+            offs_d = start_d + tl.arange(0, BLOCK_D)
+            d_mask = offs_d < head_dim
+            
+            q_ptrs = Q_ptr + pid_batch * stride_qb + pid_head * stride_qh + \
+                     pid_row * stride_qs + offs_d * stride_qd
+            q = tl.load(q_ptrs, mask=d_mask, other=0.0).to(tl.float32)
+            
+            k_base = K_ptr + pid_batch * stride_kb
+            
+            for ki in tl.static_range(BLOCK_K):
+                if start_k + ki < topk:
+                    idx = tl.load(Indices_ptr + pid_batch * stride_ib + 
+                                  pid_row * stride_is + (start_k + ki) * stride_ik).to(tl.int64)
+                    k_ptrs = k_base + idx * stride_ks + offs_d * stride_kd
+                    k = tl.load(k_ptrs, mask=d_mask, other=0.0).to(tl.float32)
+                    dot = tl.sum(q * k)
+                    qk = tl.where(offs_k == start_k + ki, qk + dot, qk)
+        
+        qk = qk * scaling
+        qk = tl.where(causal_mask | ~k_mask, NEG_INF, qk)
+        
+        p = tl.exp(qk - m_i) / l_i
+        p = tl.where(k_mask & ~causal_mask, p, 0.0)
+        
+        out_ptrs = Out_ptr + pid_batch * stride_ob + pid_head * stride_oh + \
+                   pid_row * stride_os + offs_k * stride_ok
+        tl.store(out_ptrs, p.to(Out_ptr.dtype.element_ty), mask=k_mask)
+
+
+def sparse_attention_softmax_fused(query, key, indices, scaling):
+    """
+    Sparse Attention Softmax: 只计算indices指定的topk个位置
+    
+    Args:
+        query: [batch, num_heads, seq_len, head_dim]
+        key: [batch, seq_len, head_dim]
+        indices: [batch, seq_len, topk] - 每个query位置要attend的key索引
+        scaling: float
+    
+    Returns:
+        attn_scores: [batch, num_heads, seq_len, topk]
     """
     batch_size, num_heads, seq_len, head_dim = query.shape
+    topk = indices.shape[-1]
     
     query = query.contiguous()
     key = key.contiguous()
-    mask = mask.contiguous()
+    indices = indices.contiguous().to(torch.int64)
     
-    attn_scores = torch.empty(batch_size, num_heads, seq_len, seq_len, 
+    attn_scores = torch.empty(batch_size, num_heads, seq_len, topk,
                               device=query.device, dtype=query.dtype)
     
-    # 选择合适的block size，控制shared memory使用
-    # BLOCK_D限制在64-128，大的head_dim通过循环处理
+    # Block sizes
+    BLOCK_K = min(64, triton.next_power_of_2(topk))
     BLOCK_D = min(64, triton.next_power_of_2(head_dim))
     
-    # 根据seq_len和head_dim调整BLOCK_M和BLOCK_N
-    if head_dim <= 64:
-        BLOCK_M = 64
-        BLOCK_N = 64
-    elif head_dim <= 128:
-        BLOCK_M = 32
-        BLOCK_N = 64
-    else:
-        # 大head_dim时使用更小的block
-        BLOCK_M = 32
-        BLOCK_N = 32
+    grid = (batch_size * num_heads * seq_len,)
     
-    # 根据seq_len微调
-    if seq_len >= 4096:
-        BLOCK_M = min(BLOCK_M, 64)
-        BLOCK_N = min(BLOCK_N, 64)
-    
-    num_m_blocks = triton.cdiv(seq_len, BLOCK_M)
-    grid = (batch_size * num_heads * num_m_blocks,)
-    
-    _attention_softmax_kernel_v2[grid](
-        query, key, mask, attn_scores,
-        batch_size, num_heads, seq_len, head_dim, scaling,
+    _sparse_attention_softmax_kernel_v3[grid](
+        query, key, indices, attn_scores,
+        batch_size, num_heads, seq_len, head_dim, topk, scaling,
         query.stride(0), query.stride(1), query.stride(2), query.stride(3),
         key.stride(0), key.stride(1), key.stride(2),
-        mask.stride(0), mask.stride(1), mask.stride(2),
+        indices.stride(0), indices.stride(1), indices.stride(2),
         attn_scores.stride(0), attn_scores.stride(1), attn_scores.stride(2), attn_scores.stride(3),
-        BLOCK_M, BLOCK_N, BLOCK_D,
+        BLOCK_K, BLOCK_D,
     )
     
     return attn_scores
 
 
 # ============================================================================
-# Kernel 2: Post-Reduce - HeadSum + Normalize + IndexSoftmax + KL (高性能版本)
+# Kernel 2: Sparse Post-Reduce Loss
+# 输入: attn_scores [B, H, S, topk], index_score [B, S, topk]
+# 输出: loss
 # ============================================================================
 
 @triton.jit
-def _post_reduce_loss_kernel_v2(
-    AttnScores_ptr, # [batch, num_heads, seq_len, seq_len]
-    IndexScore_ptr, # [batch, seq_len, seq_len]
-    Mask_ptr,       # [batch, seq_len, seq_len]
+def _sparse_post_reduce_loss_kernel(
+    AttnScores_ptr, # [batch, num_heads, seq_len, topk]
+    IndexScore_ptr, # [batch, seq_len, topk]
+    Indices_ptr,    # [batch, seq_len, topk] - 用于causal mask
     Loss_ptr,       # [batch, seq_len]
     # Dimensions
     batch_size,
     num_heads: tl.constexpr,
     seq_len,
+    topk: tl.constexpr,
     eps: tl.constexpr,
-    # Strides for AttnScores
+    # Strides
     stride_ab, stride_ah, stride_as, stride_ak,
-    # Strides for IndexScore
     stride_isb, stride_iss, stride_isk,
-    # Strides for Mask
-    stride_mb, stride_ms, stride_mk,
-    # Block sizes
-    BLOCK_M: tl.constexpr,  # 每个program处理的行数
-    BLOCK_K: tl.constexpr,  # key维度的tile大小
+    stride_ib, stride_is, stride_ik,
+    # Block size
+    BLOCK_K: tl.constexpr,
 ):
     """
-    高性能Post-Reduce Loss Kernel
-    
-    优化:
-    1. 每个program处理BLOCK_M行
-    2. 合并计算pass
-    3. 减少global memory访问
+    Sparse Post-Reduce Loss: 在topk维度上计算
+    复杂度 O(seq_len * topk)
     """
     pid = tl.program_id(0)
-    num_m_blocks = tl.cdiv(seq_len, BLOCK_M)
+    pid_batch = pid // seq_len
+    pid_row = pid % seq_len
     
-    pid_batch = pid // num_m_blocks
-    pid_m = pid % num_m_blocks
+    NEG_INF = -1e9
     
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    m_mask = offs_m < seq_len
-    
-    # 初始化累加器 [BLOCK_M]
-    attn_total = tl.zeros([BLOCK_M], dtype=tl.float32)
-    max_is = tl.full([BLOCK_M], value=-float("inf"), dtype=tl.float32)
-    sum_is = tl.zeros([BLOCK_M], dtype=tl.float32)
-    
-    # Pass 1: 计算attn_total, max_is, sum_is
-    for start_k in range(0, seq_len, BLOCK_K):
+    # 计算attn_total (heads求和后的总和)
+    attn_total = 0.0
+    for start_k in range(0, topk, BLOCK_K):
         offs_k = start_k + tl.arange(0, BLOCK_K)
-        k_mask = offs_k < seq_len
-        mk_mask = m_mask[:, None] & k_mask[None, :]
+        k_mask = offs_k < topk
         
-        # 累加attention scores (对所有heads求和)
-        attn_sum_block = tl.zeros([BLOCK_M, BLOCK_K], dtype=tl.float32)
+        acc = tl.zeros([BLOCK_K], dtype=tl.float32)
         for h in tl.static_range(num_heads):
             attn_ptrs = AttnScores_ptr + pid_batch * stride_ab + h * stride_ah + \
-                        offs_m[:, None] * stride_as + offs_k[None, :] * stride_ak
-            attn_val = tl.load(attn_ptrs, mask=mk_mask, other=0.0)
-            attn_sum_block += attn_val
+                        pid_row * stride_as + offs_k * stride_ak
+            attn_val = tl.load(attn_ptrs, mask=k_mask, other=0.0)
+            acc += attn_val
         
-        attn_total += tl.sum(tl.where(k_mask[None, :], attn_sum_block, 0.0), axis=1)
-        
-        # 加载index_score
-        is_ptrs = IndexScore_ptr + pid_batch * stride_isb + \
-                  offs_m[:, None] * stride_iss + offs_k[None, :] * stride_isk
-        is_val = tl.load(is_ptrs, mask=mk_mask, other=-float("inf"))
-        
-        # 加载mask
-        mask_ptrs = Mask_ptr + pid_batch * stride_mb + \
-                    offs_m[:, None] * stride_ms + offs_k[None, :] * stride_mk
-        mask_val = tl.load(mask_ptrs, mask=mk_mask, other=True)
-        is_val = tl.where(mask_val | ~k_mask[None, :], -float("inf"), is_val)
-        
-        # 更新max_is (online softmax)
-        block_max = tl.max(is_val, axis=1)
-        new_max = tl.maximum(max_is, block_max)
-        
-        # Rescale sum_is
-        alpha = tl.exp(max_is - new_max)
-        sum_is = sum_is * alpha + tl.sum(tl.exp(is_val - new_max[:, None]), axis=1)
-        max_is = new_max
+        attn_total += tl.sum(tl.where(k_mask, acc, 0.0))
     
-    # Pass 2: 计算KL散度
-    kl_sum = tl.zeros([BLOCK_M], dtype=tl.float32)
-    
-    for start_k in range(0, seq_len, BLOCK_K):
+    # 计算index_score的softmax参数
+    # 加载indices用于causal mask
+    max_is = NEG_INF
+    for start_k in range(0, topk, BLOCK_K):
         offs_k = start_k + tl.arange(0, BLOCK_K)
-        k_mask = offs_k < seq_len
-        mk_mask = m_mask[:, None] & k_mask[None, :]
+        k_mask = offs_k < topk
         
-        # 重新计算attn_sum并归一化
-        attn_sum_block = tl.zeros([BLOCK_M, BLOCK_K], dtype=tl.float32)
+        # 加载indices检查causal
+        idx_ptrs = Indices_ptr + pid_batch * stride_ib + pid_row * stride_is + offs_k * stride_ik
+        indices = tl.load(idx_ptrs, mask=k_mask, other=0).to(tl.int64)
+        causal_mask = indices > pid_row
+        
+        is_ptrs = IndexScore_ptr + pid_batch * stride_isb + pid_row * stride_iss + offs_k * stride_isk
+        is_val = tl.load(is_ptrs, mask=k_mask, other=NEG_INF)
+        is_val = tl.where(causal_mask | ~k_mask, NEG_INF, is_val)
+        
+        max_is = tl.maximum(max_is, tl.max(is_val))
+    
+    sum_is = 0.0
+    for start_k in range(0, topk, BLOCK_K):
+        offs_k = start_k + tl.arange(0, BLOCK_K)
+        k_mask = offs_k < topk
+        
+        idx_ptrs = Indices_ptr + pid_batch * stride_ib + pid_row * stride_is + offs_k * stride_ik
+        indices = tl.load(idx_ptrs, mask=k_mask, other=0).to(tl.int64)
+        causal_mask = indices > pid_row
+        
+        is_ptrs = IndexScore_ptr + pid_batch * stride_isb + pid_row * stride_iss + offs_k * stride_isk
+        is_val = tl.load(is_ptrs, mask=k_mask, other=NEG_INF)
+        is_val = tl.where(causal_mask | ~k_mask, NEG_INF, is_val)
+        
+        sum_is += tl.sum(tl.exp(is_val - max_is))
+    
+    sum_is = tl.where(sum_is < 1e-9, 1.0, sum_is)
+    
+    # 计算KL散度
+    kl_sum = 0.0
+    for start_k in range(0, topk, BLOCK_K):
+        offs_k = start_k + tl.arange(0, BLOCK_K)
+        k_mask = offs_k < topk
+        
+        # attn_sum归一化
+        attn_sum = tl.zeros([BLOCK_K], dtype=tl.float32)
         for h in tl.static_range(num_heads):
             attn_ptrs = AttnScores_ptr + pid_batch * stride_ab + h * stride_ah + \
-                        offs_m[:, None] * stride_as + offs_k[None, :] * stride_ak
-            attn_val = tl.load(attn_ptrs, mask=mk_mask, other=0.0)
-            attn_sum_block += attn_val
+                        pid_row * stride_as + offs_k * stride_ak
+            attn_val = tl.load(attn_ptrs, mask=k_mask, other=0.0)
+            attn_sum += attn_val
         
-        attn_dist = attn_sum_block / (attn_total[:, None] + eps) + eps
+        attn_dist = attn_sum / (attn_total + eps) + eps
         
-        # 计算index_prob
-        is_ptrs = IndexScore_ptr + pid_batch * stride_isb + \
-                  offs_m[:, None] * stride_iss + offs_k[None, :] * stride_isk
-        is_val = tl.load(is_ptrs, mask=mk_mask, other=-float("inf"))
+        # index_prob
+        idx_ptrs = Indices_ptr + pid_batch * stride_ib + pid_row * stride_is + offs_k * stride_ik
+        indices = tl.load(idx_ptrs, mask=k_mask, other=0).to(tl.int64)
+        causal_mask = indices > pid_row
         
-        mask_ptrs = Mask_ptr + pid_batch * stride_mb + \
-                    offs_m[:, None] * stride_ms + offs_k[None, :] * stride_mk
-        mask_val = tl.load(mask_ptrs, mask=mk_mask, other=True)
-        is_val = tl.where(mask_val | ~k_mask[None, :], -float("inf"), is_val)
+        is_ptrs = IndexScore_ptr + pid_batch * stride_isb + pid_row * stride_iss + offs_k * stride_isk
+        is_val = tl.load(is_ptrs, mask=k_mask, other=NEG_INF)
+        is_val = tl.where(causal_mask | ~k_mask, NEG_INF, is_val)
         
-        index_prob = tl.exp(is_val - max_is[:, None]) / sum_is[:, None] + eps
+        index_prob = tl.exp(is_val - max_is) / sum_is + eps
         
-        # KL散度
+        # KL
         kl = attn_dist * (tl.log(attn_dist) - tl.log(index_prob))
-        kl = tl.where(k_mask[None, :], kl, 0.0)
-        kl_sum += tl.sum(kl, axis=1)
+        kl = tl.where(k_mask & ~causal_mask, kl, 0.0)
+        kl_sum += tl.sum(kl)
     
-    # 存储结果
-    loss_ptrs = Loss_ptr + pid_batch * seq_len + offs_m
-    tl.store(loss_ptrs, kl_sum, mask=m_mask)
+    tl.store(Loss_ptr + pid_batch * seq_len + pid_row, kl_sum)
 
 
-def post_reduce_loss_fused(attn_scores, index_score, mask, eps=1e-10):
+def sparse_post_reduce_loss_fused(attn_scores, index_score, indices, eps=1e-10):
     """
-    Kernel 2: Post-Reduce - 高性能融合计算
+    Sparse Post-Reduce Loss
+    
+    Args:
+        attn_scores: [batch, num_heads, seq_len, topk]
+        index_score: [batch, seq_len, topk]
+        indices: [batch, seq_len, topk]
+        eps: float
+    
+    Returns:
+        loss: scalar
     """
-    batch_size, num_heads, seq_len, _ = attn_scores.shape
+    batch_size, num_heads, seq_len, topk = attn_scores.shape
     
     attn_scores = attn_scores.contiguous()
     index_score = index_score.contiguous()
-    mask = mask.contiguous()
+    indices = indices.contiguous().to(torch.int64)
     
     loss_per_row = torch.zeros(batch_size, seq_len, device=attn_scores.device, dtype=torch.float32)
     
-    # 选择合适的block size
-    if seq_len <= 512:
-        BLOCK_M = 32
-        BLOCK_K = 64
-    elif seq_len <= 2048:
-        BLOCK_M = 64
-        BLOCK_K = 128
-    else:
-        BLOCK_M = 64
-        BLOCK_K = 256
+    BLOCK_K = min(64, triton.next_power_of_2(topk))
     
-    num_m_blocks = triton.cdiv(seq_len, BLOCK_M)
-    grid = (batch_size * num_m_blocks,)
+    grid = (batch_size * seq_len,)
     
-    _post_reduce_loss_kernel_v2[grid](
-        attn_scores, index_score, mask, loss_per_row,
-        batch_size, num_heads, seq_len, eps,
+    _sparse_post_reduce_loss_kernel[grid](
+        attn_scores, index_score, indices, loss_per_row,
+        batch_size, num_heads, seq_len, topk, eps,
         attn_scores.stride(0), attn_scores.stride(1), attn_scores.stride(2), attn_scores.stride(3),
         index_score.stride(0), index_score.stride(1), index_score.stride(2),
-        mask.stride(0), mask.stride(1), mask.stride(2),
-        BLOCK_M, BLOCK_K,
+        indices.stride(0), indices.stride(1), indices.stride(2),
+        BLOCK_K,
     )
     
     return loss_per_row.sum() / batch_size
@@ -377,54 +668,65 @@ def post_reduce_loss_fused(attn_scores, index_score, mask, eps=1e-10):
 # 组合函数
 # ============================================================================
 
-def compute_index_loss_fused(query, key, index_score, index_mask, scaling):
+def compute_index_loss_sparse(query, key, index_score, indices, scaling):
     """
-    Fused版本: 两个kernel串联 (不含reduce)
+    Sparse版本: 复杂度 O(seq_len * topk)
+    
+    Args:
+        query: [batch, num_heads, seq_len, head_dim]
+        key: [batch, seq_len, head_dim]
+        index_score: [batch, seq_len, topk]
+        indices: [batch, seq_len, topk]
+        scaling: float
     """
-    attn_scores = attention_softmax_fused(query, key, index_mask, scaling)
-    loss = post_reduce_loss_fused(attn_scores, index_score, index_mask)
+    # Kernel 1: Sparse Attention Softmax
+    attn_scores = sparse_attention_softmax_fused(query, key, indices, scaling)
+    
+    # (这里可以插入reduce操作)
+    
+    # Kernel 2: Sparse Post-Reduce Loss
+    loss = sparse_post_reduce_loss_fused(attn_scores, index_score, indices)
+    
     return loss
 
 
 # ============================================================================
-# PyTorch参考实现
+# PyTorch参考实现 (Sparse版本)
 # ============================================================================
 
-def pytorch_reference(query, key, index_score, index_mask, scaling):
-    """完整的PyTorch参考实现"""
+def pytorch_reference_sparse(query, key, index_score, indices, scaling):
+    """Sparse版本的PyTorch参考实现"""
+    batch_size, num_heads, seq_len, head_dim = query.shape
+    topk = indices.shape[-1]
     eps = 1e-10
     
-    attn = torch.matmul(query, key.unsqueeze(1).transpose(-1, -2)) * scaling
-    attn = attn.masked_fill(index_mask.unsqueeze(1), -1e9)
+    # Gather K using indices: [batch, seq_len, topk, head_dim]
+    indices_expanded = indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)  # [B, S, topk, D]
+    k_gathered = torch.gather(key.unsqueeze(2).expand(-1, -1, topk, -1), 
+                              dim=1, 
+                              index=indices_expanded)  # [B, S, topk, D]
+    
+    # 计算attention: [batch, num_heads, seq_len, topk]
+    # query: [B, H, S, D], k_gathered: [B, S, topk, D] -> [B, 1, S, topk, D]
+    attn = torch.einsum('bhsd,bstd->bhst', query, k_gathered) * scaling
+    
+    # Causal mask
+    row_indices = torch.arange(seq_len, device=query.device).view(1, 1, -1, 1)
+    causal_mask = indices.unsqueeze(1) > row_indices
+    attn = attn.masked_fill(causal_mask, -1e9)
+    
+    # Softmax
     attn = torch.softmax(attn, dim=-1)
     
-    attn_sum = attn.sum(dim=1)
+    # Head sum + normalize
+    attn_sum = attn.sum(dim=1)  # [B, S, topk]
     attn_dist = attn_sum / (attn_sum.sum(dim=-1, keepdim=True) + eps)
     
-    index_score_masked = index_score.masked_fill(index_mask, -1e9)
+    # Index score softmax (也需要causal mask)
+    index_score_masked = index_score.masked_fill(indices > torch.arange(seq_len, device=query.device).view(1, -1, 1), -1e9)
     index_prob = torch.softmax(index_score_masked, dim=-1) + eps
     
-    kl_loss = F.kl_div(index_prob.log(), attn_dist + eps, reduction='batchmean')
-    
-    return kl_loss
-
-
-def attention_softmax_ref(query, key, mask, scaling):
-    """Kernel 1的PyTorch参考"""
-    attn = torch.matmul(query, key.unsqueeze(1).transpose(-1, -2)) * scaling
-    attn = attn.masked_fill(mask.unsqueeze(1), -1e9)
-    attn = torch.softmax(attn, dim=-1)
-    return attn
-
-
-def post_reduce_loss_ref(attn_scores, index_score, mask, eps=1e-10):
-    """Kernel 2的PyTorch参考"""
-    attn_sum = attn_scores.sum(dim=1)
-    attn_dist = attn_sum / (attn_sum.sum(dim=-1, keepdim=True) + eps)
-    
-    index_score_masked = index_score.masked_fill(mask, -1e9)
-    index_prob = torch.softmax(index_score_masked, dim=-1) + eps
-    
+    # KL
     kl_loss = F.kl_div(index_prob.log(), attn_dist + eps, reduction='batchmean')
     
     return kl_loss
@@ -434,79 +736,36 @@ def post_reduce_loss_ref(attn_scores, index_score, mask, eps=1e-10):
 # 测试函数
 # ============================================================================
 
-def generate_topk_mask(batch_size, seq_len, topk, device='cuda'):
-    """生成基于topk的index mask"""
-    t_vals = torch.arange(seq_len, device=device, dtype=torch.float32).view(1, seq_len, 1)
-    max_vals = torch.clamp(t_vals + 1, min=1).expand(batch_size, seq_len, topk)
-    random_floats = torch.rand(batch_size, seq_len, topk, device=device)
-    indices = (random_floats * max_vals).to(torch.int64)
+def generate_topk_indices(batch_size, seq_len, topk, device='cuda'):
+    """生成topk indices (causal)"""
+    indices = torch.zeros(batch_size, seq_len, topk, dtype=torch.int64, device=device)
     
-    mask = torch.ones(batch_size, seq_len, seq_len, device=device, dtype=torch.bool)
-    batch_idx = torch.arange(batch_size, device=device).view(-1, 1, 1).expand(-1, seq_len, topk)
-    row_idx = torch.arange(seq_len, device=device).view(1, -1, 1).expand(batch_size, -1, topk)
-    mask[batch_idx, row_idx, indices] = False
+    for b in range(batch_size):
+        for t in range(seq_len):
+            # 从[0, t]中随机选择topk个
+            valid_range = min(t + 1, topk)
+            if valid_range <= topk:
+                # 可选的不够topk个，就全选然后补0
+                perm = torch.randperm(max(1, t + 1), device=device)[:min(topk, t + 1)]
+                indices[b, t, :len(perm)] = perm
+            else:
+                perm = torch.randperm(t + 1, device=device)[:topk]
+                indices[b, t] = perm
     
-    causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool), diagonal=1)
-    mask = mask | causal_mask.unsqueeze(0)
-    
-    return mask, indices
+    return indices
 
 
-def test_kernel1(batch_size=2, num_heads=8, seq_len=256, head_dim=64, topk=32, seed=42):
-    """测试 Kernel 1"""
-    torch.manual_seed(seed)
-    device = 'cuda'
-    scaling = 1.0 / (head_dim ** 0.5)
-    
-    query = torch.randn(batch_size, num_heads, seq_len, head_dim, device=device, dtype=torch.float32)
-    key = torch.randn(batch_size, seq_len, head_dim, device=device, dtype=torch.float32)
-    mask, _ = generate_topk_mask(batch_size, seq_len, topk, device)
-    
-    ref = attention_softmax_ref(query, key, mask, scaling)
-    tri = attention_softmax_fused(query, key, mask, scaling)
-    
-    diff = (ref - tri).abs().max().item()
-    print(f"Kernel 1 (Attention Softmax):")
-    print(f"  Max diff: {diff:.6e}")
-    print(f"  Pass: {diff < 1e-3}")
-    
-    return diff < 1e-3
-
-
-def test_kernel2(batch_size=2, num_heads=8, seq_len=256, head_dim=64, topk=32, seed=42):
-    """测试 Kernel 2"""
-    torch.manual_seed(seed)
-    device = 'cuda'
-    
-    attn_scores = torch.rand(batch_size, num_heads, seq_len, seq_len, device=device, dtype=torch.float32)
-    attn_scores = attn_scores / attn_scores.sum(dim=-1, keepdim=True)
-    
-    index_score = torch.randn(batch_size, seq_len, seq_len, device=device, dtype=torch.float32)
-    mask, _ = generate_topk_mask(batch_size, seq_len, topk, device)
-    
-    ref = post_reduce_loss_ref(attn_scores, index_score, mask)
-    tri = post_reduce_loss_fused(attn_scores, index_score, mask)
-    
-    diff = abs(ref.item() - tri.item())
-    print(f"Kernel 2 (Post-Reduce Loss):")
-    print(f"  Ref: {ref.item():.6f}, Triton: {tri.item():.6f}")
-    print(f"  Diff: {diff:.6e}")
-    print(f"  Pass: {diff < 1e-3}")
-    
-    return diff < 1e-3
-
-
-def test_fused(
-    batch_size: int = 2,
-    num_heads: int = 8,
-    seq_len: int = 256,
-    head_dim: int = 64,
-    topk: int = 32,
+def test_sparse_kernel(
+    batch_size: int = 1,
+    num_heads: int = 16,
+    seq_len: int = 4096,
+    head_dim: int = 256,
+    topk: int = 512,
     seed: int = 42,
-    num_warmup: int = 10,
-    num_benchmark: int = 100,
+    num_warmup: int = 5,
+    num_benchmark: int = 20,
 ):
-    """测试Fused实现"""
+    """测试Sparse实现"""
     import time
     
     torch.manual_seed(seed)
@@ -514,100 +773,117 @@ def test_fused(
     scaling = 1.0 / (head_dim ** 0.5)
     
     print("=" * 60)
-    print("Triton Fused 测试")
+    print("Sparse Triton 测试")
     print("=" * 60)
     print(f"参数: batch={batch_size}, heads={num_heads}, seq={seq_len}, dim={head_dim}, topk={topk}")
+    print(f"理论复杂度: O(seq_len * topk) = O({seq_len} * {topk}) = O({seq_len * topk})")
     print("=" * 60)
     
     query = torch.randn(batch_size, num_heads, seq_len, head_dim, device=device, dtype=torch.float32)
     key = torch.randn(batch_size, seq_len, head_dim, device=device, dtype=torch.float32)
-    index_score = torch.randn(batch_size, seq_len, seq_len, device=device, dtype=torch.float32)
-    mask, _ = generate_topk_mask(batch_size, seq_len, topk, device)
+    index_score = torch.randn(batch_size, seq_len, topk, device=device, dtype=torch.float32)
+    indices = generate_topk_indices(batch_size, seq_len, topk, device)
     
     # 精度测试
     print("\n>>> 精度测试")
+    ref_loss = pytorch_reference_sparse(query, key, index_score, indices, scaling)
+    tri_loss = compute_index_loss_sparse(query, key, index_score, indices, scaling)
     
-    print("\n[Kernel 1: Attention Softmax]")
-    attn_ref = attention_softmax_ref(query, key, mask, scaling)
-    attn_tri = attention_softmax_fused(query, key, mask, scaling)
-    diff1 = (attn_ref - attn_tri).abs().max().item()
-    print(f"  Max diff: {diff1:.6e}")
-    
-    print("\n[Kernel 2: Post-Reduce Loss]")
-    loss_ref = post_reduce_loss_ref(attn_ref, index_score, mask)
-    loss_tri = post_reduce_loss_fused(attn_tri, index_score, mask)
-    diff2 = abs(loss_ref.item() - loss_tri.item())
-    print(f"  Ref: {loss_ref.item():.6f}, Triton: {loss_tri.item():.6f}")
-    print(f"  Diff: {diff2:.6e}")
-    
-    print("\n[完整流程]")
-    full_ref = pytorch_reference(query, key, index_score, mask, scaling)
-    full_tri = compute_index_loss_fused(query, key, index_score, mask, scaling)
-    diff_full = abs(full_ref.item() - full_tri.item())
-    print(f"  PyTorch: {full_ref.item():.6f}")
-    print(f"  Triton Fused: {full_tri.item():.6f}")
-    print(f"  Diff: {diff_full:.6e}")
+    print(f"  PyTorch Sparse: {ref_loss.item():.6f}")
+    print(f"  Triton Sparse: {tri_loss.item():.6f}")
+    print(f"  Diff: {abs(ref_loss.item() - tri_loss.item()):.6e}")
     
     # 性能测试
     print(f"\n>>> 性能测试 (warmup={num_warmup}, iterations={num_benchmark})")
     
     # Warmup
     for _ in range(num_warmup):
-        _ = compute_index_loss_fused(query, key, index_score, mask, scaling)
+        _ = compute_index_loss_sparse(query, key, index_score, indices, scaling)
     torch.cuda.synchronize()
     
     # Benchmark Triton
     start = time.time()
     for _ in range(num_benchmark):
-        _ = compute_index_loss_fused(query, key, index_score, mask, scaling)
+        _ = compute_index_loss_sparse(query, key, index_score, indices, scaling)
     torch.cuda.synchronize()
     triton_time = (time.time() - start) / num_benchmark * 1000
     
     # Warmup PyTorch
     for _ in range(num_warmup):
-        _ = pytorch_reference(query, key, index_score, mask, scaling)
+        _ = pytorch_reference_sparse(query, key, index_score, indices, scaling)
     torch.cuda.synchronize()
     
     # Benchmark PyTorch
     start = time.time()
     for _ in range(num_benchmark):
-        _ = pytorch_reference(query, key, index_score, mask, scaling)
+        _ = pytorch_reference_sparse(query, key, index_score, indices, scaling)
     torch.cuda.synchronize()
     pytorch_time = (time.time() - start) / num_benchmark * 1000
     
-    print(f"\n  PyTorch: {pytorch_time:.3f} ms")
-    print(f"  Triton Fused: {triton_time:.3f} ms")
+    print(f"\n  PyTorch Sparse: {pytorch_time:.3f} ms")
+    print(f"  Triton Sparse: {triton_time:.3f} ms")
     if triton_time > 0:
         print(f"  加速比: {pytorch_time / triton_time:.2f}x")
     
     return {
-        'kernel1_diff': diff1,
-        'kernel2_diff': diff2,
-        'full_diff': diff_full,
         'pytorch_time_ms': pytorch_time,
         'triton_time_ms': triton_time,
-        'speedup': pytorch_time / triton_time if triton_time > 0 else float('inf'),
     }
 
 
+def test_scaling():
+    """测试seq_len与耗时的线性关系"""
+    print("\n" + "=" * 60)
+    print("线性scaling测试 (topk固定)")
+    print("=" * 60)
+    
+    topk = 512
+    head_dim = 128
+    num_heads = 8
+    
+    results = []
+    for seq_len in [1024, 2048, 4096, 8192]:
+        try:
+            result = test_sparse_kernel(
+                batch_size=1,
+                num_heads=num_heads,
+                seq_len=seq_len,
+                head_dim=head_dim,
+                topk=topk,
+                num_warmup=3,
+                num_benchmark=10,
+            )
+            results.append({
+                'seq_len': seq_len,
+                **result
+            })
+        except Exception as e:
+            print(f"seq_len={seq_len} 失败: {e}")
+    
+    print("\n" + "=" * 60)
+    print("Scaling汇总")
+    print("=" * 60)
+    print(f"{'seq_len':<10} {'Triton(ms)':<15} {'Expected Ratio':<15} {'Actual Ratio':<15}")
+    print("-" * 60)
+    
+    base_time = results[0]['triton_time_ms'] if results else 1
+    base_seq = results[0]['seq_len'] if results else 1024
+    
+    for r in results:
+        expected_ratio = r['seq_len'] / base_seq
+        actual_ratio = r['triton_time_ms'] / base_time
+        print(f"{r['seq_len']:<10} {r['triton_time_ms']:<15.3f} {expected_ratio:<15.2f}x {actual_ratio:<15.2f}x")
+
+
 if __name__ == "__main__":
-    print("\n" + "=" * 60)
-    print("单独测试 Kernel 1")
-    print("=" * 60)
-    test_kernel1()
-    
-    print("\n" + "=" * 60)
-    print("单独测试 Kernel 2")
-    print("=" * 60)
-    test_kernel2()
-    
-    print("\n")
-    test_fused(
+    test_sparse_kernel(
         batch_size=1,
         num_heads=16,
         seq_len=4096,
         head_dim=256,
-        topk=2048,
-        num_warmup=5,
-        num_benchmark=10,
+        topk=512,
     )
+    
+    # 测试线性scaling
+    # test_scaling()
+
