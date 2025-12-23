@@ -2,10 +2,9 @@
 Triton Fused Optimized - Sparse Attention (H20 GPU优化版本)
 
 针对H20 (Hopper架构, sm_90) 的优化:
-1. Autotune配置优化
+1. 固定配置: BLOCK_D=128, BLOCK_M=16, num_stages=3, num_warps=8
 2. 每个program处理BLOCK_M行query
-3. num_stages/num_warps参数调优
-4. 内存访问模式优化
+3. 内存访问模式优化
 """
 
 import torch
@@ -14,48 +13,17 @@ import triton.language as tl
 import torch.nn.functional as F
 
 
-# ============================================================================
-# Autotune配置 - 针对H20 GPU优化
-# ============================================================================
-
-def get_autotune_configs():
-    """生成autotune配置，针对H20 (Hopper, sm_90) GPU
-    
-    H20硬件参数:
-    - 78 SMs, 228KB shared mem/SM, 65536 regs/SM
-    - 每SM最大2048线程 (64 warps)
-    - 每Block最大1024线程
-    """
-    configs = []
-    # H20推荐配置: num_warps=4-16, num_stages=2-4
-    # 更大的num_stages利用228KB共享内存进行更深流水线
-    for block_d in [64, 128, 256]:
-        for num_stages in [2, 3, 4]:
-            for num_warps in [4, 8]:
-                configs.append(
-                    triton.Config(
-                        {'BLOCK_D': block_d},
-                        num_stages=num_stages,
-                        num_warps=num_warps,
-                    )
-                )
-    return configs
-
-
-# H20 GPU常量
-H20_NUM_SMS = 78
-H20_SMEM_PER_SM = 228 * 1024  # 228 KB
-H20_REGS_PER_SM = 65536
+# 固定配置常量
+BLOCK_D = 128
+BLOCK_M = 16
+NUM_STAGES = 3
+NUM_WARPS = 8
 
 
 # ============================================================================
 # Kernel 1: Sparse Attention Softmax (H20优化版本)
 # ============================================================================
 
-@triton.autotune(
-    configs=get_autotune_configs(),
-    key=['head_dim', 'topk'],
-)
 @triton.jit
 def _sparse_attn_h20_kernel(
     Q_ptr, K_ptr, Indices_ptr, Out_ptr,
@@ -73,11 +41,9 @@ def _sparse_attn_h20_kernel(
     H20优化的Sparse Attention Kernel
     
     优化点:
-    1. 使用autotune选择最佳BLOCK_D, num_stages, num_warps
-    2. 使用2D指针批量load K[indices, :]
-    3. 向量化点积计算
-    4. 编译器hints优化 (tl.multiple_of)
-    5. 内存对齐提示
+    1. 使用2D指针批量load K[indices, :]
+    2. 向量化点积计算
+    3. 内存对齐提示
     """
     pid = tl.program_id(0)
     num_per_head = seq_len
@@ -142,28 +108,9 @@ def _sparse_attn_h20_kernel(
 
 
 # ============================================================================
-# Kernel 1 变体: 每program处理BLOCK_M行 (减少kernel启动开销)
+# Kernel 1 变体: 每program处理BLOCK_M行
 # ============================================================================
 
-@triton.autotune(
-    configs=[
-        # 小BLOCK_M配置 - 适合小seq_len或大topk
-        triton.Config({'BLOCK_M': 4, 'BLOCK_D': 64}, num_stages=2, num_warps=4),
-        triton.Config({'BLOCK_M': 4, 'BLOCK_D': 128}, num_stages=3, num_warps=4),
-        # 中等BLOCK_M配置 - 平衡选择
-        triton.Config({'BLOCK_M': 8, 'BLOCK_D': 64}, num_stages=3, num_warps=4),
-        triton.Config({'BLOCK_M': 8, 'BLOCK_D': 128}, num_stages=3, num_warps=8),
-        triton.Config({'BLOCK_M': 8, 'BLOCK_D': 256}, num_stages=4, num_warps=8),
-        # 大BLOCK_M配置 - 减少kernel启动开销
-        triton.Config({'BLOCK_M': 16, 'BLOCK_D': 64}, num_stages=3, num_warps=8),
-        triton.Config({'BLOCK_M': 16, 'BLOCK_D': 128}, num_stages=4, num_warps=8),
-        triton.Config({'BLOCK_M': 16, 'BLOCK_D': 256}, num_stages=4, num_warps=8),
-        # 更大BLOCK_M配置 - 适合大seq_len
-        triton.Config({'BLOCK_M': 32, 'BLOCK_D': 128}, num_stages=3, num_warps=8),
-        triton.Config({'BLOCK_M': 32, 'BLOCK_D': 256}, num_stages=4, num_warps=8),
-    ],
-    key=['head_dim', 'topk', 'seq_len'],
-)
 @triton.jit
 def _sparse_attn_multirow_kernel(
     Q_ptr, K_ptr, Indices_ptr, Out_ptr,
@@ -182,10 +129,9 @@ def _sparse_attn_multirow_kernel(
     多行处理的Sparse Attention Kernel (H20优化版本)
     
     优化点:
-    1. 每个program处理BLOCK_M行query，减少kernel启动开销
-    2. 使用tl.multiple_of提示内存对齐
-    3. 预计算共享的基地址和偏移量
-    4. 使用tl.static_range优化循环
+    1. 每个program处理BLOCK_M行query
+    2. 预计算共享的基地址和偏移量
+    3. 使用tl.static_range优化循环
     """
     pid = tl.program_id(0)
     num_m_blocks = tl.cdiv(seq_len, BLOCK_M)
@@ -273,9 +219,7 @@ def sparse_attention_softmax_fused(query, key, indices, scaling, use_multirow=Tr
     
     if use_multirow:
         # 使用多行处理kernel
-        grid = lambda META: (
-            batch_size * num_heads * triton.cdiv(seq_len, META['BLOCK_M']),
-        )
+        grid = (batch_size * num_heads * triton.cdiv(seq_len, BLOCK_M),)
         
         _sparse_attn_multirow_kernel[grid](
             query, key, indices, attn_scores,
@@ -284,6 +228,8 @@ def sparse_attention_softmax_fused(query, key, indices, scaling, use_multirow=Tr
             key.stride(0), key.stride(1), key.stride(2),
             indices.stride(0), indices.stride(1), indices.stride(2),
             attn_scores.stride(0), attn_scores.stride(1), attn_scores.stride(2), attn_scores.stride(3),
+            BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D,
+            num_stages=NUM_STAGES, num_warps=NUM_WARPS,
         )
     else:
         # 使用单行kernel
@@ -296,26 +242,17 @@ def sparse_attention_softmax_fused(query, key, indices, scaling, use_multirow=Tr
             key.stride(0), key.stride(1), key.stride(2),
             indices.stride(0), indices.stride(1), indices.stride(2),
             attn_scores.stride(0), attn_scores.stride(1), attn_scores.stride(2), attn_scores.stride(3),
+            BLOCK_D=BLOCK_D,
+            num_stages=NUM_STAGES, num_warps=NUM_WARPS,
         )
     
     return attn_scores
 
 
 # ============================================================================
-# Kernel 2: Sparse Post-Reduce Loss (H20优化版本)
+# Kernel 2: Sparse Post-Reduce Loss
 # ============================================================================
 
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_stages=2, num_warps=4),
-        triton.Config({}, num_stages=2, num_warps=8),
-        triton.Config({}, num_stages=3, num_warps=4),
-        triton.Config({}, num_stages=3, num_warps=8),
-        triton.Config({}, num_stages=4, num_warps=4),
-        triton.Config({}, num_stages=4, num_warps=8),
-    ],
-    key=['num_heads', 'topk'],
-)
 @triton.jit
 def _sparse_loss_h20_kernel(
     AttnScores_ptr, IndexScore_ptr, Indices_ptr, Loss_ptr,
@@ -390,6 +327,7 @@ def sparse_post_reduce_loss_fused(attn_scores, index_score, indices, eps=1e-10):
         attn_scores.stride(0), attn_scores.stride(1), attn_scores.stride(2), attn_scores.stride(3),
         index_score.stride(0), index_score.stride(1), index_score.stride(2),
         indices.stride(0), indices.stride(1), indices.stride(2),
+        num_stages=NUM_STAGES, num_warps=NUM_WARPS,
     )
     
     return loss_per_row.sum() / batch_size
