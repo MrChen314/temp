@@ -136,7 +136,10 @@ def _sparse_attn_loss_fused_kernel(
             m_block = tl.max(qk, axis=0)  # [BLOCK_H]
             m_new = tl.maximum(m_global, m_block)  # [BLOCK_H]
             # 修正旧的 sum，并加上新块的 exp
-            l_global = l_global * tl.exp(m_global - m_new) + tl.sum(tl.exp(qk - m_new[None, :]), axis=0)
+            # 关键修复: 在exp之后将无效位置显式设为0，避免 exp(NEG_INF - NEG_INF) = 1 的问题
+            exp_qk = tl.exp(qk - m_new[None, :])
+            exp_qk = tl.where(invalid_mask, 0.0, exp_qk)
+            l_global = l_global * tl.exp(m_global - m_new) + tl.sum(exp_qk, axis=0)
             m_global = m_new
         
         # 处理全 NEG_INF 情况
@@ -213,7 +216,10 @@ def _sparse_attn_loss_fused_kernel(
         
         is_m_block = tl.max(is_val)
         is_m_new = tl.maximum(is_m_global, is_m_block)
-        is_l_global = is_l_global * tl.exp(is_m_global - is_m_new) + tl.sum(tl.exp(is_val - is_m_new))
+        # 关键修复: 在exp之后将无效位置显式设为0
+        is_exp_val = tl.exp(is_val - is_m_new)
+        is_exp_val = tl.where(causal_mask_block, 0.0, is_exp_val)
+        is_l_global = is_l_global * tl.exp(is_m_global - is_m_new) + tl.sum(is_exp_val)
         is_m_global = is_m_new
     
     is_m_global = tl.where(is_m_global == NEG_INF, 0.0, is_m_global)
@@ -515,15 +521,15 @@ def test_full_accuracy(configs: List[TestConfig]):
         results.append(result)
     
     # 打印表格格式的结果
-    print(f"\n{'Name'}\t{'Config'}\t{'PyTorch'}\t{'Triton'}\t{'RelDiff'}\t{'Pass'}")
-    print("-" * 100)
+    print(f"\n{'Name':<15} {'Config':<50} {'PyTorch':<12} {'Triton':<12} {'RelDiff':<12} {'Pass':<6}")
+    print("-" * 107)
     for r in results:
-        print(f"{r['config'].name}\t{str(r['config'])}\t"
-              f"{r['ref']:.4f}\t{r['tri']:.4f}\t{r['rel_diff']:.2e}\t{'✓' if r['passed'] else '✗'}")
+        print(f"{r['config'].name:<15} {str(r['config']):<50} "
+              f"{r['ref']:<12.4f} {r['tri']:<12.4f} {r['rel_diff']:<12.2e} {'✓' if r['passed'] else '✗':<6}")
     
     # 汇总
     passed_count = sum(1 for r in results if r['passed'])
-    print("-" * 100)
+    print("-" * 107)
     print(f"总计: {passed_count}/{len(results)} 通过")
     
     return results
