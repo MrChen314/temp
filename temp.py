@@ -324,6 +324,7 @@ def test_full_accuracy(batch_size=1, num_heads=8, seq_len=256, head_dim=64, topk
 def test_performance(
     batch_size: int = 1,
     num_heads: int = 16,
+    chunk_size: int = 16 * 1024,
     seq_len: int = 4096,
     head_dim: int = 256,
     topk: int = 512,
@@ -346,11 +347,11 @@ def test_performance(
     print(f"Full复杂度:   O(seq * seq * head_dim * num_heads) = O({seq_len * seq_len * head_dim * num_heads:,})")
     print("=" * 70)
     
-    query = torch.randn(batch_size, num_heads, seq_len, head_dim, device=device, dtype=torch.float32)
+    query = torch.randn(batch_size, num_heads, chunk_size, head_dim, device=device, dtype=torch.float32)
     key = torch.randn(batch_size, seq_len, head_dim, device=device, dtype=torch.float32)
     
     # Full版本数据
-    index_score_full = torch.randn(batch_size, seq_len, seq_len, device=device, dtype=torch.float32)
+    index_score_full = torch.randn(batch_size, chunk_size, seq_len, device=device, dtype=torch.float32)
     index_mask, topk_indices = generate_index_mask_from_score(index_score_full, topk, device)
     
     # Sparse版本数据
@@ -406,7 +407,8 @@ if __name__ == "__main__":
     print("\n")
     test_performance(
         batch_size=1,
-        num_heads=16,
+        num_heads=128,
+        chunk_size=16 * 1024,
         seq_len=8 * 1024,
         head_dim=512,
         topk=2048,
