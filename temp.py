@@ -96,19 +96,19 @@ def _sparse_attn_loss_fused_kernel(
             causal_mask_block = (indices_block > global_query_pos) | (~tk_mask)
             
             # 计算 QK
-            qk = tl.zeros([BLOCK_TOPK], dtype=tl.float32)
+            qk = tl.zeros([BLOCK_TOPK, 1], dtype=tl.float32)
             num_d_blocks = tl.cdiv(head_dim, BLOCK_D)
             for d_idx in range(num_d_blocks):
                 d_start = d_idx * BLOCK_D
                 offs_d = d_start + tl.arange(0, BLOCK_D)
                 d_mask = offs_d < head_dim
                 
-                q = tl.load(q_base + offs_d * stride_qd, mask=d_mask, other=0.0).to(tl.float32)
+                q = tl.load(q_base + offs_d * stride_qd, mask=d_mask, other=0.0)  # [BLOCK_D]
                 k_ptrs = k_batch_base + indices_block[:, None] * stride_ks + offs_d[None, :] * stride_kd
-                k_gathered = tl.load(k_ptrs, mask=tk_mask[:, None] & d_mask[None, :], other=0.0).to(tl.float32)
-                qk += tl.sum(q[None, :] * k_gathered, axis=1)
+                k_gathered = tl.load(k_ptrs, mask=tk_mask[:, None] & d_mask[None, :], other=0.0)  # [BLOCK_TOPK, BLOCK_D]
+                qk += tl.dot(k_gathered, q[:, None])  # [BLOCK_TOPK, 1]
             
-            qk = qk * scaling
+            qk = qk[:, 0] * scaling  # [BLOCK_TOPK]
             qk = tl.where(causal_mask_block, NEG_INF, qk)
             
             # Online softmax update
@@ -134,19 +134,19 @@ def _sparse_attn_loss_fused_kernel(
             causal_mask_block = (indices_block > global_query_pos) | (~tk_mask)
             
             # 重新计算 QK
-            qk = tl.zeros([BLOCK_TOPK], dtype=tl.float32)
+            qk = tl.zeros([BLOCK_TOPK, 1], dtype=tl.float32)
             num_d_blocks = tl.cdiv(head_dim, BLOCK_D)
             for d_idx in range(num_d_blocks):
                 d_start = d_idx * BLOCK_D
                 offs_d = d_start + tl.arange(0, BLOCK_D)
                 d_mask = offs_d < head_dim
                 
-                q = tl.load(q_base + offs_d * stride_qd, mask=d_mask, other=0.0).to(tl.float32)
+                q = tl.load(q_base + offs_d * stride_qd, mask=d_mask, other=0.0)  # [BLOCK_D]
                 k_ptrs = k_batch_base + indices_block[:, None] * stride_ks + offs_d[None, :] * stride_kd
-                k_gathered = tl.load(k_ptrs, mask=tk_mask[:, None] & d_mask[None, :], other=0.0).to(tl.float32)
-                qk += tl.sum(q[None, :] * k_gathered, axis=1)
+                k_gathered = tl.load(k_ptrs, mask=tk_mask[:, None] & d_mask[None, :], other=0.0)  # [BLOCK_TOPK, BLOCK_D]
+                qk += tl.dot(k_gathered, q[:, None])  # [BLOCK_TOPK, 1]
             
-            qk = qk * scaling
+            qk = qk[:, 0] * scaling  # [BLOCK_TOPK]
             qk = tl.where(causal_mask_block, NEG_INF, qk)
             
             # 使用全局 max/sum 归一化
@@ -410,12 +410,12 @@ def test_full_accuracy(batch_size=1, num_heads=8, chunk_size=256, seq_len=256, h
     scaling = 1.0 / (head_dim ** 0.5)
     
     # query: [batch, num_heads, chunk_size, head_dim]
-    query = torch.randn(batch_size, num_heads, chunk_size, head_dim, device=device, dtype=torch.float32)
+    query = torch.randn(batch_size, num_heads, chunk_size, head_dim, device=device, dtype=torch.bfloat16)
     # key: [batch, seq_len, head_dim]
-    key = torch.randn(batch_size, seq_len, head_dim, device=device, dtype=torch.float32)
+    key = torch.randn(batch_size, seq_len, head_dim, device=device, dtype=torch.bfloat16)
     
     # Full版本: index_score是 [batch, chunk_size, seq_len]
-    index_score_full = torch.randn(batch_size, chunk_size, seq_len, device=device, dtype=torch.float32)
+    index_score_full = torch.randn(batch_size, chunk_size, seq_len, device=device, dtype=torch.bfloat16)
     
     # 从index_score生成mask和indices
     # chunk_offset: 当前chunk在完整序列中的起始位置
@@ -487,14 +487,14 @@ def test_performance(
     print("=" * 70)
     
     # query: [batch, num_heads, chunk_size, head_dim] - 当前chunk的query
-    query = torch.randn(batch_size, num_heads, chunk_size, head_dim, device=device, dtype=torch.float32)
+    query = torch.randn(batch_size, num_heads, chunk_size, head_dim, device=device, dtype=torch.bfloat16)
     # key: [batch, seq_len, head_dim] - 完整序列的key (KV cache)
-    key = torch.randn(batch_size, seq_len, head_dim, device=device, dtype=torch.float32)
+    key = torch.randn(batch_size, seq_len, head_dim, device=device, dtype=torch.bfloat16)
     
     # chunk_offset: 假设当前chunk从序列末尾开始
     chunk_offset = seq_len - chunk_size
     
-    index_score_full = torch.randn(batch_size, chunk_size, seq_len, device=device, dtype=torch.float32)
+    index_score_full = torch.randn(batch_size, chunk_size, seq_len, device=device, dtype=torch.bfloat16)
     index_mask, topk_indices = generate_index_mask_from_score(index_score_full, topk, device, chunk_offset=chunk_offset)
     index_score_sparse = torch.gather(index_score_full, dim=-1, index=topk_indices)
     
