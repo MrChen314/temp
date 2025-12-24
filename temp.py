@@ -11,6 +11,8 @@ import torch
 import triton
 import triton.language as tl
 import torch.nn.functional as F
+from dataclasses import dataclass
+from typing import List, Optional
 
 
 # 固定配置常量
@@ -430,38 +432,47 @@ def generate_index_mask_from_score(index_score, topk, device='cuda', chunk_offse
 
 
 # ============================================================================
-# 测试函数
+# 测试配置和函数
 # ============================================================================
 
-def test_full_accuracy(batch_size=1, num_heads=8, chunk_size=256, seq_len=256, head_dim=64, topk=32, seed=42):
-    """
-    测试完整流程精度 (Full版本)
+@dataclass
+class TestConfig:
+    """测试配置"""
+    name: str
+    batch_size: int = 1
+    num_heads: int = 8
+    chunk_size: int = 256
+    seq_len: int = 256
+    head_dim: int = 64
+    topk: int = 32
+    seed: int = 42
     
-    Args:
-        batch_size: 批次大小
-        num_heads: 注意力头数
-        chunk_size: 当前chunk的query长度
-        seq_len: 完整序列长度 (KV cache的长度)
-        head_dim: 每个头的维度
-        topk: 每个query位置选择的top-k个key
-        seed: 随机种子
-    """
-    torch.manual_seed(seed)
-    device = 'cuda'
-    scaling = 1.0 / (head_dim ** 0.5)
+    def __str__(self):
+        return (f"batch={self.batch_size}, heads={self.num_heads}, "
+                f"chunk={self.chunk_size}, seq={self.seq_len}, "
+                f"dim={self.head_dim}, topk={self.topk}")
+
+
+def run_single_accuracy_test(config: TestConfig, device: str = 'cuda'):
+    """运行单个精度测试"""
+    torch.manual_seed(config.seed)
+    scaling = 1.0 / (config.head_dim ** 0.5)
     
     # query: [batch, num_heads, chunk_size, head_dim]
-    query = torch.randn(batch_size, num_heads, chunk_size, head_dim, device=device, dtype=torch.bfloat16)
+    query = torch.randn(config.batch_size, config.num_heads, config.chunk_size, 
+                        config.head_dim, device=device, dtype=torch.bfloat16)
     # key: [batch, seq_len, head_dim]
-    key = torch.randn(batch_size, seq_len, head_dim, device=device, dtype=torch.bfloat16)
+    key = torch.randn(config.batch_size, config.seq_len, config.head_dim, 
+                      device=device, dtype=torch.bfloat16)
     
     # Full版本: index_score是 [batch, chunk_size, seq_len]
-    index_score_full = torch.randn(batch_size, chunk_size, seq_len, device=device, dtype=torch.bfloat16)
+    index_score_full = torch.randn(config.batch_size, config.chunk_size, config.seq_len, 
+                                   device=device, dtype=torch.bfloat16)
     
     # 从index_score生成mask和indices
-    # chunk_offset: 当前chunk在完整序列中的起始位置
-    chunk_offset = seq_len - chunk_size
-    index_mask, topk_indices = generate_index_mask_from_score(index_score_full, topk, device, chunk_offset=chunk_offset)
+    chunk_offset = config.seq_len - config.chunk_size
+    index_mask, topk_indices = generate_index_mask_from_score(
+        index_score_full, config.topk, device, chunk_offset=chunk_offset)
     
     # 从full index_score中gather出sparse index_score给Triton kernel使用
     index_score_sparse = torch.gather(index_score_full, dim=-1, index=topk_indices)
@@ -470,13 +481,52 @@ def test_full_accuracy(batch_size=1, num_heads=8, chunk_size=256, seq_len=256, h
     ref = pytorch_reference(query, key, index_score_full, index_mask, scaling)
     
     # Triton Sparse版本 (传入 chunk_offset)
-    tri = compute_index_loss_sparse(query, key, index_score_sparse, topk_indices, scaling, chunk_offset=chunk_offset)
+    tri = compute_index_loss_sparse(query, key, index_score_sparse, topk_indices, 
+                                     scaling, chunk_offset=chunk_offset)
     
     abs_diff = abs(ref.item() - tri.item())
-    rel_diff = abs_diff / (abs(ref.item()) + 1e-10)  # 相对误差
+    rel_diff = abs_diff / (abs(ref.item()) + 1e-10)
     passed = rel_diff < 1e-3
-    print(f"Accuracy - PyTorch(Full): {ref.item():.6f}, Triton(Sparse): {tri.item():.6f}, RelDiff: {rel_diff:.6e}, Pass: {passed}")
-    return passed
+    
+    return {
+        'config': config,
+        'ref': ref.item(),
+        'tri': tri.item(),
+        'abs_diff': abs_diff,
+        'rel_diff': rel_diff,
+        'passed': passed
+    }
+
+
+def test_full_accuracy(configs: List[TestConfig]):
+    """
+    批量运行精度测试
+    
+    Args:
+        configs: 测试配置列表
+    """
+    print("\n" + "=" * 90)
+    print("精度测试 (PyTorch Full vs Triton Sparse)")
+    print("=" * 90)
+    
+    results = []
+    for config in configs:
+        result = run_single_accuracy_test(config)
+        results.append(result)
+    
+    # 打印表格格式的结果
+    print(f"\n{'Name':<15} {'Config':<50} {'PyTorch':<12} {'Triton':<12} {'RelDiff':<12} {'Pass':<6}")
+    print("-" * 107)
+    for r in results:
+        print(f"{r['config'].name:<15} {str(r['config']):<50} "
+              f"{r['ref']:<12.4f} {r['tri']:<12.4f} {r['rel_diff']:<12.2e} {'✓' if r['passed'] else '✗':<6}")
+    
+    # 汇总
+    passed_count = sum(1 for r in results if r['passed'])
+    print("-" * 107)
+    print(f"总计: {passed_count}/{len(results)} 通过")
+    
+    return results
 
 
 def test_performance(
@@ -604,19 +654,19 @@ def test_performance(
 
 
 if __name__ == "__main__":
-    print("\n" + "=" * 70)
-    print("精度测试 (PyTorch Full vs Triton Sparse)")
-    print("=" * 70)
+    # 定义测试配置
+    accuracy_configs = [
+        TestConfig(name="小规模", batch_size=1, num_heads=4, chunk_size=32, seq_len=64, head_dim=32, topk=16),
+        TestConfig(name="中等规模", batch_size=1, num_heads=8, chunk_size=128, seq_len=256, head_dim=64, topk=64),
+        TestConfig(name="大规模", batch_size=1, num_heads=16, chunk_size=512, seq_len=1024, head_dim=128, topk=256),
+        TestConfig(name="多batch", batch_size=4, num_heads=8, chunk_size=64, seq_len=128, head_dim=64, topk=32),
+        TestConfig(name="大head_dim", batch_size=1, num_heads=8, chunk_size=128, seq_len=256, head_dim=256, topk=64),
+    ]
     
-    print("\n[小规模测试]")
-    test_full_accuracy(batch_size=1, num_heads=4, chunk_size=32, seq_len=64, head_dim=32, topk=16)
+    # 运行精度测试
+    test_full_accuracy(accuracy_configs)
     
-    print("\n[中等规模测试]")
-    test_full_accuracy(batch_size=1, num_heads=8, chunk_size=128, seq_len=256, head_dim=64, topk=64)
-    
-    print("\n[大规模测试]")
-    test_full_accuracy(batch_size=1, num_heads=16, chunk_size=512, seq_len=1024, head_dim=128, topk=256)
-    
+    # 性能测试
     print("\n")
     test_performance(
         batch_size=1,
