@@ -366,6 +366,7 @@ def test_performance(
     seed: int = 42,
     num_warmup: int = 10,
     num_benchmark: int = 50,
+    triton_only: bool = False,
 ):
     """
     性能测试
@@ -380,6 +381,7 @@ def test_performance(
         seed: 随机种子
         num_warmup: 预热次数
         num_benchmark: 测试次数
+        triton_only: 只测试Triton kernel，跳过PyTorch参考实现 (避免OOM或加速测试)
     
     数据形状:
         query: [batch, num_heads, chunk_size, head_dim]
@@ -394,12 +396,13 @@ def test_performance(
     scaling = 1.0 / (head_dim ** 0.5)
     
     print("=" * 70)
-    print("Triton Sparse vs PyTorch Full 性能测试")
+    print("Triton Sparse 性能测试" if triton_only else "Triton Sparse vs PyTorch Full 性能测试")
     print("=" * 70)
     print(f"参数: batch={batch_size}, heads={num_heads}, chunk={chunk_size}, seq={seq_len}, dim={head_dim}, topk={topk}")
     print(f"Sparse复杂度: O(chunk * topk * head_dim * num_heads) = O({chunk_size * topk * head_dim * num_heads:,})")
-    print(f"Full复杂度:   O(chunk * seq * head_dim * num_heads) = O({chunk_size * seq_len * head_dim * num_heads:,})")
-    print(f"理论加速比:   seq / topk = {seq_len} / {topk} = {seq_len / topk:.2f}x")
+    if not triton_only:
+        print(f"Full复杂度:   O(chunk * seq * head_dim * num_heads) = O({chunk_size * seq_len * head_dim * num_heads:,})")
+        print(f"理论加速比:   seq / topk = {seq_len} / {topk} = {seq_len / topk:.2f}x")
     print("=" * 70)
     
     # query: [batch, num_heads, chunk_size, head_dim] - 当前chunk的query
@@ -407,14 +410,30 @@ def test_performance(
     # key: [batch, seq_len, head_dim] - 完整序列的key (KV cache)
     key = torch.randn(batch_size, seq_len, head_dim, device=device, dtype=torch.float32)
     
+    # chunk_offset: 假设当前chunk从序列末尾开始
+    chunk_offset = seq_len - chunk_size
+    
+    # # Sparse版本数据: 直接生成，避免生成 Full 版本的大矩阵
+    # if triton_only:
+    #     # 直接生成 sparse 数据，节省显存
+    #     index_score_sparse = torch.randn(batch_size, chunk_size, topk, device=device, dtype=torch.float32)
+    #     # 生成 causal 的 topk indices
+    #     topk_indices = torch.zeros(batch_size, chunk_size, topk, dtype=torch.int64, device=device)
+    #     for t in range(chunk_size):
+    #         global_pos = chunk_offset + t
+    #         valid_range = global_pos + 1
+    #         if valid_range >= topk:
+    #             for b in range(batch_size):
+    #                 perm = torch.randperm(valid_range, device=device)[:topk]
+    #                 topk_indices[b, t] = perm
+    #         else:
+    #             base = torch.arange(valid_range, device=device)
+    #             extra = torch.randint(0, max(1, valid_range), (topk - valid_range,), device=device)
+    #             topk_indices[:, t] = torch.cat([base, extra]).unsqueeze(0).expand(batch_size, -1)
+    # else:
     # Full版本数据: index_score [batch, chunk_size, seq_len]
     index_score_full = torch.randn(batch_size, chunk_size, seq_len, device=device, dtype=torch.float32)
-    # 从index_score中选择topk，生成mask和indices
-    # chunk_offset: 假设当前chunk从序列末尾开始 (seq_len - chunk_size)，这样可以attend到前面所有位置
-    chunk_offset = seq_len - chunk_size
     index_mask, topk_indices = generate_index_mask_from_score(index_score_full, topk, device, chunk_offset=chunk_offset)
-    
-    # Sparse版本数据
     index_score_sparse = torch.gather(index_score_full, dim=-1, index=topk_indices)
     
     results = {}
@@ -431,21 +450,25 @@ def test_performance(
     triton_time = (time.time() - start) / num_benchmark * 1000
     results['triton_sparse'] = triton_time
     
-    # Test 2: PyTorch reference (Full)
-    for _ in range(num_warmup):
-        _ = pytorch_reference(query, key, index_score_full, index_mask, scaling)
-    torch.cuda.synchronize()
-    
-    start = time.time()
-    for _ in range(num_benchmark):
-        _ = pytorch_reference(query, key, index_score_full, index_mask, scaling)
-    torch.cuda.synchronize()
-    pytorch_time = (time.time() - start) / num_benchmark * 1000
-    results['pytorch_full'] = pytorch_time
+    # Test 2: PyTorch reference (Full) - 仅当 triton_only=False 时执行
+    if not triton_only:
+        for _ in range(num_warmup):
+            _ = pytorch_reference(query, key, index_score_full, index_mask, scaling)
+        torch.cuda.synchronize()
+        
+        start = time.time()
+        for _ in range(num_benchmark):
+            _ = pytorch_reference(query, key, index_score_full, index_mask, scaling)
+        torch.cuda.synchronize()
+        pytorch_time = (time.time() - start) / num_benchmark * 1000
+        results['pytorch_full'] = pytorch_time
     
     print(f"\n>>> 性能结果 (warmup={num_warmup}, iters={num_benchmark})")
-    print(f"  PyTorch Full ref:      {pytorch_time:.3f} ms")
-    print(f"  Triton Sparse fused:   {triton_time:.3f} ms (加速: {pytorch_time/triton_time:.2f}x)")
+    if triton_only:
+        print(f"  Triton Sparse fused:   {triton_time:.3f} ms")
+    else:
+        print(f"  PyTorch Full ref:      {pytorch_time:.3f} ms")
+        print(f"  Triton Sparse fused:   {triton_time:.3f} ms (加速: {pytorch_time/triton_time:.2f}x)")
     
     return results
 
@@ -474,4 +497,5 @@ if __name__ == "__main__":
         topk=2048,
         num_warmup=2,
         num_benchmark=3,
+        triton_only=True,  # 只测试Triton，避免PyTorch Full版本OOM
     )
