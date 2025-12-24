@@ -1,0 +1,45 @@
+ID,Estimated Speedup [%],Function Name,Demangled Name,Runtime Improvement [ns],# Registers [register/thread],Grid Size,Block Size [block],Result Type
+0,0.00,distribution_elementwise_grid_stride_kernel,..distribution_elementwise_grid_stride_kernel..,n/a,44,"  624,    1,    1","  256,    1,    1",Kernel: SIMT
+1,0.00,distribution_elementwise_grid_stride_kernel,..distribution_elementwise_grid_stride_kernel..,n/a,44,"  624,    1,    1","  256,    1,    1",Kernel: SIMT
+2,0.00,distribution_elementwise_grid_stride_kernel,..distribution_elementwise_grid_stride_kernel..,n/a,44,"  624,    1,    1","  256,    1,    1",Kernel: SIMT
+3,0.00,elementwise_kernel_with_index,..elementwise_kernel_with_index..,n/a,16,"   64,    1,    1","   64,    1,    1",Kernel: SIMT
+4,0.00,vectorized_elementwise_kernel,..CUDAFunctorOnSelf_add..,n/a,38,"    4,    1,    1","  128,    1,    1",Kernel: SIMT
+5,0.00,elementwise_kernel_with_index,..elementwise_kernel_with_index..,n/a,16,"  128,    1,    1","   64,    1,    1",Kernel: SIMT
+6,0.00,elementwise_kernel,..gpu_kernel_impl_nocast..,n/a,18,"65536,    1,    1","  128,    1,    1",Kernel: SIMT
+7,0.00,vectorized_elementwise_kernel,..masked_fill_kernel..,n/a,32,"32768,    1,    1","  128,    1,    1",Kernel: SIMT
+8,0.00,fill,..mbtopk::fill..T1..,n/a,16,"    8,    1,    1","  512,    1,    1",Kernel: SIMT
+9,0.00,radixFindKthValues,..radixFindKthValues..,n/a,20," 4096,    1,    1","  256,    1,    1",Kernel: SIMT
+10,0.00,computeBlockwiseWithinKCounts,..computeBlockwiseWithinKCounts..,n/a,32," 4096,    1,    1","  256,    1,    1",Kernel: SIMT
+11,0.00,radixFindKthValues,..radixFindKthValues..,n/a,20," 4096,    1,    1","  256,    1,    1",Kernel: SIMT
+12,0.00,computeBlockwiseWithinKCounts,..computeBlockwiseWithinKCounts..,n/a,32," 4096,    1,    1","  256,    1,    1",Kernel: SIMT
+13,0.00,radixFindKthValues,..radixFindKthValues..,n/a,20," 4096,    1,    1","  256,    1,    1",Kernel: SIMT
+14,0.00,computeBlockwiseWithinKCounts,..computeBlockwiseWithinKCounts..,n/a,32," 4096,    1,    1","  256,    1,    1",Kernel: SIMT
+15,0.00,radixFindKthValues,..radixFindKthValues..,n/a,20," 4096,    1,    1","  256,    1,    1",Kernel: SIMT
+16,0.00,computeBlockwiseWithinKCounts,..computeBlockwiseWithinKCounts..,n/a,32," 4096,    1,    1","  256,    1,    1",Kernel: SIMT
+17,0.00,computeBlockwiseKthCounts,..computeBlockwiseKthCounts..,n/a,18,"   16,    1,    1","  256,    1,    1",Kernel: SIMT
+18,0.00,DeviceScanByKeyInitKernel,..DeviceScanByKeyInitKernel..,n/a,16,"    1,    1,    1","  128,    1,    1",Kernel: SIMT
+19,0.00,DeviceScanByKeyKernel,..DeviceScanByKeyKernel..,n/a,55,"    2,    1,    1","  288,    1,    1",Kernel: SIMT
+20,0.00,DeviceScanByKeyInitKernel,..DeviceScanByKeyInitKernel..,n/a,16,"    1,    1,    1","  128,    1,    1",Kernel: SIMT
+21,0.00,DeviceScanByKeyKernel,..DeviceScanByKeyKernel..,n/a,55,"    2,    1,    1","  288,    1,    1",Kernel: SIMT
+22,0.00,gatherTopK,..gatherTopK..TensorInfo..,n/a,32," 4096,    1,    1","  256,    1,    1",Kernel: SIMT
+23,0.00,radixSortKVInPlace,..radixSortKVInPlace..,n/a,194," 4096,    1,    1","   64,    1,    1",Kernel: SIMT
+24,0.00,vectorized_elementwise_kernel,..vectorized_elementwise_kernel..,n/a,16,"16384,    1,    1","  128,    1,    1",Kernel: SIMT
+25,0.00,_scatter_gather_elementwise_kernel,.._cuda_scatter_fill_internal_kernel..,n/a,32," 8192,    1,    1","  128,    1,    1",Kernel: SIMT
+26,0.00,vectorized_elementwise_kernel,..logical_or_kernel_cuda..,n/a,32,"32768,    1,    1","  128,    1,    1",Kernel: SIMT
+27,0.00,_scatter_gather_elementwise_kernel,.._cuda_scatter_gather_internal_kernel..,n/a,32," 8192,    1,    1","  128,    1,    1",Kernel: SIMT
+28,0.00,vectorized_elementwise_kernel,..vectorized_elementwise_kernel..,n/a,16,"    4,    1,    1","  128,    1,    1",Kernel: SIMT
+29,0.00,_sparse_attn_loss_fused_kernel,_sparse_attn_loss_fused_kernel,n/a,32," 4096,    1,    1","  256,    1,    1",Kernel: SIMT
+30,0.00,reduce_kernel,..reduce_kernel..func_wrapper_t..,n/a,32,"    1,    1,    1","  512,    1,    1",Kernel: SIMT
+31,0.00,vectorized_elementwise_kernel,..BUnaryFunctor..binary_internal..,n/a,32,"    1,    1,    1","  128,    1,    1",Kernel: SIMT
+32,0.00,vectorized_elementwise_kernel,..vectorized_elementwise_kernel..,n/a,16,"    4,    1,    1","  128,    1,    1",Kernel: SIMT
+33,0.00,_sparse_attn_loss_fused_kernel,_sparse_attn_loss_fused_kernel,n/a,32," 4096,    1,    1","  256,    1,    1",Kernel: SIMT
+34,0.00,reduce_kernel,..reduce_kernel..func_wrapper_t..,n/a,32,"    1,    1,    1","  512,    1,    1",Kernel: SIMT
+35,0.00,vectorized_elementwise_kernel,..BUnaryFunctor..binary_internal..,n/a,32,"    1,    1,    1","  128,    1,    1",Kernel: SIMT
+36,0.00,vectorized_elementwise_kernel,..vectorized_elementwise_kernel..,n/a,16,"    4,    1,    1","  128,    1,    1",Kernel: SIMT
+37,0.00,_sparse_attn_loss_fused_kernel,_sparse_attn_loss_fused_kernel,n/a,32," 4096,    1,    1","  256,    1,    1",Kernel: SIMT
+38,0.00,reduce_kernel,..reduce_kernel..func_wrapper_t..,n/a,32,"    1,    1,    1","  512,    1,    1",Kernel: SIMT
+39,0.00,vectorized_elementwise_kernel,..BUnaryFunctor..binary_internal..,n/a,32,"    1,    1,    1","  128,    1,    1",Kernel: SIMT
+40,0.00,vectorized_elementwise_kernel,..vectorized_elementwise_kernel..,n/a,16,"    4,    1,    1","  128,    1,    1",Kernel: SIMT
+41,0.00,_sparse_attn_loss_fused_kernel,_sparse_attn_loss_fused_kernel,n/a,32," 4096,    1,    1","  256,    1,    1",Kernel: SIMT
+42,0.00,reduce_kernel,..reduce_kernel..func_wrapper_t..,n/a,32,"    1,    1,    1","  512,    1,    1",Kernel: SIMT
+43,0.00,vectorized_elementwise_kernel,..BUnaryFunctor..binary_internal..,n/a,32,"    1,    1,    1","  128,    1,    1",Kernel: SIMT
