@@ -20,15 +20,15 @@ NUM_WARPS = 8
 
 
 # ============================================================================
-# Fused Kernel: Sparse Attention + Loss (完全融合版本)
+# Fused Kernel: Sparse Attention + Loss (优化编译时间版本)
 # ============================================================================
 
 @triton.jit
 def _sparse_attn_loss_fused_kernel(
     Q_ptr, K_ptr, IndexScore_ptr, Indices_ptr, Loss_ptr,
-    batch_size, num_heads: tl.constexpr, seq_len,
+    batch_size, num_heads, seq_len,  # num_heads 改为非 constexpr，避免循环展开
     head_dim: tl.constexpr,
-    topk: tl.constexpr,
+    topk: tl.constexpr,  # topk 保持 constexpr 以保证正确性
     scaling,
     eps: tl.constexpr,
     # Strides for Q: [batch, num_heads, seq_len, head_dim]
@@ -42,14 +42,15 @@ def _sparse_attn_loss_fused_kernel(
     BLOCK_D: tl.constexpr,
 ):
     """
-    完全融合的 Sparse Attention + Loss Kernel
+    完全融合的 Sparse Attention + Loss Kernel (优化编译时间版本)
     
-    单个kernel完成:
-    1. 对每个head计算sparse attention softmax
-    2. 累加所有heads的attention scores
-    3. 归一化得到attention分布
-    4. 计算index_score的softmax
-    5. 计算KL散度loss
+    优化策略:
+    1. num_heads 使用动态 range，避免 16 次循环展开
+    2. topk 保持 constexpr 以保证 softmax 归一化正确性
+    
+    编译时间优化效果:
+    - 原版: num_heads=16 时循环完全展开，代码膨胀 16 倍
+    - 优化后: 循环不展开，编译时间大幅减少
     
     输出: 每个(batch, row)位置的loss值
     """
@@ -68,41 +69,41 @@ def _sparse_attn_loss_fused_kernel(
     idx_base = Indices_ptr + pid_batch * stride_ib + pid_row * stride_is
     is_base = IndexScore_ptr + pid_batch * stride_isb + pid_row * stride_iss
     
-    # 加载indices [topk]
+    # 加载 indices [topk]
     indices = tl.load(idx_base + offs_topk * stride_ik).to(tl.int64)
     
-    # Causal mask: indices > current_row 的位置需要mask
+    # Causal mask: indices > current_row 的位置需要 mask
     causal_mask = indices > pid_row
     
     # =========================================================================
-    # Part 1: 累加所有heads的attention scores
+    # Part 1: 累加所有 heads 的 attention scores
     # =========================================================================
     attn_sum = tl.zeros([topk], dtype=tl.float32)
     
-    # 对每个head循环
-    for h in tl.static_range(num_heads):
+    # 对每个 head 循环 (使用动态 range，不展开循环)
+    for h in range(num_heads):
         q_base = q_batch_base + h * stride_qh + pid_row * stride_qs
         
-        # 计算QK^T - 分块处理head_dim
+        # 计算 QK^T - 分块处理 head_dim
         qk = tl.zeros([topk], dtype=tl.float32)
         
-        num_d_blocks = (head_dim + BLOCK_D - 1) // BLOCK_D
+        num_d_blocks = tl.cdiv(head_dim, BLOCK_D)
         for d_idx in range(num_d_blocks):
             d_start = d_idx * BLOCK_D
             offs_d = d_start + tl.arange(0, BLOCK_D)
             d_mask = offs_d < head_dim
             
-            # 加载Q chunk: [BLOCK_D]
+            # 加载 Q chunk: [BLOCK_D]
             q = tl.load(q_base + offs_d * stride_qd, mask=d_mask, other=0.0).to(tl.float32)
             
-            # 批量load K: [topk, BLOCK_D]
+            # 批量 load K: [topk, BLOCK_D]
             k_ptrs = k_batch_base + indices[:, None] * stride_ks + offs_d[None, :] * stride_kd
             k_gathered = tl.load(k_ptrs, mask=d_mask[None, :], other=0.0).to(tl.float32)
             
             # 向量化点积: q[d] * k_gathered[topk, d] -> sum over d -> [topk]
             qk += tl.sum(q[None, :] * k_gathered, axis=1)
         
-        # 应用scaling和causal mask
+        # 应用 scaling 和 causal mask
         qk = qk * scaling
         qk = tl.where(causal_mask, NEG_INF, qk)
         
@@ -115,18 +116,18 @@ def _sparse_attn_loss_fused_kernel(
         p = p / l
         p = tl.where(causal_mask, 0.0, p)
         
-        # 累加到attn_sum
+        # 累加到 attn_sum
         attn_sum += p
     
     # =========================================================================
-    # Part 2: 归一化attention分布
+    # Part 2: 归一化 attention 分布
     # =========================================================================
     attn_total = tl.sum(attn_sum)
     attn_total = tl.where(attn_total < eps, 1.0, attn_total)
     attn_dist = attn_sum / attn_total + eps
     
     # =========================================================================
-    # Part 3: 计算index_score的softmax
+    # Part 3: 计算 index_score 的 softmax
     # =========================================================================
     is_val = tl.load(is_base + offs_topk * stride_isk)
     is_val = tl.where(causal_mask, NEG_INF, is_val)
@@ -139,13 +140,13 @@ def _sparse_attn_loss_fused_kernel(
     index_prob = p_is / s_is + eps
     
     # =========================================================================
-    # Part 4: 计算KL散度
+    # Part 4: 计算 KL 散度
     # =========================================================================
     kl = attn_dist * (tl.log(attn_dist) - tl.log(index_prob))
     kl = tl.where(causal_mask, 0.0, kl)
     kl_sum = tl.sum(kl)
     
-    # 写出loss
+    # 写出 loss
     tl.store(Loss_ptr + pid_batch * seq_len + pid_row, kl_sum)
 
 
@@ -167,6 +168,10 @@ def compute_index_loss_sparse(query, key, index_score, indices, scaling, eps=1e-
     
     Returns:
         loss: 标量loss值
+    
+    编译时间优化:
+        - num_heads 使用动态循环，不展开，大幅减少编译时间
+        - topk 保持 constexpr 以保证正确性
     """
     batch_size, num_heads, seq_len, head_dim = query.shape
     topk = indices.shape[-1]
@@ -402,9 +407,9 @@ if __name__ == "__main__":
     test_performance(
         batch_size=1,
         num_heads=16,
-        seq_len=4096,
-        head_dim=256,
-        topk=512,
+        seq_len=8 * 1024,
+        head_dim=512,
+        topk=2048,
         num_warmup=2,
         num_benchmark=3,
     )
