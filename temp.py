@@ -11,6 +11,7 @@ import torch
 import triton
 import triton.language as tl
 import torch.nn.functional as F
+import pandas as pd
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -514,17 +515,27 @@ def test_full_accuracy(configs: List[TestConfig]):
         result = run_single_accuracy_test(config)
         results.append(result)
     
-    # 打印表格格式的结果
-    print(f"\n{'Name':<15} {'Config':<50} {'PyTorch':<12} {'Triton':<12} {'RelDiff':<12} {'Pass':<6}")
-    print("-" * 107)
-    for r in results:
-        print(f"{r['config'].name:<15} {str(r['config']):<50} "
-              f"{r['ref']:<12.4f} {r['tri']:<12.4f} {r['rel_diff']:<12.2e} {'✓' if r['passed'] else '✗':<6}")
+    # 使用 pandas 打印表格
+    df = pd.DataFrame([
+        {
+            'Name': r['config'].name,
+            'Config': str(r['config']),
+            'PyTorch': f"{r['ref']:.4f}",
+            'Triton': f"{r['tri']:.4f}",
+            'RelDiff': f"{r['rel_diff']:.2e}",
+            'Pass': '✓' if r['passed'] else '✗'
+        }
+        for r in results
+    ])
+    
+    # 设置 pandas 显示选项
+    pd.set_option('display.max_colwidth', None)
+    pd.set_option('display.width', None)
+    print(f"\n{df.to_string(index=False)}")
     
     # 汇总
     passed_count = sum(1 for r in results if r['passed'])
-    print("-" * 107)
-    print(f"总计: {passed_count}/{len(results)} 通过")
+    print(f"\n总计: {passed_count}/{len(results)} 通过")
     
     return results
 
