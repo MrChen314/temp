@@ -26,23 +26,27 @@ NUM_WARPS = 8
 @triton.jit
 def _sparse_attn_loss_fused_kernel(
     Q_ptr, K_ptr, IndexScore_ptr, Indices_ptr, Loss_ptr,
-    batch_size, num_heads, seq_len,  # num_heads 改为非 constexpr，避免循环展开
+    batch_size, num_heads, chunk_size,  # num_heads 改为非 constexpr，避免循环展开
     head_dim: tl.constexpr,
     topk: tl.constexpr,  # topk 保持 constexpr 以保证正确性
     scaling,
     eps: tl.constexpr,
-    # Strides for Q: [batch, num_heads, seq_len, head_dim]
+    # Strides for Q: [batch, num_heads, chunk_size, head_dim]
     stride_qb, stride_qh, stride_qs, stride_qd,
-    # Strides for K: [batch, seq_len, head_dim]
+    # Strides for K: [batch, kv_len, head_dim] (kv_len 通过 indices 隐式处理)
     stride_kb, stride_ks, stride_kd,
-    # Strides for IndexScore: [batch, seq_len, topk]
+    # Strides for IndexScore: [batch, chunk_size, topk]
     stride_isb, stride_iss, stride_isk,
-    # Strides for Indices: [batch, seq_len, topk]
+    # Strides for Indices: [batch, chunk_size, topk]
     stride_ib, stride_is, stride_ik,
     BLOCK_D: tl.constexpr,
 ):
     """
     完全融合的 Sparse Attention + Loss Kernel (优化编译时间版本)
+    
+    支持分块注意力场景:
+    - chunk_size: 当前chunk的query数量
+    - kv_len: key的完整长度 (通过indices间接访问，无需显式传入)
     
     优化策略:
     1. num_heads 使用动态 range，避免 16 次循环展开
@@ -52,11 +56,11 @@ def _sparse_attn_loss_fused_kernel(
     - 原版: num_heads=16 时循环完全展开，代码膨胀 16 倍
     - 优化后: 循环不展开，编译时间大幅减少
     
-    输出: 每个(batch, row)位置的loss值
+    输出: 每个(batch, query_row)位置的loss值
     """
     pid = tl.program_id(0)
-    pid_batch = pid // seq_len
-    pid_row = pid % seq_len
+    pid_batch = pid // chunk_size
+    pid_row = pid % chunk_size  # 当前处理的query行
     
     NEG_INF = -1e9
     
@@ -147,7 +151,7 @@ def _sparse_attn_loss_fused_kernel(
     kl_sum = tl.sum(kl)
     
     # 写出 loss
-    tl.store(Loss_ptr + pid_batch * seq_len + pid_row, kl_sum)
+    tl.store(Loss_ptr + pid_batch * chunk_size + pid_row, kl_sum)
 
 
 # ============================================================================
@@ -158,11 +162,13 @@ def compute_index_loss_sparse(query, key, index_score, indices, scaling, eps=1e-
     """
     Sparse版本的完整loss计算 (H20优化, 完全融合版本)
     
+    支持分块注意力场景: chunk_size (query长度) 可以不等于 kv_len (key长度)
+    
     Args:
-        query: [batch, num_heads, seq_len, head_dim]
-        key: [batch, seq_len, head_dim]
-        index_score: [batch, seq_len, topk]
-        indices: [batch, seq_len, topk]
+        query: [batch, num_heads, chunk_size, head_dim] - 当前chunk的query
+        key: [batch, kv_len, head_dim] - 完整的key (KV cache)
+        index_score: [batch, chunk_size, topk] - sparse版本的index分数
+        indices: [batch, chunk_size, topk] - 每个query选择的topk个key索引
         scaling: attention scaling factor
         eps: 数值稳定epsilon
     
@@ -173,7 +179,7 @@ def compute_index_loss_sparse(query, key, index_score, indices, scaling, eps=1e-
         - num_heads 使用动态循环，不展开，大幅减少编译时间
         - topk 保持 constexpr 以保证正确性
     """
-    batch_size, num_heads, seq_len, head_dim = query.shape
+    batch_size, num_heads, chunk_size, head_dim = query.shape
     topk = indices.shape[-1]
     
     query = query.contiguous()
@@ -181,15 +187,15 @@ def compute_index_loss_sparse(query, key, index_score, indices, scaling, eps=1e-
     index_score = index_score.contiguous()
     indices = indices.contiguous().to(torch.int64)
     
-    # 输出: 每行的loss
-    loss_per_row = torch.zeros(batch_size, seq_len, device=query.device, dtype=torch.float32)
+    # 输出: 每行(每个query位置)的loss
+    loss_per_row = torch.zeros(batch_size, chunk_size, device=query.device, dtype=torch.float32)
     
-    # 每个program处理一个(batch, row)
-    grid = (batch_size * seq_len,)
+    # 每个program处理一个(batch, query_row)
+    grid = (batch_size * chunk_size,)
     
     _sparse_attn_loss_fused_kernel[grid](
         query, key, index_score, indices, loss_per_row,
-        batch_size, num_heads, seq_len, head_dim, topk, scaling, eps,
+        batch_size, num_heads, chunk_size, head_dim, topk, scaling, eps,
         query.stride(0), query.stride(1), query.stride(2), query.stride(3),
         key.stride(0), key.stride(1), key.stride(2),
         index_score.stride(0), index_score.stride(1), index_score.stride(2),
@@ -208,11 +214,13 @@ def compute_index_loss_sparse(query, key, index_score, indices, scaling, eps=1e-
 def pytorch_reference(query, key, index_score, index_mask, scaling):
     """完整的PyTorch参考实现 (Full版本)
     
+    支持分块注意力场景: chunk_size (query长度) 可以不等于 kv_len (key长度)
+    
     Args:
-        query: [batch, num_heads, seq_len, head_dim]
-        key: [batch, seq_len, head_dim]
-        index_score: [batch, seq_len, seq_len]
-        index_mask: [batch, 1, seq_len, seq_len] - True表示需要mask的位置
+        query: [batch, num_heads, chunk_size, head_dim] - 当前chunk的query
+        key: [batch, kv_len, head_dim] - 完整的key (KV cache)
+        index_score: [batch, chunk_size, kv_len] - 每个query对所有key的分数
+        index_mask: [batch, 1, chunk_size, kv_len] - True表示需要mask的位置
         scaling: attention scaling factor
     
     Returns:
@@ -244,26 +252,32 @@ def pytorch_reference(query, key, index_score, index_mask, scaling):
 # 测试辅助函数
 # ============================================================================
 
-def generate_index_mask_from_score(index_score, topk, device='cuda'):
+def generate_index_mask_from_score(index_score, topk, device='cuda', chunk_offset=0):
     """
     从index_score生成index_mask和topk_indices
     
+    用于分块注意力计算场景:
+    - chunk_size: 当前chunk的query长度
+    - seq_len: 完整序列的key长度 (KV cache长度)
+    
     Args:
-        index_score: [batch, seq_len, seq_len]
-        topk: topk的数量
+        index_score: [batch, chunk_size, seq_len] - 每个query位置对所有key位置的分数
+        topk: 每个query位置选择的top-k个key
         device: 设备
+        chunk_offset: 当前chunk在完整序列中的起始位置 (用于causal mask)
     
     Returns:
-        index_mask: [batch, 1, seq_len, seq_len] - True表示需要mask的位置
-        topk_indices: [batch, seq_len, topk]
+        index_mask: [batch, 1, chunk_size, seq_len] - True表示需要mask的位置
+        topk_indices: [batch, chunk_size, topk] - 每个query选择的topk个key的索引
     """
-    batch_size, seq_len, _ = index_score.shape
+    batch_size, chunk_size, seq_len = index_score.shape
     
-    # 创建causal mask (上三角为True)
-    causal_mask = torch.triu(
-        torch.ones(seq_len, seq_len, device=device), 
-        diagonal=1
-    ).bool()
+    # 创建causal mask: query位置 i 只能看到 key位置 <= chunk_offset + i
+    # 对于 chunk 内的第 i 个 query，其全局位置是 chunk_offset + i
+    # 它只能 attend 到 key 位置 j，其中 j <= chunk_offset + i
+    query_positions = chunk_offset + torch.arange(chunk_size, device=device).view(-1, 1)
+    key_positions = torch.arange(seq_len, device=device).view(1, -1)
+    causal_mask = key_positions > query_positions  # [chunk_size, seq_len]
     
     # 对index_score应用causal mask
     causal_index_score = index_score.masked_fill(causal_mask, float('-inf'))
@@ -281,7 +295,7 @@ def generate_index_mask_from_score(index_score, topk, device='cuda'):
     # 与causal_mask合并
     index_mask = torch.logical_or(index_mask, causal_mask)
     
-    # 添加head维度: [batch, 1, seq_len, seq_len]
+    # 添加head维度: [batch, 1, chunk_size, seq_len]
     index_mask = index_mask.unsqueeze(1)
     
     return index_mask, topk_indices
@@ -291,20 +305,35 @@ def generate_index_mask_from_score(index_score, topk, device='cuda'):
 # 测试函数
 # ============================================================================
 
-def test_full_accuracy(batch_size=1, num_heads=8, seq_len=256, head_dim=64, topk=32, seed=42):
-    """测试完整流程精度 (Full版本)"""
+def test_full_accuracy(batch_size=1, num_heads=8, chunk_size=256, seq_len=256, head_dim=64, topk=32, seed=42):
+    """
+    测试完整流程精度 (Full版本)
+    
+    Args:
+        batch_size: 批次大小
+        num_heads: 注意力头数
+        chunk_size: 当前chunk的query长度
+        seq_len: 完整序列长度 (KV cache的长度)
+        head_dim: 每个头的维度
+        topk: 每个query位置选择的top-k个key
+        seed: 随机种子
+    """
     torch.manual_seed(seed)
     device = 'cuda'
     scaling = 1.0 / (head_dim ** 0.5)
     
-    query = torch.randn(batch_size, num_heads, seq_len, head_dim, device=device, dtype=torch.float32)
+    # query: [batch, num_heads, chunk_size, head_dim]
+    query = torch.randn(batch_size, num_heads, chunk_size, head_dim, device=device, dtype=torch.float32)
+    # key: [batch, seq_len, head_dim]
     key = torch.randn(batch_size, seq_len, head_dim, device=device, dtype=torch.float32)
     
-    # Full版本: index_score是 [batch, seq_len, seq_len]
-    index_score_full = torch.randn(batch_size, seq_len, seq_len, device=device, dtype=torch.float32)
+    # Full版本: index_score是 [batch, chunk_size, seq_len]
+    index_score_full = torch.randn(batch_size, chunk_size, seq_len, device=device, dtype=torch.float32)
     
     # 从index_score生成mask和indices
-    index_mask, topk_indices = generate_index_mask_from_score(index_score_full, topk, device)
+    # chunk_offset: 当前chunk在完整序列中的起始位置
+    chunk_offset = seq_len - chunk_size
+    index_mask, topk_indices = generate_index_mask_from_score(index_score_full, topk, device, chunk_offset=chunk_offset)
     
     # 从full index_score中gather出sparse index_score给Triton kernel使用
     index_score_sparse = torch.gather(index_score_full, dim=-1, index=topk_indices)
@@ -332,7 +361,26 @@ def test_performance(
     num_warmup: int = 10,
     num_benchmark: int = 50,
 ):
-    """性能测试"""
+    """
+    性能测试
+    
+    Args:
+        batch_size: 批次大小
+        num_heads: 注意力头数
+        chunk_size: 当前chunk的query长度 (通常 chunk_size <= seq_len)
+        seq_len: 完整序列长度 (KV cache的长度)
+        head_dim: 每个头的维度
+        topk: 每个query位置选择的top-k个key
+        seed: 随机种子
+        num_warmup: 预热次数
+        num_benchmark: 测试次数
+    
+    数据形状:
+        query: [batch, num_heads, chunk_size, head_dim]
+        key: [batch, seq_len, head_dim]
+        index_score: [batch, chunk_size, seq_len] -> sparse: [batch, chunk_size, topk]
+        indices: [batch, chunk_size, topk]
+    """
     import time
     
     torch.manual_seed(seed)
@@ -342,17 +390,23 @@ def test_performance(
     print("=" * 70)
     print("Triton Sparse vs PyTorch Full 性能测试")
     print("=" * 70)
-    print(f"参数: batch={batch_size}, heads={num_heads}, seq={seq_len}, dim={head_dim}, topk={topk}")
-    print(f"Sparse复杂度: O(seq * topk * head_dim * num_heads) = O({seq_len * topk * head_dim * num_heads:,})")
-    print(f"Full复杂度:   O(seq * seq * head_dim * num_heads) = O({seq_len * seq_len * head_dim * num_heads:,})")
+    print(f"参数: batch={batch_size}, heads={num_heads}, chunk={chunk_size}, seq={seq_len}, dim={head_dim}, topk={topk}")
+    print(f"Sparse复杂度: O(chunk * topk * head_dim * num_heads) = O({chunk_size * topk * head_dim * num_heads:,})")
+    print(f"Full复杂度:   O(chunk * seq * head_dim * num_heads) = O({chunk_size * seq_len * head_dim * num_heads:,})")
+    print(f"理论加速比:   seq / topk = {seq_len} / {topk} = {seq_len / topk:.2f}x")
     print("=" * 70)
     
+    # query: [batch, num_heads, chunk_size, head_dim] - 当前chunk的query
     query = torch.randn(batch_size, num_heads, chunk_size, head_dim, device=device, dtype=torch.float32)
+    # key: [batch, seq_len, head_dim] - 完整序列的key (KV cache)
     key = torch.randn(batch_size, seq_len, head_dim, device=device, dtype=torch.float32)
     
-    # Full版本数据
+    # Full版本数据: index_score [batch, chunk_size, seq_len]
     index_score_full = torch.randn(batch_size, chunk_size, seq_len, device=device, dtype=torch.float32)
-    index_mask, topk_indices = generate_index_mask_from_score(index_score_full, topk, device)
+    # 从index_score中选择topk，生成mask和indices
+    # chunk_offset: 假设当前chunk从序列末尾开始 (seq_len - chunk_size)，这样可以attend到前面所有位置
+    chunk_offset = seq_len - chunk_size
+    index_mask, topk_indices = generate_index_mask_from_score(index_score_full, topk, device, chunk_offset=chunk_offset)
     
     # Sparse版本数据
     index_score_sparse = torch.gather(index_score_full, dim=-1, index=topk_indices)
@@ -396,13 +450,13 @@ if __name__ == "__main__":
     print("=" * 70)
     
     print("\n[小规模测试]")
-    test_full_accuracy(batch_size=1, num_heads=4, seq_len=64, head_dim=32, topk=16)
+    test_full_accuracy(batch_size=1, num_heads=4, chunk_size=32, seq_len=64, head_dim=32, topk=16)
     
     print("\n[中等规模测试]")
-    test_full_accuracy(batch_size=1, num_heads=8, seq_len=256, head_dim=64, topk=64)
+    test_full_accuracy(batch_size=1, num_heads=8, chunk_size=128, seq_len=256, head_dim=64, topk=64)
     
     print("\n[大规模测试]")
-    test_full_accuracy(batch_size=1, num_heads=16, seq_len=1024, head_dim=128, topk=256)
+    test_full_accuracy(batch_size=1, num_heads=16, chunk_size=512, seq_len=1024, head_dim=128, topk=256)
     
     print("\n")
     test_performance(
