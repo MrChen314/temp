@@ -503,7 +503,7 @@ def test_performance(
     
     # 记录基准显存 (输入数据分配后)
     torch.cuda.synchronize()
-    base_memory = torch.cuda.memory_allocated() / (1024**2)  # MB
+    base_memory = torch.cuda.memory_allocated() / (1024**3)  # GB
     
     # Test 1: Triton fused kernel (Sparse) - 带显存监控
     torch.cuda.reset_peak_memory_stats()
@@ -518,7 +518,7 @@ def test_performance(
         _ = compute_index_loss_sparse(query, key, index_score_sparse, topk_indices, scaling, chunk_offset=chunk_offset)
     torch.cuda.synchronize()
     triton_time = (time.time() - start) / num_benchmark * 1000
-    triton_peak_memory = torch.cuda.max_memory_allocated() / (1024**2)  # MB
+    triton_peak_memory = torch.cuda.max_memory_allocated() / (1024**3)  # GB
     results['triton_sparse'] = triton_time
     memory_stats['triton_sparse'] = triton_peak_memory
     
@@ -539,7 +539,7 @@ def test_performance(
             _ = pytorch_reference(query, key, index_score_full, index_mask, scaling)
         torch.cuda.synchronize()
         pytorch_time = (time.time() - start) / num_benchmark * 1000
-        pytorch_peak_memory = torch.cuda.max_memory_allocated() / (1024**2)  # MB
+        pytorch_peak_memory = torch.cuda.max_memory_allocated() / (1024**3)  # GB
         results['pytorch_full'] = pytorch_time
         memory_stats['pytorch_full'] = pytorch_peak_memory
     
@@ -551,11 +551,11 @@ def test_performance(
         print(f"  Triton Sparse fused:   {triton_time:.3f} ms (加速: {pytorch_time/triton_time:.2f}x)")
     
     print(f"\n>>> 显存峰值")
-    print(f"  基准显存 (输入数据):    {base_memory:.1f} MB")
-    print(f"  Triton Sparse 峰值:    {memory_stats['triton_sparse']:.1f} MB (增量: {memory_stats['triton_sparse'] - base_memory:.1f} MB)")
+    print(f"  基准显存 (输入数据):    {base_memory:.2f} GB")
+    print(f"  Triton Sparse 峰值:    {memory_stats['triton_sparse']:.2f} GB (增量: {memory_stats['triton_sparse'] - base_memory:.2f} GB)")
     if not triton_only:
-        print(f"  PyTorch Full 峰值:     {memory_stats['pytorch_full']:.1f} MB (增量: {memory_stats['pytorch_full'] - base_memory:.1f} MB)")
-        print(f"  显存节省:              {memory_stats['pytorch_full'] - memory_stats['triton_sparse']:.1f} MB ({(1 - memory_stats['triton_sparse']/memory_stats['pytorch_full'])*100:.1f}%)")
+        print(f"  PyTorch Full 峰值:     {memory_stats['pytorch_full']:.2f} GB (增量: {memory_stats['pytorch_full'] - base_memory:.2f} GB)")
+        print(f"  显存节省:              {memory_stats['pytorch_full'] - memory_stats['triton_sparse']:.2f} GB ({(1 - memory_stats['triton_sparse']/memory_stats['pytorch_full'])*100:.1f}%)")
     
     results['memory'] = memory_stats
     return results
