@@ -556,7 +556,7 @@ def test_performance(
 
 
 # ============================================================================
-# 性能分析：拆分 Kernel 各部分
+# 性能分析：拆分 Kernel 各部分 (与 Online Softmax 版本对应)
 # ============================================================================
 
 @triton.jit
@@ -567,30 +567,40 @@ def _profile_load_only_kernel(
     stride_kb, stride_ks, stride_kd,
     stride_ib, stride_is, stride_ik,
     BLOCK_D: tl.constexpr,
+    BLOCK_TOPK: tl.constexpr,
 ):
-    """Profile: 只测试数据加载"""
+    """Profile: 只测试数据加载 (BLOCK_TOPK 分块版本)"""
     pid = tl.program_id(0)
     pid_batch = pid // chunk_size
     pid_row = pid % chunk_size
     
-    offs_topk = tl.arange(0, topk)
     k_batch_base = K_ptr + pid_batch * stride_kb
     idx_base = Indices_ptr + pid_batch * stride_ib + pid_row * stride_is
     
-    indices = tl.load(idx_base + offs_topk * stride_ik).to(tl.int64)
+    num_topk_blocks = tl.cdiv(topk, BLOCK_TOPK)
+    acc_total = 0.0
     
-    acc = tl.zeros([topk], dtype=tl.float32)
-    num_d_blocks = tl.cdiv(head_dim, BLOCK_D)
-    for d_idx in range(num_d_blocks):
-        d_start = d_idx * BLOCK_D
-        offs_d = d_start + tl.arange(0, BLOCK_D)
-        d_mask = offs_d < head_dim
+    for tk_idx in range(num_topk_blocks):
+        tk_start = tk_idx * BLOCK_TOPK
+        offs_tk = tk_start + tl.arange(0, BLOCK_TOPK)
+        tk_mask = offs_tk < topk
         
-        k_ptrs = k_batch_base + indices[:, None] * stride_ks + offs_d[None, :] * stride_kd
-        k_gathered = tl.load(k_ptrs, mask=d_mask[None, :], other=0.0).to(tl.float32)
-        acc += tl.sum(k_gathered, axis=1)
+        indices_block = tl.load(idx_base + offs_tk * stride_ik, mask=tk_mask, other=0).to(tl.int64)
+        
+        acc = tl.zeros([BLOCK_TOPK], dtype=tl.float32)
+        num_d_blocks = tl.cdiv(head_dim, BLOCK_D)
+        for d_idx in range(num_d_blocks):
+            d_start = d_idx * BLOCK_D
+            offs_d = d_start + tl.arange(0, BLOCK_D)
+            d_mask = offs_d < head_dim
+            
+            k_ptrs = k_batch_base + indices_block[:, None] * stride_ks + offs_d[None, :] * stride_kd
+            k_gathered = tl.load(k_ptrs, mask=tk_mask[:, None] & d_mask[None, :], other=0.0).to(tl.float32)
+            acc += tl.sum(k_gathered, axis=1)
+        
+        acc_total += tl.sum(acc)
     
-    tl.store(Output_ptr + pid, tl.sum(acc))
+    tl.store(Output_ptr + pid, acc_total)
 
 
 @triton.jit
@@ -602,43 +612,49 @@ def _profile_qk_only_kernel(
     stride_kb, stride_ks, stride_kd,
     stride_ib, stride_is, stride_ik,
     BLOCK_D: tl.constexpr,
+    BLOCK_TOPK: tl.constexpr,
 ):
-    """Profile: 测试 QK 计算（不含 softmax）"""
+    """Profile: 测试 QK 计算 (BLOCK_TOPK 分块版本，不含 softmax)"""
     pid = tl.program_id(0)
     pid_batch = pid // chunk_size
     pid_row = pid % chunk_size
     
-    offs_topk = tl.arange(0, topk)
     q_batch_base = Q_ptr + pid_batch * stride_qb
     k_batch_base = K_ptr + pid_batch * stride_kb
     idx_base = Indices_ptr + pid_batch * stride_ib + pid_row * stride_is
     
-    indices = tl.load(idx_base + offs_topk * stride_ik).to(tl.int64)
-    
-    acc = tl.zeros([topk], dtype=tl.float32)
+    num_topk_blocks = tl.cdiv(topk, BLOCK_TOPK)
+    acc_total = 0.0
     
     for h in range(num_heads):
         q_base = q_batch_base + h * stride_qh + pid_row * stride_qs
-        qk = tl.zeros([topk], dtype=tl.float32)
         
-        num_d_blocks = tl.cdiv(head_dim, BLOCK_D)
-        for d_idx in range(num_d_blocks):
-            d_start = d_idx * BLOCK_D
-            offs_d = d_start + tl.arange(0, BLOCK_D)
-            d_mask = offs_d < head_dim
+        for tk_idx in range(num_topk_blocks):
+            tk_start = tk_idx * BLOCK_TOPK
+            offs_tk = tk_start + tl.arange(0, BLOCK_TOPK)
+            tk_mask = offs_tk < topk
             
-            q = tl.load(q_base + offs_d * stride_qd, mask=d_mask, other=0.0).to(tl.float32)
-            k_ptrs = k_batch_base + indices[:, None] * stride_ks + offs_d[None, :] * stride_kd
-            k_gathered = tl.load(k_ptrs, mask=d_mask[None, :], other=0.0).to(tl.float32)
-            qk += tl.sum(q[None, :] * k_gathered, axis=1)
-        
-        acc += qk * scaling
+            indices_block = tl.load(idx_base + offs_tk * stride_ik, mask=tk_mask, other=0).to(tl.int64)
+            
+            qk = tl.zeros([BLOCK_TOPK], dtype=tl.float32)
+            num_d_blocks = tl.cdiv(head_dim, BLOCK_D)
+            for d_idx in range(num_d_blocks):
+                d_start = d_idx * BLOCK_D
+                offs_d = d_start + tl.arange(0, BLOCK_D)
+                d_mask = offs_d < head_dim
+                
+                q = tl.load(q_base + offs_d * stride_qd, mask=d_mask, other=0.0).to(tl.float32)
+                k_ptrs = k_batch_base + indices_block[:, None] * stride_ks + offs_d[None, :] * stride_kd
+                k_gathered = tl.load(k_ptrs, mask=tk_mask[:, None] & d_mask[None, :], other=0.0).to(tl.float32)
+                qk += tl.sum(q[None, :] * k_gathered, axis=1)
+            
+            acc_total += tl.sum(qk * scaling)
     
-    tl.store(Output_ptr + pid, tl.sum(acc))
+    tl.store(Output_ptr + pid, acc_total)
 
 
 @triton.jit
-def _profile_qk_softmax_kernel(
+def _profile_online_softmax_pass1_kernel(
     Q_ptr, K_ptr, Indices_ptr, Output_ptr,
     batch_size, num_heads, chunk_size, chunk_offset,
     head_dim: tl.constexpr, topk: tl.constexpr, scaling,
@@ -646,53 +662,170 @@ def _profile_qk_softmax_kernel(
     stride_kb, stride_ks, stride_kd,
     stride_ib, stride_is, stride_ik,
     BLOCK_D: tl.constexpr,
+    BLOCK_TOPK: tl.constexpr,
 ):
-    """Profile: 测试 QK + Softmax（不含 KL）"""
+    """Profile: Online Softmax Pass 1 - 计算全局 max 和 sum"""
     pid = tl.program_id(0)
     pid_batch = pid // chunk_size
     pid_row = pid % chunk_size
     NEG_INF = -1e9
     
-    offs_topk = tl.arange(0, topk)
     q_batch_base = Q_ptr + pid_batch * stride_qb
     k_batch_base = K_ptr + pid_batch * stride_kb
     idx_base = Indices_ptr + pid_batch * stride_ib + pid_row * stride_is
-    
-    indices = tl.load(idx_base + offs_topk * stride_ik).to(tl.int64)
     global_query_pos = chunk_offset + pid_row
-    causal_mask = indices > global_query_pos
+    num_topk_blocks = tl.cdiv(topk, BLOCK_TOPK)
     
-    attn_sum = tl.zeros([topk], dtype=tl.float32)
+    acc = 0.0
     
     for h in range(num_heads):
         q_base = q_batch_base + h * stride_qh + pid_row * stride_qs
-        qk = tl.zeros([topk], dtype=tl.float32)
         
-        num_d_blocks = tl.cdiv(head_dim, BLOCK_D)
-        for d_idx in range(num_d_blocks):
-            d_start = d_idx * BLOCK_D
-            offs_d = d_start + tl.arange(0, BLOCK_D)
-            d_mask = offs_d < head_dim
+        # Online Softmax Pass 1: 计算全局 max 和 sum
+        m_global = NEG_INF
+        l_global = 0.0
+        
+        for tk_idx in range(num_topk_blocks):
+            tk_start = tk_idx * BLOCK_TOPK
+            offs_tk = tk_start + tl.arange(0, BLOCK_TOPK)
+            tk_mask = offs_tk < topk
             
-            q = tl.load(q_base + offs_d * stride_qd, mask=d_mask, other=0.0).to(tl.float32)
-            k_ptrs = k_batch_base + indices[:, None] * stride_ks + offs_d[None, :] * stride_kd
-            k_gathered = tl.load(k_ptrs, mask=d_mask[None, :], other=0.0).to(tl.float32)
-            qk += tl.sum(q[None, :] * k_gathered, axis=1)
+            indices_block = tl.load(idx_base + offs_tk * stride_ik, mask=tk_mask, other=0).to(tl.int64)
+            causal_mask_block = (indices_block > global_query_pos) | (~tk_mask)
+            
+            qk = tl.zeros([BLOCK_TOPK], dtype=tl.float32)
+            num_d_blocks = tl.cdiv(head_dim, BLOCK_D)
+            for d_idx in range(num_d_blocks):
+                d_start = d_idx * BLOCK_D
+                offs_d = d_start + tl.arange(0, BLOCK_D)
+                d_mask = offs_d < head_dim
+                
+                q = tl.load(q_base + offs_d * stride_qd, mask=d_mask, other=0.0).to(tl.float32)
+                k_ptrs = k_batch_base + indices_block[:, None] * stride_ks + offs_d[None, :] * stride_kd
+                k_gathered = tl.load(k_ptrs, mask=tk_mask[:, None] & d_mask[None, :], other=0.0).to(tl.float32)
+                qk += tl.sum(q[None, :] * k_gathered, axis=1)
+            
+            qk = qk * scaling
+            qk = tl.where(causal_mask_block, NEG_INF, qk)
+            
+            # Online softmax update
+            m_block = tl.max(qk)
+            m_new = tl.maximum(m_global, m_block)
+            l_global = l_global * tl.exp(m_global - m_new) + tl.sum(tl.exp(qk - m_new))
+            m_global = m_new
         
-        qk = qk * scaling
-        qk = tl.where(causal_mask, NEG_INF, qk)
-        
-        m = tl.max(qk)
-        m = tl.where(m == NEG_INF, 0.0, m)
-        p = tl.exp(qk - m)
-        l = tl.sum(p)
-        l = tl.where(l < 1e-9, 1.0, l)
-        p = p / l
-        p = tl.where(causal_mask, 0.0, p)
-        
-        attn_sum += p
+        acc += m_global + tl.log(l_global + 1e-9)
     
-    tl.store(Output_ptr + pid, tl.sum(attn_sum))
+    tl.store(Output_ptr + pid, acc)
+
+
+@triton.jit
+def _profile_online_softmax_full_kernel(
+    Q_ptr, K_ptr, Indices_ptr, AttnSum_ptr, Output_ptr,
+    batch_size, num_heads, chunk_size, chunk_offset,
+    head_dim: tl.constexpr, topk: tl.constexpr, scaling,
+    stride_qb, stride_qh, stride_qs, stride_qd,
+    stride_kb, stride_ks, stride_kd,
+    stride_ib, stride_is, stride_ik,
+    stride_asb, stride_ass, stride_ask,
+    BLOCK_D: tl.constexpr,
+    BLOCK_TOPK: tl.constexpr,
+):
+    """Profile: Online Softmax 完整流程 (Pass 1 + Pass 2，不含 KL)"""
+    pid = tl.program_id(0)
+    pid_batch = pid // chunk_size
+    pid_row = pid % chunk_size
+    NEG_INF = -1e9
+    
+    q_batch_base = Q_ptr + pid_batch * stride_qb
+    k_batch_base = K_ptr + pid_batch * stride_kb
+    idx_base = Indices_ptr + pid_batch * stride_ib + pid_row * stride_is
+    attn_sum_base = AttnSum_ptr + pid_batch * stride_asb + pid_row * stride_ass
+    global_query_pos = chunk_offset + pid_row
+    num_topk_blocks = tl.cdiv(topk, BLOCK_TOPK)
+    
+    for h in range(num_heads):
+        q_base = q_batch_base + h * stride_qh + pid_row * stride_qs
+        
+        # Pass 1: 计算全局 max 和 sum
+        m_global = NEG_INF
+        l_global = 0.0
+        
+        for tk_idx in range(num_topk_blocks):
+            tk_start = tk_idx * BLOCK_TOPK
+            offs_tk = tk_start + tl.arange(0, BLOCK_TOPK)
+            tk_mask = offs_tk < topk
+            
+            indices_block = tl.load(idx_base + offs_tk * stride_ik, mask=tk_mask, other=0).to(tl.int64)
+            causal_mask_block = (indices_block > global_query_pos) | (~tk_mask)
+            
+            qk = tl.zeros([BLOCK_TOPK], dtype=tl.float32)
+            num_d_blocks = tl.cdiv(head_dim, BLOCK_D)
+            for d_idx in range(num_d_blocks):
+                d_start = d_idx * BLOCK_D
+                offs_d = d_start + tl.arange(0, BLOCK_D)
+                d_mask = offs_d < head_dim
+                
+                q = tl.load(q_base + offs_d * stride_qd, mask=d_mask, other=0.0).to(tl.float32)
+                k_ptrs = k_batch_base + indices_block[:, None] * stride_ks + offs_d[None, :] * stride_kd
+                k_gathered = tl.load(k_ptrs, mask=tk_mask[:, None] & d_mask[None, :], other=0.0).to(tl.float32)
+                qk += tl.sum(q[None, :] * k_gathered, axis=1)
+            
+            qk = qk * scaling
+            qk = tl.where(causal_mask_block, NEG_INF, qk)
+            
+            m_block = tl.max(qk)
+            m_new = tl.maximum(m_global, m_block)
+            l_global = l_global * tl.exp(m_global - m_new) + tl.sum(tl.exp(qk - m_new))
+            m_global = m_new
+        
+        m_global = tl.where(m_global == NEG_INF, 0.0, m_global)
+        l_global = tl.where(l_global < 1e-9, 1.0, l_global)
+        
+        # Pass 2: 计算归一化概率并累加
+        for tk_idx in range(num_topk_blocks):
+            tk_start = tk_idx * BLOCK_TOPK
+            offs_tk = tk_start + tl.arange(0, BLOCK_TOPK)
+            tk_mask = offs_tk < topk
+            
+            indices_block = tl.load(idx_base + offs_tk * stride_ik, mask=tk_mask, other=0).to(tl.int64)
+            causal_mask_block = (indices_block > global_query_pos) | (~tk_mask)
+            
+            qk = tl.zeros([BLOCK_TOPK], dtype=tl.float32)
+            num_d_blocks = tl.cdiv(head_dim, BLOCK_D)
+            for d_idx in range(num_d_blocks):
+                d_start = d_idx * BLOCK_D
+                offs_d = d_start + tl.arange(0, BLOCK_D)
+                d_mask = offs_d < head_dim
+                
+                q = tl.load(q_base + offs_d * stride_qd, mask=d_mask, other=0.0).to(tl.float32)
+                k_ptrs = k_batch_base + indices_block[:, None] * stride_ks + offs_d[None, :] * stride_kd
+                k_gathered = tl.load(k_ptrs, mask=tk_mask[:, None] & d_mask[None, :], other=0.0).to(tl.float32)
+                qk += tl.sum(q[None, :] * k_gathered, axis=1)
+            
+            qk = qk * scaling
+            qk = tl.where(causal_mask_block, NEG_INF, qk)
+            
+            p = tl.exp(qk - m_global) / l_global
+            p = tl.where(causal_mask_block, 0.0, p)
+            
+            attn_sum_ptrs = attn_sum_base + offs_tk * stride_ask
+            if h == 0:
+                tl.store(attn_sum_ptrs, p, mask=tk_mask)
+            else:
+                old_val = tl.load(attn_sum_ptrs, mask=tk_mask, other=0.0)
+                tl.store(attn_sum_ptrs, old_val + p, mask=tk_mask)
+    
+    # 计算 attn_sum 总和
+    attn_total = 0.0
+    for tk_idx in range(num_topk_blocks):
+        tk_start = tk_idx * BLOCK_TOPK
+        offs_tk = tk_start + tl.arange(0, BLOCK_TOPK)
+        tk_mask = offs_tk < topk
+        attn_sum_block = tl.load(attn_sum_base + offs_tk * stride_ask, mask=tk_mask, other=0.0)
+        attn_total += tl.sum(attn_sum_block)
+    
+    tl.store(Output_ptr + pid, attn_total)
 
 
 def profile_kernel_parts(
@@ -700,25 +833,28 @@ def profile_kernel_parts(
     head_dim=512, topk=2048, num_warmup=3, num_iters=10
 ):
     """
-    分步 Profile 各部分耗时
+    分步 Profile 各部分耗时 (Online Softmax + BLOCK_TOPK 分块版本)
     
     测试内容:
-    1. 只加载 K (gather 操作)
-    2. QK 计算 (不含 softmax)
-    3. QK + Softmax (不含 KL)
-    4. 完整 kernel
+    1. 只加载 K (gather 操作, BLOCK_TOPK 分块)
+    2. QK 计算 (BLOCK_TOPK 分块, 不含 softmax)
+    3. Online Softmax Pass 1 (计算全局 max/sum)
+    4. Online Softmax 完整 (Pass 1 + Pass 2, 不含 KL)
+    5. 完整 kernel (含 KL 计算)
     """
     import time
     
     device = 'cuda'
     scaling = 1.0 / (head_dim ** 0.5)
     chunk_offset = seq_len - chunk_size
+    block_topk = min(BLOCK_TOPK, topk)
     
     print("=" * 70)
-    print("Kernel 各部分耗时分析")
+    print("Kernel 各部分耗时分析 (Online Softmax + BLOCK_TOPK 分块版本)")
     print("=" * 70)
     print(f"参数: batch={batch_size}, heads={num_heads}, chunk={chunk_size}")
     print(f"       seq={seq_len}, dim={head_dim}, topk={topk}")
+    print(f"       BLOCK_TOPK={block_topk}, BLOCK_D={BLOCK_D}")
     print("=" * 70)
     
     # 准备数据
@@ -741,19 +877,20 @@ def profile_kernel_parts(
             indices[:, t] = torch.cat([base, extra]).unsqueeze(0).expand(batch_size, -1)
     
     output = torch.zeros(batch_size * chunk_size, device=device, dtype=torch.float32)
+    attn_sum = torch.zeros(batch_size, chunk_size, topk, device=device, dtype=torch.float32)
     grid = (batch_size * chunk_size,)
     
     results = {}
     
-    # Test 1: 只加载 K
-    print("\n[1] 只加载 K (gather 操作)...")
+    # Test 1: 只加载 K (BLOCK_TOPK 分块)
+    print("\n[1] 只加载 K (gather, BLOCK_TOPK 分块)...")
     for _ in range(num_warmup):
         _profile_load_only_kernel[grid](
             key, indices, output,
             batch_size, chunk_size, chunk_offset, head_dim, topk,
             key.stride(0), key.stride(1), key.stride(2),
             indices.stride(0), indices.stride(1), indices.stride(2),
-            BLOCK_D=BLOCK_D, num_warps=NUM_WARPS,
+            BLOCK_D=BLOCK_D, BLOCK_TOPK=block_topk, num_warps=NUM_WARPS,
         )
     torch.cuda.synchronize()
     
@@ -764,14 +901,14 @@ def profile_kernel_parts(
             batch_size, chunk_size, chunk_offset, head_dim, topk,
             key.stride(0), key.stride(1), key.stride(2),
             indices.stride(0), indices.stride(1), indices.stride(2),
-            BLOCK_D=BLOCK_D, num_warps=NUM_WARPS,
+            BLOCK_D=BLOCK_D, BLOCK_TOPK=block_topk, num_warps=NUM_WARPS,
         )
     torch.cuda.synchronize()
     results['load_k'] = (time.time() - start) / num_iters * 1000
     print(f"    耗时: {results['load_k']:.3f} ms")
     
-    # Test 2: QK 计算
-    print("\n[2] QK 计算 (不含 softmax)...")
+    # Test 2: QK 计算 (BLOCK_TOPK 分块)
+    print("\n[2] QK 计算 (BLOCK_TOPK 分块, 不含 softmax)...")
     for _ in range(num_warmup):
         _profile_qk_only_kernel[grid](
             query, key, indices, output,
@@ -779,7 +916,7 @@ def profile_kernel_parts(
             query.stride(0), query.stride(1), query.stride(2), query.stride(3),
             key.stride(0), key.stride(1), key.stride(2),
             indices.stride(0), indices.stride(1), indices.stride(2),
-            BLOCK_D=BLOCK_D, num_warps=NUM_WARPS,
+            BLOCK_D=BLOCK_D, BLOCK_TOPK=block_topk, num_warps=NUM_WARPS,
         )
     torch.cuda.synchronize()
     
@@ -791,44 +928,71 @@ def profile_kernel_parts(
             query.stride(0), query.stride(1), query.stride(2), query.stride(3),
             key.stride(0), key.stride(1), key.stride(2),
             indices.stride(0), indices.stride(1), indices.stride(2),
-            BLOCK_D=BLOCK_D, num_warps=NUM_WARPS,
+            BLOCK_D=BLOCK_D, BLOCK_TOPK=block_topk, num_warps=NUM_WARPS,
         )
     torch.cuda.synchronize()
     results['qk_only'] = (time.time() - start) / num_iters * 1000
     print(f"    耗时: {results['qk_only']:.3f} ms")
     
-    # Test 3: QK + Softmax
-    print("\n[3] QK + Softmax (不含 KL)...")
+    # Test 3: Online Softmax Pass 1
+    print("\n[3] Online Softmax Pass 1 (计算全局 max/sum)...")
     for _ in range(num_warmup):
-        _profile_qk_softmax_kernel[grid](
+        _profile_online_softmax_pass1_kernel[grid](
             query, key, indices, output,
             batch_size, num_heads, chunk_size, chunk_offset, head_dim, topk, scaling,
             query.stride(0), query.stride(1), query.stride(2), query.stride(3),
             key.stride(0), key.stride(1), key.stride(2),
             indices.stride(0), indices.stride(1), indices.stride(2),
-            BLOCK_D=BLOCK_D, num_warps=NUM_WARPS,
+            BLOCK_D=BLOCK_D, BLOCK_TOPK=block_topk, num_warps=NUM_WARPS,
         )
     torch.cuda.synchronize()
     
     start = time.time()
     for _ in range(num_iters):
-        _profile_qk_softmax_kernel[grid](
+        _profile_online_softmax_pass1_kernel[grid](
             query, key, indices, output,
             batch_size, num_heads, chunk_size, chunk_offset, head_dim, topk, scaling,
             query.stride(0), query.stride(1), query.stride(2), query.stride(3),
             key.stride(0), key.stride(1), key.stride(2),
             indices.stride(0), indices.stride(1), indices.stride(2),
-            BLOCK_D=BLOCK_D, num_warps=NUM_WARPS,
+            BLOCK_D=BLOCK_D, BLOCK_TOPK=block_topk, num_warps=NUM_WARPS,
         )
     torch.cuda.synchronize()
-    results['qk_softmax'] = (time.time() - start) / num_iters * 1000
-    print(f"    耗时: {results['qk_softmax']:.3f} ms")
+    results['softmax_pass1'] = (time.time() - start) / num_iters * 1000
+    print(f"    耗时: {results['softmax_pass1']:.3f} ms")
     
-    # Test 4: 完整 kernel (Online Softmax 版本)
-    print("\n[4] 完整 Kernel (Online Softmax)...")
+    # Test 4: Online Softmax 完整 (Pass 1 + Pass 2)
+    print("\n[4] Online Softmax 完整 (Pass 1 + Pass 2, 不含 KL)...")
+    for _ in range(num_warmup):
+        _profile_online_softmax_full_kernel[grid](
+            query, key, indices, attn_sum, output,
+            batch_size, num_heads, chunk_size, chunk_offset, head_dim, topk, scaling,
+            query.stride(0), query.stride(1), query.stride(2), query.stride(3),
+            key.stride(0), key.stride(1), key.stride(2),
+            indices.stride(0), indices.stride(1), indices.stride(2),
+            attn_sum.stride(0), attn_sum.stride(1), attn_sum.stride(2),
+            BLOCK_D=BLOCK_D, BLOCK_TOPK=block_topk, num_warps=NUM_WARPS,
+        )
+    torch.cuda.synchronize()
+    
+    start = time.time()
+    for _ in range(num_iters):
+        _profile_online_softmax_full_kernel[grid](
+            query, key, indices, attn_sum, output,
+            batch_size, num_heads, chunk_size, chunk_offset, head_dim, topk, scaling,
+            query.stride(0), query.stride(1), query.stride(2), query.stride(3),
+            key.stride(0), key.stride(1), key.stride(2),
+            indices.stride(0), indices.stride(1), indices.stride(2),
+            attn_sum.stride(0), attn_sum.stride(1), attn_sum.stride(2),
+            BLOCK_D=BLOCK_D, BLOCK_TOPK=block_topk, num_warps=NUM_WARPS,
+        )
+    torch.cuda.synchronize()
+    results['softmax_full'] = (time.time() - start) / num_iters * 1000
+    print(f"    耗时: {results['softmax_full']:.3f} ms")
+    
+    # Test 5: 完整 kernel (Online Softmax + KL)
+    print("\n[5] 完整 Kernel (Online Softmax + KL)...")
     loss_per_row = torch.zeros(batch_size, chunk_size, device=device, dtype=torch.float32)
-    attn_sum = torch.zeros(batch_size, chunk_size, topk, device=device, dtype=torch.float32)
-    block_topk = min(BLOCK_TOPK, topk)
     for _ in range(num_warmup):
         _sparse_attn_loss_fused_kernel[grid](
             query, key, index_score, indices, loss_per_row,
@@ -864,13 +1028,15 @@ def profile_kernel_parts(
     print("\n" + "=" * 70)
     print("耗时分解分析")
     print("=" * 70)
-    print(f"  [1] 加载 K:                    {results['load_k']:.3f} ms ({results['load_k']/results['full']*100:.1f}%)")
-    print(f"  [2] QK 计算 (含加载):          {results['qk_only']:.3f} ms ({results['qk_only']/results['full']*100:.1f}%)")
-    print(f"  [3] QK + Softmax:              {results['qk_softmax']:.3f} ms ({results['qk_softmax']/results['full']*100:.1f}%)")
-    print(f"  [4] 完整 Kernel:               {results['full']:.3f} ms (100%)")
+    print(f"  [1] 加载 K:                       {results['load_k']:.3f} ms ({results['load_k']/results['full']*100:.1f}%)")
+    print(f"  [2] QK 计算:                      {results['qk_only']:.3f} ms ({results['qk_only']/results['full']*100:.1f}%)")
+    print(f"  [3] Online Softmax Pass 1:        {results['softmax_pass1']:.3f} ms ({results['softmax_pass1']/results['full']*100:.1f}%)")
+    print(f"  [4] Online Softmax 完整:          {results['softmax_full']:.3f} ms ({results['softmax_full']/results['full']*100:.1f}%)")
+    print(f"  [5] 完整 Kernel:                  {results['full']:.3f} ms (100%)")
     print("-" * 70)
-    print(f"  增量: Softmax 开销:            {results['qk_softmax'] - results['qk_only']:.3f} ms")
-    print(f"  增量: KL 开销:                 {results['full'] - results['qk_softmax']:.3f} ms")
+    print(f"  增量: Pass 2 开销:                {results['softmax_full'] - results['softmax_pass1']:.3f} ms")
+    print(f"  增量: KL 开销:                    {results['full'] - results['softmax_full']:.3f} ms")
+    print(f"  理论: Pass 1 ≈ QK + online_reduce, Pass 2 ≈ QK + normalize + store")
     
     return results
 
