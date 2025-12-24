@@ -667,6 +667,9 @@ if __name__ == "__main__":
         TestConfig(name="大规模", batch_size=1, num_heads=16, chunk_size=512, seq_len=1024, head_dim=128, topk=256),
         TestConfig(name="多batch", batch_size=4, num_heads=8, chunk_size=64, seq_len=128, head_dim=64, topk=32),
         TestConfig(name="大head_dim", batch_size=1, num_heads=8, chunk_size=128, seq_len=256, head_dim=256, topk=64),
+        TestConfig(name="大规模", batch_size=1, num_heads=128, chunk_size=4096, seq_len=4096, head_dim=576, topk=2048),
+        TestConfig(name="大规模", batch_size=1, num_heads=128, chunk_size=4096, seq_len=8192, head_dim=576, topk=2048),
+        TestConfig(name="大规模", batch_size=1, num_heads=128, chunk_size=8192, seq_len=8192, head_dim=576, topk=2048),
     ]
     
     # 运行精度测试
@@ -679,7 +682,7 @@ if __name__ == "__main__":
         num_heads=128,
         chunk_size=4 * 1024,
         seq_len=8 * 1024,
-        head_dim=512,
+        head_dim=576,
         topk=2048,
         num_warmup=1,
         num_benchmark=3,
