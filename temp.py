@@ -93,8 +93,8 @@ def _sparse_attn_loss_fused_kernel(
         # Pass 1: 计算全局 max 和 sum (Online Softmax) - 每个 head 独立
         # -----------------------------------------------------------------
         # m_global, l_global: [BLOCK_H] - 每个 head 一个值
-        m_global = tl.full([BLOCK_H], NEG_INF, dtype=tl.float32)
-        l_global = tl.zeros([BLOCK_H], dtype=tl.float32)
+        m_global = tl.full([BLOCK_H], NEG_INF, dtype=tl.bfloat16)
+        l_global = tl.zeros([BLOCK_H], dtype=tl.bfloat16)
         
         for tk_idx in range(num_topk_blocks):
             tk_start = tk_idx * BLOCK_TOPK
@@ -106,7 +106,7 @@ def _sparse_attn_loss_fused_kernel(
             causal_mask_block = (indices_block > global_query_pos) | (~tk_mask)  # [BLOCK_TOPK]
             
             # 分块计算 QK (支持 head_dim > BLOCK_D)
-            qk = tl.zeros([BLOCK_TOPK, BLOCK_H], dtype=tl.float32)
+            qk = tl.zeros([BLOCK_TOPK, BLOCK_H], dtype=tl.bfloat16)
             num_d_blocks = tl.cdiv(head_dim, BLOCK_D)
             for d_idx in range(num_d_blocks):
                 d_start = d_idx * BLOCK_D
@@ -122,7 +122,7 @@ def _sparse_attn_loss_fused_kernel(
                 k_gathered = tl.load(k_ptrs, mask=tk_mask[:, None] & d_block_mask[None, :], other=0.0)  # [BLOCK_TOPK, BLOCK_D]
                 
                 # 累加 QK: [BLOCK_TOPK, BLOCK_H]
-                qk += tl.dot(k_gathered, qT)
+                qk += tl.dot(k_gathered, qT).to(tl.bfloat16)
             
             qk = qk * scaling
             
@@ -133,18 +133,18 @@ def _sparse_attn_loss_fused_kernel(
             qk = tl.where(invalid_mask, NEG_INF, qk)  # [BLOCK_TOPK, BLOCK_H]
             
             # Online softmax update - 对每个 head 独立
-            m_block = tl.max(qk, axis=0)  # [BLOCK_H]
+            m_block = tl.max(qk, axis=0).to(tl.bfloat16)  # [BLOCK_H]
             m_new = tl.maximum(m_global, m_block)  # [BLOCK_H]
             # 修正旧的 sum，并加上新块的 exp
             # 关键修复: 在exp之后将无效位置显式设为0，避免 exp(NEG_INF - NEG_INF) = 1 的问题
-            exp_qk = tl.exp(qk - m_new[None, :])
+            exp_qk = tl.exp(qk - m_new[None, :]).to(tl.bfloat16)
             exp_qk = tl.where(invalid_mask, 0.0, exp_qk)
-            l_global = l_global * tl.exp(m_global - m_new) + tl.sum(exp_qk, axis=0)
+            l_global = l_global * tl.exp(m_global - m_new).to(tl.bfloat16) + tl.sum(exp_qk, axis=0).to(tl.bfloat16)
             m_global = m_new
         
         # 处理全 NEG_INF 情况
-        m_global = tl.where(m_global == NEG_INF, 0.0, m_global)  # [BLOCK_H]
-        l_global = tl.where(l_global < 1e-9, 1.0, l_global)  # [BLOCK_H]
+        m_global = tl.where(m_global == NEG_INF, 0.0, m_global).to(tl.bfloat16)  # [BLOCK_H]
+        l_global = tl.where(l_global < 1e-9, 1.0, l_global).to(tl.bfloat16)  # [BLOCK_H]
         
         # -----------------------------------------------------------------
         # Pass 2: 使用全局 max/sum 计算归一化概率，累加到 attn_sum
@@ -158,7 +158,7 @@ def _sparse_attn_loss_fused_kernel(
             causal_mask_block = (indices_block > global_query_pos) | (~tk_mask)  # [BLOCK_TOPK]
             
             # 分块计算 QK (支持 head_dim > BLOCK_D)
-            qk = tl.zeros([BLOCK_TOPK, BLOCK_H], dtype=tl.float32)
+            qk = tl.zeros([BLOCK_TOPK, BLOCK_H], dtype=tl.bfloat16)
             num_d_blocks = tl.cdiv(head_dim, BLOCK_D)
             for d_idx in range(num_d_blocks):
                 d_start = d_idx * BLOCK_D
@@ -174,7 +174,7 @@ def _sparse_attn_loss_fused_kernel(
                 k_gathered = tl.load(k_ptrs, mask=tk_mask[:, None] & d_block_mask[None, :], other=0.0)  # [BLOCK_TOPK, BLOCK_D]
                 
                 # 累加 QK: [BLOCK_TOPK, BLOCK_H]
-                qk += tl.dot(k_gathered, qT)
+                qk += tl.dot(k_gathered, qT).to(tl.bfloat16)
             
             qk = qk * scaling
             
@@ -183,11 +183,11 @@ def _sparse_attn_loss_fused_kernel(
             qk = tl.where(invalid_mask, NEG_INF, qk)
             
             # 使用全局 max/sum 归一化: [BLOCK_TOPK, BLOCK_H]
-            p = tl.exp(qk - m_global[None, :]) / l_global[None, :]
+            p = (tl.exp(qk - m_global[None, :]) / l_global[None, :]).to(tl.bfloat16)
             p = tl.where(invalid_mask, 0.0, p)  # 对 padding head 和 causal masked 位置设为 0
             
             # 对所有有效 head 求和: [BLOCK_TOPK]
-            p_sum = tl.sum(p, axis=1)
+            p_sum = tl.sum(p, axis=1).to(tl.bfloat16)
             
             # 累加到 attn_sum
             attn_sum_ptrs = attn_sum_base + offs_tk * stride_ask
@@ -200,8 +200,8 @@ def _sparse_attn_loss_fused_kernel(
     # =========================================================================
     # Part 2: 对 index_score 做 Online Softmax
     # =========================================================================
-    is_m_global = NEG_INF
-    is_l_global = 0.0
+    is_m_global: tl.bfloat16 = NEG_INF
+    is_l_global: tl.bfloat16 = 0.0
     
     for tk_idx in range(num_topk_blocks):
         tk_start = tk_idx * BLOCK_TOPK
@@ -214,33 +214,33 @@ def _sparse_attn_loss_fused_kernel(
         is_val = tl.load(is_base + offs_tk * stride_isk, mask=tk_mask, other=NEG_INF)
         is_val = tl.where(causal_mask_block, NEG_INF, is_val)
         
-        is_m_block = tl.max(is_val)
+        is_m_block = tl.max(is_val).to(tl.bfloat16)
         is_m_new = tl.maximum(is_m_global, is_m_block)
         # 关键修复: 在exp之后将无效位置显式设为0
-        is_exp_val = tl.exp(is_val - is_m_new)
+        is_exp_val = tl.exp(is_val - is_m_new).to(tl.bfloat16)
         is_exp_val = tl.where(causal_mask_block, 0.0, is_exp_val)
-        is_l_global = is_l_global * tl.exp(is_m_global - is_m_new) + tl.sum(is_exp_val)
+        is_l_global = is_l_global * tl.exp(is_m_global - is_m_new).to(tl.bfloat16) + tl.sum(is_exp_val).to(tl.bfloat16)
         is_m_global = is_m_new
     
-    is_m_global = tl.where(is_m_global == NEG_INF, 0.0, is_m_global)
-    is_l_global = tl.where(is_l_global < 1e-9, 1.0, is_l_global)
+    is_m_global = tl.where(is_m_global == NEG_INF, 0.0, is_m_global).to(tl.bfloat16)
+    is_l_global = tl.where(is_l_global < 1e-9, 1.0, is_l_global).to(tl.bfloat16)
     
     # =========================================================================
     # Part 3: 计算 attn_dist 和 KL 散度
     # =========================================================================
     # 先计算 attn_sum 的总和 (用于归一化)
-    attn_total = 0.0
+    attn_total: tl.bfloat16 = 0.0
     for tk_idx in range(num_topk_blocks):
         tk_start = tk_idx * BLOCK_TOPK
         offs_tk = tk_start + tl.arange(0, BLOCK_TOPK)
         tk_mask = offs_tk < topk
-        attn_sum_block = tl.load(attn_sum_base + offs_tk * stride_ask, mask=tk_mask, other=0.0)
-        attn_total += tl.sum(attn_sum_block)
+        attn_sum_block = tl.load(attn_sum_base + offs_tk * stride_ask, mask=tk_mask, other=0.0).to(tl.bfloat16)
+        attn_total += tl.sum(attn_sum_block).to(tl.bfloat16)
     
-    attn_total = tl.where(attn_total < eps, 1.0, attn_total)
+    attn_total = tl.where(attn_total < eps, 1.0, attn_total).to(tl.bfloat16)
     
     # 计算 KL 散度
-    kl_sum = 0.0
+    kl_sum: tl.bfloat16 = 0.0
     for tk_idx in range(num_topk_blocks):
         tk_start = tk_idx * BLOCK_TOPK
         offs_tk = tk_start + tl.arange(0, BLOCK_TOPK)
@@ -250,18 +250,18 @@ def _sparse_attn_loss_fused_kernel(
         causal_mask_block = (indices_block > global_query_pos) | (~tk_mask)
         
         # 加载 attn_sum 并归一化
-        attn_sum_block = tl.load(attn_sum_base + offs_tk * stride_ask, mask=tk_mask, other=0.0)
-        attn_dist = attn_sum_block / attn_total + eps
+        attn_sum_block = tl.load(attn_sum_base + offs_tk * stride_ask, mask=tk_mask, other=0.0).to(tl.bfloat16)
+        attn_dist = (attn_sum_block / attn_total + eps).to(tl.bfloat16)
         
         # 计算 index_prob
         is_val = tl.load(is_base + offs_tk * stride_isk, mask=tk_mask, other=NEG_INF)
         is_val = tl.where(causal_mask_block, NEG_INF, is_val)
-        index_prob = tl.exp(is_val - is_m_global) / is_l_global + eps
+        index_prob = (tl.exp(is_val - is_m_global) / is_l_global + eps).to(tl.bfloat16)
         
         # KL 散度
-        kl = attn_dist * (tl.log(attn_dist) - tl.log(index_prob))
+        kl = (attn_dist * (tl.log(attn_dist) - tl.log(index_prob))).to(tl.bfloat16)
         kl = tl.where(causal_mask_block, 0.0, kl)
-        kl_sum += tl.sum(kl)
+        kl_sum += tl.sum(kl).to(tl.bfloat16)
     
     # 写出 loss
     tl.store(Loss_ptr + pid_batch * chunk_size + pid_row, kl_sum)
@@ -363,6 +363,9 @@ def pytorch_reference(query, key, index_score, index_mask, scaling):
         kl_loss: 标量loss值
     """
     eps = 1e-10
+    # query = query.to(torch.float32)
+    # key = key.to(torch.float32)
+    # index_score = index_score.to(torch.float32)
     
     # 计算attention: [batch, num_heads, seq_len, seq_len]
     attn = torch.matmul(query, key.unsqueeze(1).transpose(-1, -2)) * scaling
