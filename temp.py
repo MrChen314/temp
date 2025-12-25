@@ -431,9 +431,10 @@ def test_full_accuracy(batch_size=1, num_heads=8, chunk_size=256, seq_len=256, h
     # Triton Sparse版本 (传入 chunk_offset)
     tri = compute_index_loss_sparse(query, key, index_score_sparse, topk_indices, scaling, chunk_offset=chunk_offset)
     
-    diff = abs(ref.item() - tri.item())
-    passed = diff < 1e-3
-    print(f"Accuracy - PyTorch(Full): {ref.item():.6f}, Triton(Sparse): {tri.item():.6f}, Diff: {diff:.6e}, Pass: {passed}")
+    abs_diff = abs(ref.item() - tri.item())
+    rel_diff = abs_diff / max(abs(ref.item()), 1e-10)
+    passed = rel_diff < 1e-3
+    print(f"Accuracy - PyTorch(Full): {ref.item():.6f}, Triton(Sparse): {tri.item():.6f}, AbsDiff: {abs_diff:.6e}, RelDiff: {rel_diff:.6e}, Pass: {passed}")
     return passed
 
 
