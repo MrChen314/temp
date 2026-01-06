@@ -1,16 +1,14 @@
 # ruff: noqa
 """
-TileLang 实现的 Indexer Loss Kernel - 3 线程组流水线优化版本
+TileLang 实现的 Indexer Loss Kernel - 2 线程组流水线优化版本
 
 优化点：
 1. Producer 线程组预取 K 数据，使用双缓冲隐藏 global memory 延迟
-2. Pass1 计算线程组执行 QK 计算和 Online Softmax
-3. Pass2 计算线程组执行归一化和累加
+2. 计算线程组执行 QK 计算 + Online Softmax + 归一化累加
 
-架构（参考 sparse_mla_fwd_pipelined.py）：
-- tx < 128: Pass1 计算线程组（QK 计算 + Online Softmax + 缓存 QK）
-- tx >= 128 && tx < 256: Pass2 计算线程组（归一化 + 累加到 attn_sum）
-- tx >= 256: Producer 线程组（按 indices 预取 K 数据到 shared memory）
+架构：
+- tx < 128: 计算线程组（QK 计算 + Online Softmax + 归一化累加）
+- tx >= 128: Producer 线程组（按 indices 预取 K 数据到 shared memory）
 """
 
 import torch
@@ -46,15 +44,15 @@ def indexer_loss_fwd_kernel(
     scaling,
     block_tk=64,
     block_h=16,
-    threads=384,
+    threads=256,
 ):
     """
-    TileLang 实现的 Indexer Loss Forward Kernel - 3 线程组流水线版本
+    TileLang 实现的 Indexer Loss Forward Kernel - 2 线程组版本
     
     每个 program 处理一个 (batch, query_row)。
-    对于每个 head_block，执行：
-    - Pass1: 遍历所有 topk_blocks，计算 QK 并更新 Online Softmax
-    - Pass2: 再次遍历所有 topk_blocks，使用全局 max/sum 归一化并累加
+    对于每个 head_block：
+    - Pass1: 遍历所有 topk_blocks，计算 online softmax 得到全局 m 和 l
+    - Pass2: 重新遍历，使用全局 m 和 l 计算归一化概率并累加
     
     流水线优化：Producer 线程组使用双缓冲预取 K 数据
     """
@@ -103,18 +101,17 @@ def indexer_loss_fwd_kernel(
             K_shared_0 = T.alloc_shared([BI, D], dtype)
             K_shared_1 = T.alloc_shared([BI, D], dtype)
             
-            # QK 结果缓存（用于 Pass2）: [BI, BH]
-            # 由于 shared memory 有限，我们在第二遍时重新计算 QK
-            # 这里仅缓存当前块的结果
-            QK_shared = T.alloc_shared([BI, BH], accum_dtype)
-            
             # 有效性标记双缓冲
             is_valid_0 = T.alloc_shared([BI], "bool", scope="shared")
             is_valid_1 = T.alloc_shared([BI], "bool", scope="shared")
             
-            # Online Softmax 状态（shared，供 Pass2 使用）
+            # Softmax 参数的 shared memory 版本（用于避免 layout 冲突）
+            m_new_shared = T.alloc_shared([BH], accum_dtype)
             m_global_shared = T.alloc_shared([BH], accum_dtype)
             l_global_shared = T.alloc_shared([BH], accum_dtype)
+            
+            # exp_sum 的 shared memory 缓存
+            exp_sum_shared = T.alloc_shared([BI], accum_dtype)
             
             # Fragment 分配
             acc_qk = T.alloc_fragment([BI, BH], accum_dtype)
@@ -123,21 +120,20 @@ def indexer_loss_fwd_kernel(
             m_block = T.alloc_fragment([BH], accum_dtype)
             m_new = T.alloc_fragment([BH], accum_dtype)
             alpha = T.alloc_fragment([BH], accum_dtype)
-            p_local = T.alloc_fragment([BI, BH], accum_dtype)
-            p_sum = T.alloc_fragment([BI], accum_dtype)
+            
+            # 用于 reduce 操作的中间变量
+            block_sum = T.alloc_fragment([BH], accum_dtype)
+            
             indices_local = T.alloc_local([1], indices_dtype)
             
             # ===============================================================
-            # Barrier 分配
+            # Barrier 分配（2 线程组）
             # ===============================================================
-            bar_q = T.alloc_barrier(arrive_count=384)
+            bar_q = T.alloc_barrier(arrive_count=256)
             bar_k_0_ready = T.alloc_barrier(arrive_count=128)
             bar_k_1_ready = T.alloc_barrier(arrive_count=128)
-            bar_k_0_free = T.alloc_barrier(arrive_count=256)
-            bar_k_1_free = T.alloc_barrier(arrive_count=256)
-            bar_qk_ready = T.alloc_barrier(arrive_count=128)
-            bar_qk_free = T.alloc_barrier(arrive_count=128)
-            bar_softmax_done = T.alloc_barrier(arrive_count=128)
+            bar_k_0_free = T.alloc_barrier(arrive_count=128)
+            bar_k_1_free = T.alloc_barrier(arrive_count=128)
             
             # ===============================================================
             # 计算索引
@@ -155,29 +151,27 @@ def indexer_loss_fwd_kernel(
                 h_start = h_block * BH
                 
                 # 加载 Q 到 shared memory
-                # Q shape: [batch, heads, chunk_size, dim]
-                # 需要加载 Q[b_i, h_start:h_start+BH, s_i, :]
                 T.copy(Q[b_i, h_start:h_start + BH, s_i, 0:D], Q_shared)
                 T.barrier_arrive(bar_q)
                 
                 if tx < 128:
                     # =======================================================
-                    # Pass1 计算线程组
+                    # 计算线程组
                     # =======================================================
                     T.set_max_nreg(240, 1)
                     
-                    # 初始化 Online Softmax
+                    # 初始化 Online Softmax 状态
                     T.fill(m_global, NEG_INF)
                     T.fill(l_global, 0.0)
                     
                     T.barrier_wait(bar_q, 0)
                     
-                    # Pass1: 遍历所有 topk_blocks
+                    # Pass 1: 遍历所有 topk_blocks，计算 online softmax
                     for i_i in T.serial(T.ceildiv(NTK, 2)):
                         # ----- Buffer 0 -----
                         T.barrier_wait(bar_k_0_ready[0], (i_i & 1))
                         
-                        # 初始化 QK
+                        # 初始化 QK（根据有效性设置初值）
                         for tk_i, h_i in T.Parallel(BI, BH):
                             acc_qk[tk_i, h_i] = T.if_then_else(is_valid_0[tk_i], 0.0, NEG_INF)
                         
@@ -189,23 +183,30 @@ def indexer_loss_fwd_kernel(
                         for tk_i, h_i in T.Parallel(BI, BH):
                             acc_qk[tk_i, h_i] = acc_qk[tk_i, h_i] * scaling
                         
-                        # Online Softmax 更新
+                        # Online Softmax 更新 - 步骤1：计算块内 max
                         T.reduce_max(acc_qk, m_block, dim=0, clear=True)
+                        
+                        # 步骤2：更新全局 max 和 alpha（1D 操作）
                         for h_i in T.Parallel(BH):
                             m_new[h_i] = T.max(m_global[h_i], m_block[h_i])
                             alpha[h_i] = T.exp2((m_global[h_i] - m_new[h_i]) * LOG2E)
                         
-                        # 计算新的 l
+                        # 将 m_new 存入 shared memory 以避免 2D/1D layout 冲突
+                        T.copy(m_new, m_new_shared)
+                        
+                        # 步骤3：计算 exp 值（2D 操作，从 shared memory 读取 m_new）
                         for tk_i, h_i in T.Parallel(BI, BH):
-                            exp_val = T.exp2((acc_qk[tk_i, h_i] - m_new[h_i]) * LOG2E)
-                            exp_val = T.if_then_else(is_valid_0[tk_i], exp_val, 0.0)
-                            acc_qk[tk_i, h_i] = exp_val
+                            raw_exp = T.exp2((acc_qk[tk_i, h_i] - m_new_shared[h_i]) * LOG2E)
+                            acc_qk[tk_i, h_i] = T.if_then_else(is_valid_0[tk_i], raw_exp, 0.0)
+                        
+                        # 步骤4：更新 l_global（使用预分配的 block_sum 避免作用域问题）
+                        T.fill(block_sum, 0.0)
+                        for tk_i in T.serial(BI):
+                            for h_i in T.Parallel(BH):
+                                block_sum[h_i] = block_sum[h_i] + acc_qk[tk_i, h_i]
                         
                         for h_i in T.Parallel(BH):
-                            sum_exp = 0.0
-                            for tk_i in T.serial(BI):
-                                sum_exp += acc_qk[tk_i, h_i]
-                            l_global[h_i] = l_global[h_i] * alpha[h_i] + sum_exp
+                            l_global[h_i] = l_global[h_i] * alpha[h_i] + block_sum[h_i]
                             m_global[h_i] = m_new[h_i]
                         
                         T.barrier_arrive(bar_k_0_free[0])
@@ -223,43 +224,45 @@ def indexer_loss_fwd_kernel(
                             acc_qk[tk_i, h_i] = acc_qk[tk_i, h_i] * scaling
                         
                         T.reduce_max(acc_qk, m_block, dim=0, clear=True)
+                        
                         for h_i in T.Parallel(BH):
                             m_new[h_i] = T.max(m_global[h_i], m_block[h_i])
                             alpha[h_i] = T.exp2((m_global[h_i] - m_new[h_i]) * LOG2E)
                         
+                        T.copy(m_new, m_new_shared)
+                        
                         for tk_i, h_i in T.Parallel(BI, BH):
-                            exp_val = T.exp2((acc_qk[tk_i, h_i] - m_new[h_i]) * LOG2E)
-                            exp_val = T.if_then_else(is_valid_1[tk_i], exp_val, 0.0)
-                            acc_qk[tk_i, h_i] = exp_val
+                            raw_exp = T.exp2((acc_qk[tk_i, h_i] - m_new_shared[h_i]) * LOG2E)
+                            acc_qk[tk_i, h_i] = T.if_then_else(is_valid_1[tk_i], raw_exp, 0.0)
+                        
+                        T.fill(block_sum, 0.0)
+                        for tk_i in T.serial(BI):
+                            for h_i in T.Parallel(BH):
+                                block_sum[h_i] = block_sum[h_i] + acc_qk[tk_i, h_i]
                         
                         for h_i in T.Parallel(BH):
-                            sum_exp = 0.0
-                            for tk_i in T.serial(BI):
-                                sum_exp += acc_qk[tk_i, h_i]
-                            l_global[h_i] = l_global[h_i] * alpha[h_i] + sum_exp
+                            l_global[h_i] = l_global[h_i] * alpha[h_i] + block_sum[h_i]
                             m_global[h_i] = m_new[h_i]
                         
                         T.barrier_arrive(bar_k_1_free[0])
                     
+                    # 存储最终的 softmax 参数到 shared memory
                     # 处理边界情况
                     for h_i in T.Parallel(BH):
                         m_global[h_i] = T.if_then_else(m_global[h_i] == NEG_INF, 0.0, m_global[h_i])
                         l_global[h_i] = T.if_then_else(l_global[h_i] < 1e-9, 1.0, l_global[h_i])
                     
-                    # 存储 Softmax 参数
                     T.copy(m_global, m_global_shared)
                     T.copy(l_global, l_global_shared)
-                    T.barrier_arrive(bar_softmax_done)
                     
-                    # Pass2: 重新遍历计算归一化概率并累加
-                    T.barrier_wait(bar_softmax_done, 0)
-                    
+                    # Pass 2: 重新遍历，使用全局 m 和 l 计算归一化概率并累加
                     for i_i in T.serial(T.ceildiv(NTK, 2)):
                         tk_start_0 = (i_i * 2) * BI
                         tk_start_1 = (i_i * 2 + 1) * BI
                         
                         # ----- Buffer 0 -----
-                        T.barrier_wait(bar_k_0_ready[0], (i_i & 1) + NTK // 2)  # offset for second pass
+                        # 等待 Producer 重新加载数据
+                        T.barrier_wait(bar_k_0_ready[0], (i_i & 1) + (NTK + 1) // 2)
                         
                         for tk_i, h_i in T.Parallel(BI, BH):
                             acc_qk[tk_i, h_i] = T.if_then_else(is_valid_0[tk_i], 0.0, NEG_INF)
@@ -270,31 +273,34 @@ def indexer_loss_fwd_kernel(
                         for tk_i, h_i in T.Parallel(BI, BH):
                             acc_qk[tk_i, h_i] = acc_qk[tk_i, h_i] * scaling
                         
-                        # 归一化
+                        # 使用全局 m 和 l 计算归一化概率
+                        # p[tk_i, h_i] = exp(qk - m_global) / l_global
                         for tk_i, h_i in T.Parallel(BI, BH):
-                            p = T.exp2((acc_qk[tk_i, h_i] - m_global_shared[h_i]) * LOG2E) / l_global_shared[h_i]
-                            p = T.if_then_else(is_valid_0[tk_i], p, 0.0)
-                            p_local[tk_i, h_i] = p
+                            raw_exp = T.exp2((acc_qk[tk_i, h_i] - m_global_shared[h_i]) * LOG2E)
+                            p_val = raw_exp / l_global_shared[h_i]
+                            acc_qk[tk_i, h_i] = T.if_then_else(is_valid_0[tk_i], p_val, 0.0)
                         
-                        # 对 head 求和
+                        # 对 head 求和（使用预分配的 exp_sum_shared 避免作用域问题）
                         for tk_i in T.Parallel(BI):
-                            p_sum[tk_i] = 0.0
-                            for h_i in T.serial(BH):
-                                p_sum[tk_i] += p_local[tk_i, h_i]
+                            exp_sum_shared[tk_i] = 0.0
+                        for h_i in T.serial(BH):
+                            for tk_i in T.Parallel(BI):
+                                exp_sum_shared[tk_i] = exp_sum_shared[tk_i] + acc_qk[tk_i, h_i]
                         
-                        # 写入 attn_sum
+                        # 写入到输出
                         for tk_i in T.Parallel(BI):
-                            if tk_start_0 + tk_i < topk:
+                            curr_tk = tk_start_0 + tk_i
+                            if curr_tk < topk:
                                 if h_block == 0:
-                                    AttnSum[b_i, s_i, tk_start_0 + tk_i] = p_sum[tk_i]
+                                    AttnSum[b_i, s_i, curr_tk] = exp_sum_shared[tk_i]
                                 else:
-                                    old_val = AttnSum[b_i, s_i, tk_start_0 + tk_i]
-                                    AttnSum[b_i, s_i, tk_start_0 + tk_i] = old_val + p_sum[tk_i]
+                                    old_val = AttnSum[b_i, s_i, curr_tk]
+                                    AttnSum[b_i, s_i, curr_tk] = old_val + exp_sum_shared[tk_i]
                         
                         T.barrier_arrive(bar_k_0_free[0])
                         
                         # ----- Buffer 1 -----
-                        T.barrier_wait(bar_k_1_ready[0], (i_i & 1) + NTK // 2)
+                        T.barrier_wait(bar_k_1_ready[0], (i_i & 1) + (NTK + 1) // 2)
                         
                         for tk_i, h_i in T.Parallel(BI, BH):
                             acc_qk[tk_i, h_i] = T.if_then_else(is_valid_1[tk_i], 0.0, NEG_INF)
@@ -306,58 +312,39 @@ def indexer_loss_fwd_kernel(
                             acc_qk[tk_i, h_i] = acc_qk[tk_i, h_i] * scaling
                         
                         for tk_i, h_i in T.Parallel(BI, BH):
-                            p = T.exp2((acc_qk[tk_i, h_i] - m_global_shared[h_i]) * LOG2E) / l_global_shared[h_i]
-                            p = T.if_then_else(is_valid_1[tk_i], p, 0.0)
-                            p_local[tk_i, h_i] = p
+                            raw_exp = T.exp2((acc_qk[tk_i, h_i] - m_global_shared[h_i]) * LOG2E)
+                            p_val = raw_exp / l_global_shared[h_i]
+                            acc_qk[tk_i, h_i] = T.if_then_else(is_valid_1[tk_i], p_val, 0.0)
                         
                         for tk_i in T.Parallel(BI):
-                            p_sum[tk_i] = 0.0
-                            for h_i in T.serial(BH):
-                                p_sum[tk_i] += p_local[tk_i, h_i]
+                            exp_sum_shared[tk_i] = 0.0
+                        for h_i in T.serial(BH):
+                            for tk_i in T.Parallel(BI):
+                                exp_sum_shared[tk_i] = exp_sum_shared[tk_i] + acc_qk[tk_i, h_i]
                         
                         for tk_i in T.Parallel(BI):
-                            if tk_start_1 + tk_i < topk:
+                            curr_tk = tk_start_1 + tk_i
+                            if curr_tk < topk:
                                 if h_block == 0:
-                                    AttnSum[b_i, s_i, tk_start_1 + tk_i] = p_sum[tk_i]
+                                    AttnSum[b_i, s_i, curr_tk] = exp_sum_shared[tk_i]
                                 else:
-                                    old_val = AttnSum[b_i, s_i, tk_start_1 + tk_i]
-                                    AttnSum[b_i, s_i, tk_start_1 + tk_i] = old_val + p_sum[tk_i]
+                                    old_val = AttnSum[b_i, s_i, curr_tk]
+                                    AttnSum[b_i, s_i, curr_tk] = old_val + exp_sum_shared[tk_i]
                         
                         T.barrier_arrive(bar_k_1_free[0])
                     
-                elif tx >= 128 and tx < 256:
-                    # =======================================================
-                    # Pass2 辅助线程组（这个版本中与 Pass1 合并计算）
-                    # =======================================================
-                    T.set_max_nreg(168, 1)
-                    T.barrier_wait(bar_q, 0)
-                    
-                    # 在 Pass1 完成后参与同步
-                    for i_i in T.serial(T.ceildiv(NTK, 2)):
-                        T.barrier_arrive(bar_k_0_free[0])
-                        T.barrier_arrive(bar_k_1_free[0])
-                    
-                    T.barrier_arrive(bar_softmax_done)
-                    T.barrier_wait(bar_softmax_done, 0)
-                    
-                    for i_i in T.serial(T.ceildiv(NTK, 2)):
-                        T.barrier_arrive(bar_k_0_free[0])
-                        T.barrier_arrive(bar_k_1_free[0])
-                    
-                elif tx >= 256:
+                else:
                     # =======================================================
                     # Producer 线程组：预取 K 数据到 shared memory
                     # =======================================================
                     T.set_max_nreg(80, 0)
                     
-                    # Pass1 的数据加载
+                    # Pass 1 的数据加载
                     for i_i in T.serial(T.ceildiv(NTK, 2)):
                         # ----- Buffer 0 -----
                         T.barrier_wait(bar_k_0_free[0], ((i_i & 1) ^ 1))
                         
-                        # 计算每个线程负责的行
-                        # 128 个线程，每个线程可能负责多行
-                        thread_id = tx - 256  # 0-127
+                        thread_id = tx - 128  # 0-127
                         rows_per_thread = T.ceildiv(BI, 128)
                         
                         for r in T.serial(rows_per_thread):
@@ -397,11 +384,12 @@ def indexer_loss_fwd_kernel(
                         
                         T.cp_async_barrier_noinc(bar_k_1_ready[0])
                     
-                    # Pass2 的数据加载（重复加载以支持第二轮计算）
+                    # Pass 2 的数据加载（重复加载以支持第二轮计算）
                     for i_i in T.serial(T.ceildiv(NTK, 2)):
-                        T.barrier_wait(bar_k_0_free[0], ((i_i & 1) ^ 1) + NTK // 2)
+                        # ----- Buffer 0 -----
+                        T.barrier_wait(bar_k_0_free[0], ((i_i & 1) ^ 1) + (NTK + 1) // 2)
                         
-                        thread_id = tx - 256
+                        thread_id = tx - 128
                         rows_per_thread = T.ceildiv(BI, 128)
                         
                         for r in T.serial(rows_per_thread):
@@ -421,7 +409,8 @@ def indexer_loss_fwd_kernel(
                         
                         T.cp_async_barrier_noinc(bar_k_0_ready[0])
                         
-                        T.barrier_wait(bar_k_1_free[0], ((i_i & 1) ^ 1) + NTK // 2)
+                        # ----- Buffer 1 -----
+                        T.barrier_wait(bar_k_1_free[0], ((i_i & 1) ^ 1) + (NTK + 1) // 2)
                         
                         for r in T.serial(rows_per_thread):
                             row_idx = thread_id * rows_per_thread + r
@@ -445,7 +434,7 @@ def indexer_loss_fwd_kernel(
 
 def indexer_loss_fwd_tilelang(
     query, key, indices, scaling, chunk_offset=0, 
-    block_tk=64, block_h=16, threads=384,
+    block_tk=64, block_h=16, threads=256,
     return_kernel=False, print_kernel=False
 ):
     """
