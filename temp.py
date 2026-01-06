@@ -39,13 +39,13 @@ def indexer_loss_fwd(
     threads=384,
 ):
     """
-    IndexerLoss Forward Kernel with Pipeline Optimization
+    IndexerLoss Forward Kernel with Pipeline Optimization (简化版)
     
     计算 sparse attention 的累加分布 AttnSum，用于后续的 loss 计算。
     
-    线程分组:
-    - 线程1组 (tx < 128): 处理前半 heads，两遍扫描计算 m/l 和 attn_sum
-    - 线程2组 (128 <= tx < 256): 处理后半 heads，两遍扫描计算 m/l 和 attn_sum  
+    线程分组 (简化设计):
+    - 线程1组 (tx < 128): 只做 Pass 1，计算所有 heads 的 m_global 和 l_global
+    - 线程2组 (128 <= tx < 256): 只做 Pass 2，使用 m/l 计算归一化 attention 并累加 attn_sum
     - 线程3组 (tx >= 256): producer，负责加载 K 到 shared memory 双 buffer
     
     输出:
@@ -89,8 +89,6 @@ def indexer_loss_fwd(
         REPLICATE_H = 1
 
     H_per_block = padded_H if REPLICATE_H == 1 else 64
-    # 每组线程处理一半的 heads
-    H_half = H_per_block // 2
 
     @T.prim_func
     def main(
@@ -101,7 +99,7 @@ def indexer_loss_fwd(
         AttnSum: T.Tensor(attn_sum_shape, accum_dtype),  # type: ignore
     ):
         with T.Kernel((seq_len - kv_stride + 1 if CP0 else seq_len) * REPLICATE_H, batch, kv_group, threads=threads) as (bx, by, bz):
-            # Q shared memory - 两组线程共用
+            # Q shared memory - 所有线程共用
             Q_shared_l = T.alloc_shared([H_per_block, D // 2], dtype)
             Q_shared_r = T.alloc_shared([H_per_block, D // 2], dtype)
             Q_tail_shared = T.alloc_shared([H_per_block, D_tail], dtype)
@@ -114,56 +112,41 @@ def indexer_loss_fwd(
             K_tail_shared_0 = T.alloc_shared([BI, D_tail], dtype)
             K_tail_shared_1 = T.alloc_shared([BI, D_tail], dtype)
             
-            # K validity mask
+            # K validity mask - 双 buffer
             is_kv_valid_0 = T.alloc_shared([BI], "bool", scope="shared")
             is_kv_valid_1 = T.alloc_shared([BI], "bool", scope="shared")
-            
-            # Indices shared memory for second pass
-            indices_shared_0 = T.alloc_shared([BI], indices_dtype)
-            indices_shared_1 = T.alloc_shared([BI], indices_dtype)
 
-            # 线程1组的局部变量
-            acc_s_1 = T.alloc_fragment([H_half, BI], accum_dtype)
-            sumexp_1 = T.alloc_fragment([H_half], accum_dtype)
-            sumexp_i_1 = T.alloc_fragment([H_half], accum_dtype)
-            m_i_1 = T.alloc_fragment([H_half], accum_dtype)
-            m_i_prev_1 = T.alloc_fragment([H_half], accum_dtype)
-            attn_sum_local_1 = T.alloc_fragment([BI], accum_dtype)
+            # 线程1组 (Pass 1) 的局部变量 - 处理所有 heads
+            acc_s = T.alloc_fragment([H_per_block, BI], accum_dtype)
+            sumexp = T.alloc_fragment([H_per_block], accum_dtype)
+            sumexp_i = T.alloc_fragment([H_per_block], accum_dtype)
+            m_i = T.alloc_fragment([H_per_block], accum_dtype)
+            m_i_prev = T.alloc_fragment([H_per_block], accum_dtype)
             
-            # 线程2组的局部变量
-            acc_s_2 = T.alloc_fragment([H_half, BI], accum_dtype)
-            sumexp_2 = T.alloc_fragment([H_half], accum_dtype)
-            sumexp_i_2 = T.alloc_fragment([H_half], accum_dtype)
-            m_i_2 = T.alloc_fragment([H_half], accum_dtype)
-            m_i_prev_2 = T.alloc_fragment([H_half], accum_dtype)
-            attn_sum_local_2 = T.alloc_fragment([BI], accum_dtype)
+            # 线程2组 (Pass 2) 的局部变量 - 处理所有 heads
+            acc_s_2 = T.alloc_fragment([H_per_block, BI], accum_dtype)
+            attn_sum_local = T.alloc_fragment([BI], accum_dtype)
             
-            # 共享的 attn_sum 用于最终合并
-            attn_sum_shared = T.alloc_shared([BI], accum_dtype)
-            
-            # 用于存储最终的 m 和 l (第一遍扫描结束后)
-            m_final_shared_1 = T.alloc_shared([H_half], accum_dtype)
-            l_final_shared_1 = T.alloc_shared([H_half], accum_dtype)
-            m_final_shared_2 = T.alloc_shared([H_half], accum_dtype)
-            l_final_shared_2 = T.alloc_shared([H_half], accum_dtype)
+            # 共享的 m_final 和 l_final，Pass 1 写入，Pass 2 读取
+            m_final_shared = T.alloc_shared([H_per_block], accum_dtype)
+            l_final_shared = T.alloc_shared([H_per_block], accum_dtype)
 
             indices_local = T.alloc_local([1], indices_dtype)
 
-            # Barriers
+            # Barriers - 简化版
             bar_q = T.alloc_barrier(arrive_count=384)
+            # Pass 1 的 K buffer 同步
             bar_k_0_ready = T.alloc_barrier(arrive_count=128)
             bar_k_1_ready = T.alloc_barrier(arrive_count=128)
-            bar_k_0_free = T.alloc_barrier(arrive_count=256)
-            bar_k_1_free = T.alloc_barrier(arrive_count=256)
+            bar_k_0_free = T.alloc_barrier(arrive_count=128)
+            bar_k_1_free = T.alloc_barrier(arrive_count=128)
+            # Pass 1 完成同步 (线程1组 + producer)
             bar_pass1_done = T.alloc_barrier(arrive_count=256)
+            # Pass 2 的 K buffer 同步
             bar_pass2_k_0_ready = T.alloc_barrier(arrive_count=128)
             bar_pass2_k_1_ready = T.alloc_barrier(arrive_count=128)
-            bar_pass2_k_0_free = T.alloc_barrier(arrive_count=256)
-            bar_pass2_k_1_free = T.alloc_barrier(arrive_count=256)
-            # 线程1组写完后 arrive，线程2组 wait
-            bar_merge_ready = T.alloc_barrier(arrive_count=128)
-            # 线程2组读完后 arrive，线程1组 wait (下一轮才能继续写)
-            bar_merge_done = T.alloc_barrier(arrive_count=128)
+            bar_pass2_k_0_free = T.alloc_barrier(arrive_count=128)
+            bar_pass2_k_1_free = T.alloc_barrier(arrive_count=128)
 
             b_i, g_i = by, bz
             s_i = (bx + (KV_stride - 1 if CP0 else 0)) if REPLICATE_H == 1 else (bx // REPLICATE_H + (KV_stride - 1 if CP0 else 0))
@@ -183,288 +166,137 @@ def indexer_loss_fwd(
 
             if tx < 128:
                 # ================================================================
-                # 线程1组: 处理前半 heads [0, H_half)
+                # 线程1组: 只做 Pass 1 - 计算所有 heads 的 m_global 和 l_global
                 # ================================================================
                 T.set_max_nreg(240, 1)
-                T.fill(sumexp_1, 0)
-                T.fill(m_i_1, -(2**30))
+                T.fill(sumexp, 0)
+                T.fill(m_i, -(2**30))
                 T.barrier_wait(bar_q, 0)
 
-                # ================================================================
-                # Pass 1: 计算 m_global 和 l_global
-                # ================================================================
                 for i_i in T.serial(T.ceildiv(NI, 2)):
                     # Buffer 0
                     T.barrier_wait(bar_k_0_ready[0], (i_i & 1))
 
-                    for h_i, bi_i in T.Parallel(H_half, BI):
-                        acc_s_1[h_i, bi_i] = T.if_then_else(is_kv_valid_0[bi_i], 0, -T.infinity(acc_s_1.dtype))
-                    # QK 矩阵乘 - 只用前半 heads
-                    T.gemm(Q_shared_l[0:H_half, :], KV_shared_0_l, acc_s_1, transpose_B=True, wg_wait=-1)
-                    T.gemm(Q_shared_r[0:H_half, :], KV_shared_0_r, acc_s_1, transpose_B=True, wg_wait=-1)
-                    T.gemm(Q_tail_shared[0:H_half, :], K_tail_shared_0, acc_s_1, transpose_B=True, wg_wait=-1)
+                    for h_i, bi_i in T.Parallel(H_per_block, BI):
+                        acc_s[h_i, bi_i] = T.if_then_else(is_kv_valid_0[bi_i], 0, -T.infinity(acc_s.dtype))
+                    # QK 矩阵乘 - 处理所有 heads
+                    T.gemm(Q_shared_l, KV_shared_0_l, acc_s, transpose_B=True, wg_wait=-1)
+                    T.gemm(Q_shared_r, KV_shared_0_r, acc_s, transpose_B=True, wg_wait=-1)
+                    T.gemm(Q_tail_shared, K_tail_shared_0, acc_s, transpose_B=True, wg_wait=-1)
 
                     T.wait_wgmma(0)
 
                     # Online softmax
-                    T.copy(m_i_1, m_i_prev_1)
-                    T.reduce_max(acc_s_1, m_i_1, dim=1, clear=False)
-                    for h_i in T.Parallel(H_half):
-                        m_i_1[h_i] = T.max(m_i_1[h_i], m_i_prev_1[h_i])
-                    for h_i, bi_i in T.Parallel(H_half, BI):
-                        acc_s_1[h_i, bi_i] = T.exp2(acc_s_1[h_i, bi_i] * sm_scale - m_i_1[h_i] * sm_scale)
-                    for h_i, bi_i in T.Parallel(H_half, BI):
-                        acc_s_1[h_i, bi_i] = T.if_then_else(is_kv_valid_0[bi_i], acc_s_1[h_i, bi_i], 0)
-                    T.reduce_sum(acc_s_1, sumexp_i_1, dim=1)
-                    for h_i in T.Parallel(H_half):
-                        sumexp_1[h_i] = sumexp_1[h_i] * T.exp2((m_i_prev_1[h_i] - m_i_1[h_i]) * sm_scale) + sumexp_i_1[h_i]
+                    T.copy(m_i, m_i_prev)
+                    T.reduce_max(acc_s, m_i, dim=1, clear=False)
+                    for h_i in T.Parallel(H_per_block):
+                        m_i[h_i] = T.max(m_i[h_i], m_i_prev[h_i])
+                    for h_i, bi_i in T.Parallel(H_per_block, BI):
+                        acc_s[h_i, bi_i] = T.exp2(acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale)
+                    for h_i, bi_i in T.Parallel(H_per_block, BI):
+                        acc_s[h_i, bi_i] = T.if_then_else(is_kv_valid_0[bi_i], acc_s[h_i, bi_i], 0)
+                    T.reduce_sum(acc_s, sumexp_i, dim=1)
+                    for h_i in T.Parallel(H_per_block):
+                        sumexp[h_i] = sumexp[h_i] * T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale) + sumexp_i[h_i]
 
                     T.barrier_arrive(bar_k_0_free[0])
 
                     # Buffer 1
                     T.barrier_wait(bar_k_1_ready[0], (i_i & 1))
 
-                    for h_i, bi_i in T.Parallel(H_half, BI):
-                        acc_s_1[h_i, bi_i] = T.if_then_else(is_kv_valid_1[bi_i], 0, -T.infinity(acc_s_1.dtype))
-                    T.gemm(Q_shared_l[0:H_half, :], KV_shared_1_l, acc_s_1, transpose_B=True, wg_wait=-1)
-                    T.gemm(Q_shared_r[0:H_half, :], KV_shared_1_r, acc_s_1, transpose_B=True, wg_wait=-1)
-                    T.gemm(Q_tail_shared[0:H_half, :], K_tail_shared_1, acc_s_1, transpose_B=True, wg_wait=-1)
+                    for h_i, bi_i in T.Parallel(H_per_block, BI):
+                        acc_s[h_i, bi_i] = T.if_then_else(is_kv_valid_1[bi_i], 0, -T.infinity(acc_s.dtype))
+                    T.gemm(Q_shared_l, KV_shared_1_l, acc_s, transpose_B=True, wg_wait=-1)
+                    T.gemm(Q_shared_r, KV_shared_1_r, acc_s, transpose_B=True, wg_wait=-1)
+                    T.gemm(Q_tail_shared, K_tail_shared_1, acc_s, transpose_B=True, wg_wait=-1)
 
                     T.wait_wgmma(0)
 
-                    T.copy(m_i_1, m_i_prev_1)
-                    T.reduce_max(acc_s_1, m_i_1, dim=1, clear=False)
-                    for h_i in T.Parallel(H_half):
-                        m_i_1[h_i] = T.max(m_i_1[h_i], m_i_prev_1[h_i])
-                    for h_i, bi_i in T.Parallel(H_half, BI):
-                        acc_s_1[h_i, bi_i] = T.exp2(acc_s_1[h_i, bi_i] * sm_scale - m_i_1[h_i] * sm_scale)
-                    for h_i, bi_i in T.Parallel(H_half, BI):
-                        acc_s_1[h_i, bi_i] = T.if_then_else(is_kv_valid_1[bi_i], acc_s_1[h_i, bi_i], 0)
-                    T.reduce_sum(acc_s_1, sumexp_i_1, dim=1)
-                    for h_i in T.Parallel(H_half):
-                        sumexp_1[h_i] = sumexp_1[h_i] * T.exp2((m_i_prev_1[h_i] - m_i_1[h_i]) * sm_scale) + sumexp_i_1[h_i]
+                    T.copy(m_i, m_i_prev)
+                    T.reduce_max(acc_s, m_i, dim=1, clear=False)
+                    for h_i in T.Parallel(H_per_block):
+                        m_i[h_i] = T.max(m_i[h_i], m_i_prev[h_i])
+                    for h_i, bi_i in T.Parallel(H_per_block, BI):
+                        acc_s[h_i, bi_i] = T.exp2(acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale)
+                    for h_i, bi_i in T.Parallel(H_per_block, BI):
+                        acc_s[h_i, bi_i] = T.if_then_else(is_kv_valid_1[bi_i], acc_s[h_i, bi_i], 0)
+                    T.reduce_sum(acc_s, sumexp_i, dim=1)
+                    for h_i in T.Parallel(H_per_block):
+                        sumexp[h_i] = sumexp[h_i] * T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale) + sumexp_i[h_i]
 
                     T.barrier_arrive(bar_k_1_free[0])
 
-                # 保存最终的 m 和 l
-                for h_i in T.Parallel(H_half):
-                    m_final_shared_1[h_i] = m_i_1[h_i]
-                    l_final_shared_1[h_i] = sumexp_1[h_i]
+                # 保存最终的 m 和 l 到 shared memory
+                for h_i in T.Parallel(H_per_block):
+                    m_final_shared[h_i] = m_i[h_i]
+                    l_final_shared[h_i] = sumexp[h_i]
                 
+                T.barrier_arrive(bar_pass1_done)
+
+            elif tx >= 128 and tx < 256:
+                # ================================================================
+                # 线程2组: 只做 Pass 2 - 使用 m/l 计算归一化 attention 并累加 attn_sum
+                # ================================================================
+                T.set_max_nreg(240, 1)
+                T.barrier_wait(bar_q, 0)
+                
+                # 等待 Pass 1 完成，获取 m_final 和 l_final
                 T.barrier_arrive(bar_pass1_done)
                 T.barrier_wait(bar_pass1_done, 0)
 
-                # ================================================================
-                # Pass 2: 使用 m_global/l_global 计算归一化 attention 并累加
-                # ================================================================
                 for i_i in T.serial(T.ceildiv(NI, 2)):
                     # Buffer 0
-                    T.fill(attn_sum_local_1, 0)
+                    T.fill(attn_sum_local, 0)
                     T.barrier_wait(bar_pass2_k_0_ready[0], (i_i & 1))
 
-                    for h_i, bi_i in T.Parallel(H_half, BI):
-                        acc_s_1[h_i, bi_i] = T.if_then_else(is_kv_valid_0[bi_i], 0, -T.infinity(acc_s_1.dtype))
-                    T.gemm(Q_shared_l[0:H_half, :], KV_shared_0_l, acc_s_1, transpose_B=True, wg_wait=-1)
-                    T.gemm(Q_shared_r[0:H_half, :], KV_shared_0_r, acc_s_1, transpose_B=True, wg_wait=-1)
-                    T.gemm(Q_tail_shared[0:H_half, :], K_tail_shared_0, acc_s_1, transpose_B=True, wg_wait=-1)
+                    for h_i, bi_i in T.Parallel(H_per_block, BI):
+                        acc_s_2[h_i, bi_i] = T.if_then_else(is_kv_valid_0[bi_i], 0, -T.infinity(acc_s_2.dtype))
+                    T.gemm(Q_shared_l, KV_shared_0_l, acc_s_2, transpose_B=True, wg_wait=-1)
+                    T.gemm(Q_shared_r, KV_shared_0_r, acc_s_2, transpose_B=True, wg_wait=-1)
+                    T.gemm(Q_tail_shared, K_tail_shared_0, acc_s_2, transpose_B=True, wg_wait=-1)
 
                     T.wait_wgmma(0)
 
                     # 使用最终的 m/l 归一化
-                    for h_i, bi_i in T.Parallel(H_half, BI):
-                        acc_s_1[h_i, bi_i] = T.exp2(acc_s_1[h_i, bi_i] * sm_scale - m_final_shared_1[h_i] * sm_scale) / l_final_shared_1[h_i]
-                    for h_i, bi_i in T.Parallel(H_half, BI):
-                        acc_s_1[h_i, bi_i] = T.if_then_else(is_kv_valid_0[bi_i], acc_s_1[h_i, bi_i], 0)
-                    
-                    # Head sum 并累加到 attn_sum_local
-                    for bi_i in T.Parallel(BI):
-                        for h_i in T.serial(H_half):
-                            attn_sum_local_1[bi_i] += acc_s_1[h_i, bi_i]
-                    
-                    # 写入 shared memory 供线程2组合并
-                    for bi_i in T.Parallel(BI):
-                        attn_sum_shared[bi_i] = attn_sum_local_1[bi_i]
-                    
-                    # 通知线程2组可以读取
-                    T.barrier_arrive(bar_merge_ready[0])
-                    # 等待线程2组读取完成后才能继续下一次写入
-                    T.barrier_wait(bar_merge_done[0], (i_i * 2) & 1)
-
-                    T.barrier_arrive(bar_pass2_k_0_free[0])
-
-                    # Buffer 1
-                    T.fill(attn_sum_local_1, 0)
-                    T.barrier_wait(bar_pass2_k_1_ready[0], (i_i & 1))
-
-                    for h_i, bi_i in T.Parallel(H_half, BI):
-                        acc_s_1[h_i, bi_i] = T.if_then_else(is_kv_valid_1[bi_i], 0, -T.infinity(acc_s_1.dtype))
-                    T.gemm(Q_shared_l[0:H_half, :], KV_shared_1_l, acc_s_1, transpose_B=True, wg_wait=-1)
-                    T.gemm(Q_shared_r[0:H_half, :], KV_shared_1_r, acc_s_1, transpose_B=True, wg_wait=-1)
-                    T.gemm(Q_tail_shared[0:H_half, :], K_tail_shared_1, acc_s_1, transpose_B=True, wg_wait=-1)
-
-                    T.wait_wgmma(0)
-
-                    for h_i, bi_i in T.Parallel(H_half, BI):
-                        acc_s_1[h_i, bi_i] = T.exp2(acc_s_1[h_i, bi_i] * sm_scale - m_final_shared_1[h_i] * sm_scale) / l_final_shared_1[h_i]
-                    for h_i, bi_i in T.Parallel(H_half, BI):
-                        acc_s_1[h_i, bi_i] = T.if_then_else(is_kv_valid_1[bi_i], acc_s_1[h_i, bi_i], 0)
-                    
-                    for bi_i in T.Parallel(BI):
-                        for h_i in T.serial(H_half):
-                            attn_sum_local_1[bi_i] += acc_s_1[h_i, bi_i]
-                    
-                    # 写入 shared memory 供线程2组合并
-                    for bi_i in T.Parallel(BI):
-                        attn_sum_shared[bi_i] = attn_sum_local_1[bi_i]
-                    
-                    # 通知线程2组可以读取
-                    T.barrier_arrive(bar_merge_ready[0])
-                    # 等待线程2组读取完成后才能继续下一次写入
-                    T.barrier_wait(bar_merge_done[0], (i_i * 2 + 1) & 1)
-
-                    T.barrier_arrive(bar_pass2_k_1_free[0])
-
-            elif tx >= 128 and tx < 256:
-                # ================================================================
-                # 线程2组: 处理后半 heads [H_half, H_per_block)
-                # ================================================================
-                T.set_max_nreg(240, 1)
-                T.fill(sumexp_2, 0)
-                T.fill(m_i_2, -(2**30))
-                T.barrier_wait(bar_q, 0)
-
-                # ================================================================
-                # Pass 1: 计算 m_global 和 l_global
-                # ================================================================
-                for i_i in T.serial(T.ceildiv(NI, 2)):
-                    # Buffer 0
-                    T.barrier_wait(bar_k_0_ready[0], (i_i & 1))
-
-                    for h_i, bi_i in T.Parallel(H_half, BI):
-                        acc_s_2[h_i, bi_i] = T.if_then_else(is_kv_valid_0[bi_i], 0, -T.infinity(acc_s_2.dtype))
-                    # QK 矩阵乘 - 只用后半 heads
-                    T.gemm(Q_shared_l[H_half:H_per_block, :], KV_shared_0_l, acc_s_2, transpose_B=True, wg_wait=-1)
-                    T.gemm(Q_shared_r[H_half:H_per_block, :], KV_shared_0_r, acc_s_2, transpose_B=True, wg_wait=-1)
-                    T.gemm(Q_tail_shared[H_half:H_per_block, :], K_tail_shared_0, acc_s_2, transpose_B=True, wg_wait=-1)
-
-                    T.wait_wgmma(0)
-
-                    T.copy(m_i_2, m_i_prev_2)
-                    T.reduce_max(acc_s_2, m_i_2, dim=1, clear=False)
-                    for h_i in T.Parallel(H_half):
-                        m_i_2[h_i] = T.max(m_i_2[h_i], m_i_prev_2[h_i])
-                    for h_i, bi_i in T.Parallel(H_half, BI):
-                        acc_s_2[h_i, bi_i] = T.exp2(acc_s_2[h_i, bi_i] * sm_scale - m_i_2[h_i] * sm_scale)
-                    for h_i, bi_i in T.Parallel(H_half, BI):
-                        acc_s_2[h_i, bi_i] = T.if_then_else(is_kv_valid_0[bi_i], acc_s_2[h_i, bi_i], 0)
-                    T.reduce_sum(acc_s_2, sumexp_i_2, dim=1)
-                    for h_i in T.Parallel(H_half):
-                        sumexp_2[h_i] = sumexp_2[h_i] * T.exp2((m_i_prev_2[h_i] - m_i_2[h_i]) * sm_scale) + sumexp_i_2[h_i]
-
-                    T.barrier_arrive(bar_k_0_free[0])
-
-                    # Buffer 1
-                    T.barrier_wait(bar_k_1_ready[0], (i_i & 1))
-
-                    for h_i, bi_i in T.Parallel(H_half, BI):
-                        acc_s_2[h_i, bi_i] = T.if_then_else(is_kv_valid_1[bi_i], 0, -T.infinity(acc_s_2.dtype))
-                    T.gemm(Q_shared_l[H_half:H_per_block, :], KV_shared_1_l, acc_s_2, transpose_B=True, wg_wait=-1)
-                    T.gemm(Q_shared_r[H_half:H_per_block, :], KV_shared_1_r, acc_s_2, transpose_B=True, wg_wait=-1)
-                    T.gemm(Q_tail_shared[H_half:H_per_block, :], K_tail_shared_1, acc_s_2, transpose_B=True, wg_wait=-1)
-
-                    T.wait_wgmma(0)
-
-                    T.copy(m_i_2, m_i_prev_2)
-                    T.reduce_max(acc_s_2, m_i_2, dim=1, clear=False)
-                    for h_i in T.Parallel(H_half):
-                        m_i_2[h_i] = T.max(m_i_2[h_i], m_i_prev_2[h_i])
-                    for h_i, bi_i in T.Parallel(H_half, BI):
-                        acc_s_2[h_i, bi_i] = T.exp2(acc_s_2[h_i, bi_i] * sm_scale - m_i_2[h_i] * sm_scale)
-                    for h_i, bi_i in T.Parallel(H_half, BI):
-                        acc_s_2[h_i, bi_i] = T.if_then_else(is_kv_valid_1[bi_i], acc_s_2[h_i, bi_i], 0)
-                    T.reduce_sum(acc_s_2, sumexp_i_2, dim=1)
-                    for h_i in T.Parallel(H_half):
-                        sumexp_2[h_i] = sumexp_2[h_i] * T.exp2((m_i_prev_2[h_i] - m_i_2[h_i]) * sm_scale) + sumexp_i_2[h_i]
-
-                    T.barrier_arrive(bar_k_1_free[0])
-
-                # 保存最终的 m 和 l
-                for h_i in T.Parallel(H_half):
-                    m_final_shared_2[h_i] = m_i_2[h_i]
-                    l_final_shared_2[h_i] = sumexp_2[h_i]
-                
-                T.barrier_arrive(bar_pass1_done)
-                T.barrier_wait(bar_pass1_done, 0)
-
-                # ================================================================
-                # Pass 2: 使用 m_global/l_global 计算归一化 attention 并累加
-                # ================================================================
-                for i_i in T.serial(T.ceildiv(NI, 2)):
-                    # Buffer 0
-                    T.fill(attn_sum_local_2, 0)
-                    T.barrier_wait(bar_pass2_k_0_ready[0], (i_i & 1))
-
-                    for h_i, bi_i in T.Parallel(H_half, BI):
-                        acc_s_2[h_i, bi_i] = T.if_then_else(is_kv_valid_0[bi_i], 0, -T.infinity(acc_s_2.dtype))
-                    T.gemm(Q_shared_l[H_half:H_per_block, :], KV_shared_0_l, acc_s_2, transpose_B=True, wg_wait=-1)
-                    T.gemm(Q_shared_r[H_half:H_per_block, :], KV_shared_0_r, acc_s_2, transpose_B=True, wg_wait=-1)
-                    T.gemm(Q_tail_shared[H_half:H_per_block, :], K_tail_shared_0, acc_s_2, transpose_B=True, wg_wait=-1)
-
-                    T.wait_wgmma(0)
-
-                    for h_i, bi_i in T.Parallel(H_half, BI):
-                        acc_s_2[h_i, bi_i] = T.exp2(acc_s_2[h_i, bi_i] * sm_scale - m_final_shared_2[h_i] * sm_scale) / l_final_shared_2[h_i]
-                    for h_i, bi_i in T.Parallel(H_half, BI):
+                    for h_i, bi_i in T.Parallel(H_per_block, BI):
+                        acc_s_2[h_i, bi_i] = T.exp2(acc_s_2[h_i, bi_i] * sm_scale - m_final_shared[h_i] * sm_scale) / l_final_shared[h_i]
+                    for h_i, bi_i in T.Parallel(H_per_block, BI):
                         acc_s_2[h_i, bi_i] = T.if_then_else(is_kv_valid_0[bi_i], acc_s_2[h_i, bi_i], 0)
                     
-                    for bi_i in T.Parallel(BI):
-                        for h_i in T.serial(H_half):
-                            attn_sum_local_2[bi_i] += acc_s_2[h_i, bi_i]
+                    # 使用 T.reduce_sum 沿 head 维度求和
+                    T.reduce_sum(acc_s_2, attn_sum_local, dim=0)
                     
-                    # 等待线程1组写入 shared memory
-                    T.barrier_wait(bar_merge_ready[0], (i_i * 2) & 1)
-                    
-                    # 合并两组结果并写出
+                    # 写出当前 block 的 attn_sum
                     tk_start_0 = (i_i * 2) * BI
                     for bi_i in T.Parallel(BI):
-                        AttnSum[b_i, s_i, tk_start_0 + bi_i] = attn_sum_shared[bi_i] + attn_sum_local_2[bi_i]
-                    
-                    # 通知线程1组可以继续
-                    T.barrier_arrive(bar_merge_done[0])
+                        AttnSum[b_i, s_i, tk_start_0 + bi_i] = attn_sum_local[bi_i]
 
                     T.barrier_arrive(bar_pass2_k_0_free[0])
 
                     # Buffer 1
-                    T.fill(attn_sum_local_2, 0)
+                    T.fill(attn_sum_local, 0)
                     T.barrier_wait(bar_pass2_k_1_ready[0], (i_i & 1))
 
-                    for h_i, bi_i in T.Parallel(H_half, BI):
+                    for h_i, bi_i in T.Parallel(H_per_block, BI):
                         acc_s_2[h_i, bi_i] = T.if_then_else(is_kv_valid_1[bi_i], 0, -T.infinity(acc_s_2.dtype))
-                    T.gemm(Q_shared_l[H_half:H_per_block, :], KV_shared_1_l, acc_s_2, transpose_B=True, wg_wait=-1)
-                    T.gemm(Q_shared_r[H_half:H_per_block, :], KV_shared_1_r, acc_s_2, transpose_B=True, wg_wait=-1)
-                    T.gemm(Q_tail_shared[H_half:H_per_block, :], K_tail_shared_1, acc_s_2, transpose_B=True, wg_wait=-1)
+                    T.gemm(Q_shared_l, KV_shared_1_l, acc_s_2, transpose_B=True, wg_wait=-1)
+                    T.gemm(Q_shared_r, KV_shared_1_r, acc_s_2, transpose_B=True, wg_wait=-1)
+                    T.gemm(Q_tail_shared, K_tail_shared_1, acc_s_2, transpose_B=True, wg_wait=-1)
 
                     T.wait_wgmma(0)
 
-                    for h_i, bi_i in T.Parallel(H_half, BI):
-                        acc_s_2[h_i, bi_i] = T.exp2(acc_s_2[h_i, bi_i] * sm_scale - m_final_shared_2[h_i] * sm_scale) / l_final_shared_2[h_i]
-                    for h_i, bi_i in T.Parallel(H_half, BI):
+                    for h_i, bi_i in T.Parallel(H_per_block, BI):
+                        acc_s_2[h_i, bi_i] = T.exp2(acc_s_2[h_i, bi_i] * sm_scale - m_final_shared[h_i] * sm_scale) / l_final_shared[h_i]
+                    for h_i, bi_i in T.Parallel(H_per_block, BI):
                         acc_s_2[h_i, bi_i] = T.if_then_else(is_kv_valid_1[bi_i], acc_s_2[h_i, bi_i], 0)
                     
-                    for bi_i in T.Parallel(BI):
-                        for h_i in T.serial(H_half):
-                            attn_sum_local_2[bi_i] += acc_s_2[h_i, bi_i]
+                    # 使用 T.reduce_sum 沿 head 维度求和
+                    T.reduce_sum(acc_s_2, attn_sum_local, dim=0)
                     
-                    # 等待线程1组写入 shared memory
-                    T.barrier_wait(bar_merge_ready[0], (i_i * 2 + 1) & 1)
-                    
-                    # 合并两组结果并写出
+                    # 写出当前 block 的 attn_sum
                     tk_start_1 = (i_i * 2 + 1) * BI
                     for bi_i in T.Parallel(BI):
-                        AttnSum[b_i, s_i, tk_start_1 + bi_i] = attn_sum_shared[bi_i] + attn_sum_local_2[bi_i]
-                    
-                    # 通知线程1组可以继续
-                    T.barrier_arrive(bar_merge_done[0])
+                        AttnSum[b_i, s_i, tk_start_1 + bi_i] = attn_sum_local[bi_i]
 
                     T.barrier_arrive(bar_pass2_k_1_free[0])
 
@@ -474,13 +306,12 @@ def indexer_loss_fwd(
                 # ================================================================
                 T.set_max_nreg(80, 0)
                 
-                # Pass 1: 加载 K 给第一遍扫描
+                # Pass 1: 加载 K 给第一遍扫描 (线程1组使用)
                 for i_i in T.serial(T.ceildiv(NI, 2)):
                     # Buffer 0
                     T.barrier_wait(bar_k_0_free[0], ((i_i & 1) ^ 1))
                     for r in T.serial(4):
                         indices_local[0] = Indices[b_i, s_i, g_i, (i_i * 2) * BI + r * 16 + (tx - 256) // 8]
-                        indices_shared_0[r * 16 + (tx - 256) // 8] = indices_local[0]
                         is_kv_valid_0[r * 16 + (tx - 256) // 8] = indices_local[0] <= max_kv_i
                         if is_kv_valid_0[r * 16 + (tx - 256) // 8]:
                             with T.attr("default", "async_scope", 1):
@@ -503,7 +334,6 @@ def indexer_loss_fwd(
                     T.barrier_wait(bar_k_1_free[0], ((i_i & 1) ^ 1))
                     for r in T.serial(4):
                         indices_local[0] = Indices[b_i, s_i, g_i, (i_i * 2 + 1) * BI + r * 16 + (tx - 256) // 8]
-                        indices_shared_1[r * 16 + (tx - 256) // 8] = indices_local[0]
                         is_kv_valid_1[r * 16 + (tx - 256) // 8] = indices_local[0] <= max_kv_i
                         if is_kv_valid_1[r * 16 + (tx - 256) // 8]:
                             with T.attr("default", "async_scope", 1):
@@ -526,7 +356,7 @@ def indexer_loss_fwd(
                 T.barrier_arrive(bar_pass1_done)
                 T.barrier_wait(bar_pass1_done, 0)
 
-                # Pass 2: 重新加载 K 给第二遍扫描
+                # Pass 2: 重新加载 K 给第二遍扫描 (线程2组使用)
                 for i_i in T.serial(T.ceildiv(NI, 2)):
                     # Buffer 0
                     T.barrier_wait(bar_pass2_k_0_free[0], ((i_i & 1) ^ 1))
