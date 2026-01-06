@@ -6,3 +6,7 @@
 线程3组：producer，负责维护buffer
 
 前向kernel只算attn_sum，给反向用
+
+
+#tilelang_kernel_pipeline.py目前是sparse mla的实现，但  #indexer_loss_kernel.py的_indexer_loss_fwd_kernel实现可参考tilelang的pipeline优化
+根据  #线程分组.txt，修改  #tilelang_kernel_pipeline.py中的sparse_mla_fwd为_indexer_loss_fwd_kernel_tilelang，实现一般优化的indexer_loss_kernel
