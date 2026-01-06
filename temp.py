@@ -14,10 +14,11 @@ NUM_WARPS = 8
 
 
 @triton.jit
-def _indexer_loss_fwd_kernel(
+def _indexer_loss_fwd_kernel_opt(
     Q_ptr, K_ptr, IndexScore_ptr, Indices_ptr, Loss_ptr,
     # 中间存储指针 (用于两遍扫描)
     AttnSum_ptr,  # [batch, chunk_size, topk] - 存储累加的attention
+    QKCache_ptr,  # [batch, chunk_size, topk, BLOCK_H] - 缓存 QK 结果
     batch_size, num_heads, chunk_size,
     chunk_offset,
     head_dim: tl.constexpr,
@@ -29,12 +30,17 @@ def _indexer_loss_fwd_kernel(
     stride_isb, stride_iss, stride_isk,
     stride_ib, stride_is, stride_ik,
     stride_asb, stride_ass, stride_ask,  # AttnSum strides
+    stride_qkc_b, stride_qkc_s, stride_qkc_k, stride_qkc_h,  # QKCache strides
     BLOCK_D: tl.constexpr,
     BLOCK_TOPK: tl.constexpr,
     BLOCK_H: tl.constexpr,
 ):
     """
-    Sparse Attention + Loss Kernel (Online Softmax + tl.dot 优化版本)
+    Sparse Attention + Loss Kernel (QK 缓存优化版本)
+    
+    优化点：
+    - 在 Pass 1 中计算 QK 后缓存到 QKCache_ptr
+    - 在 Pass 2 中直接从 QKCache_ptr 读取，避免重复计算
     
     使用 tl.dot 利用 Tensor Core，一次处理 BLOCK_H 个 head：
     - qT: [BLOCK_D, BLOCK_H] - 转置形式
@@ -58,6 +64,7 @@ def _indexer_loss_fwd_kernel(
     idx_base = Indices_ptr + pid_batch * stride_ib + pid_row * stride_is
     is_base = IndexScore_ptr + pid_batch * stride_isb + pid_row * stride_iss
     attn_sum_base = AttnSum_ptr + pid_batch * stride_asb + pid_row * stride_ass
+    qk_cache_base = QKCache_ptr + pid_batch * stride_qkc_b + pid_row * stride_qkc_s
     
     global_query_pos = chunk_offset + pid_row
     num_topk_blocks = tl.cdiv(topk, BLOCK_TOPK)
@@ -77,6 +84,7 @@ def _indexer_loss_fwd_kernel(
         
         # -----------------------------------------------------------------
         # Pass 1: 计算全局 max 和 sum (Online Softmax) - 每个 head 独立
+        #         同时将 QK 结果缓存到 QKCache
         # -----------------------------------------------------------------
         # m_global, l_global: [BLOCK_H] - 每个 head 一个值
         m_global = tl.full([BLOCK_H], NEG_INF, dtype=tl.float32)
@@ -112,6 +120,13 @@ def _indexer_loss_fwd_kernel(
             
             qk = qk * scaling
             
+            # ============= 缓存 QK 结果 (优化点) =============
+            # 存储到 QKCache: [batch, chunk_size, topk, BLOCK_H]
+            # 注意: 这里存储的是 scaled QK，还未应用 mask
+            qk_cache_ptrs = qk_cache_base + offs_tk[:, None] * stride_qkc_k + offs_h[None, :] * stride_qkc_h
+            tl.store(qk_cache_ptrs, qk, mask=tk_mask[:, None] & h_mask[None, :])
+            # ================================================
+            
             # 应用 causal mask 和 head mask: 对被 mask 的位置设为 NEG_INF
             # causal_mask_block[:, None]: [BLOCK_TOPK, 1] -> 广播到 [BLOCK_TOPK, BLOCK_H]
             # h_mask[None, :]: [1, BLOCK_H] -> 广播到 [BLOCK_TOPK, BLOCK_H]
@@ -133,7 +148,7 @@ def _indexer_loss_fwd_kernel(
         l_global = tl.where(l_global < 1e-9, 1.0, l_global)  # [BLOCK_H]
         
         # -----------------------------------------------------------------
-        # Pass 2: 使用全局 max/sum 计算归一化概率，累加到 attn_sum
+        # Pass 2: 从缓存读取 QK，使用全局 max/sum 计算归一化概率，累加到 attn_sum
         # -----------------------------------------------------------------
         for tk_idx in range(num_topk_blocks):
             tk_start = tk_idx * BLOCK_TOPK
@@ -143,26 +158,11 @@ def _indexer_loss_fwd_kernel(
             indices_block = tl.load(idx_base + offs_tk * stride_ik, mask=tk_mask, other=0).to(tl.int64)
             causal_mask_block = (indices_block > global_query_pos) | (~tk_mask)  # [BLOCK_TOPK]
             
-            # 分块计算 QK (支持 head_dim > BLOCK_D)
-            qk = tl.zeros([BLOCK_TOPK, BLOCK_H], dtype=tl.float32)
-            num_d_blocks = tl.cdiv(head_dim, BLOCK_D)
-            for d_idx in range(num_d_blocks):
-                d_start = d_idx * BLOCK_D
-                offs_d_block = d_start + offs_d
-                d_block_mask = offs_d_block < head_dim
-                
-                # 加载 qT: [BLOCK_D, BLOCK_H]
-                q_ptrs = q_batch_base + (h_start + offs_h[None, :]) * stride_qh + offs_d_block[:, None] * stride_qd
-                qT = tl.load(q_ptrs, mask=d_block_mask[:, None] & h_mask[None, :], other=0.0)  # [BLOCK_D, BLOCK_H]
-                
-                # 加载 k_gathered: [BLOCK_TOPK, BLOCK_D]
-                k_ptrs = k_batch_base + indices_block[:, None] * stride_ks + offs_d_block[None, :] * stride_kd
-                k_gathered = tl.load(k_ptrs, mask=tk_mask[:, None] & d_block_mask[None, :], other=0.0)  # [BLOCK_TOPK, BLOCK_D]
-                
-                # 累加 QK: [BLOCK_TOPK, BLOCK_H]
-                qk += tl.dot(k_gathered, qT)
-            
-            qk = qk * scaling
+            # ============= 从缓存读取 QK (优化点) =============
+            # 从 QKCache 读取已缓存的 QK 结果
+            qk_cache_ptrs = qk_cache_base + offs_tk[:, None] * stride_qkc_k + offs_h[None, :] * stride_qkc_h
+            qk = tl.load(qk_cache_ptrs, mask=tk_mask[:, None] & h_mask[None, :], other=0.0)
+            # =================================================
             
             # 应用 causal mask 和 head mask
             invalid_mask = causal_mask_block[:, None] | (~h_mask[None, :])
@@ -367,15 +367,16 @@ def _indexer_loss_bwd_kernel(
         tl.store(dis_ptrs, grad, mask=tk_mask)
 
 
-class IndexerLossFunction(torch.autograd.Function):
+class IndexerLossFunctionOpt(torch.autograd.Function):
     """
-    自定义 autograd Function，实现稀疏注意力索引损失的前向和反向传播
+    自定义 autograd Function，实现稀疏注意力索引损失的前向和反向传播 (QK 缓存优化版本)
     
     前向传播:
         1. 计算 sparse attention (Q @ K[indices]) 并应用 online softmax
-        2. 将所有 head 的 attention 累加到 attn_sum
-        3. 对 index_score 做 softmax 得到 index_prob
-        4. 计算 KL(attn_dist || index_prob) 作为损失
+        2. 缓存 QK 结果到 qk_cache，避免 Pass 2 重复计算
+        3. 将所有 head 的 attention 累加到 attn_sum
+        4. 对 index_score 做 softmax 得到 index_prob
+        5. 计算 KL(attn_dist || index_prob) 作为损失
     
     反向传播:
         由于 attn_dist 不依赖于 index_score（只依赖于 Q, K），所以：
@@ -385,7 +386,7 @@ class IndexerLossFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, query, key, index_score, indices, scaling, chunk_offset=0, eps=1e-10, block_topk=None):
         """
-        前向传播
+        前向传播 (QK 缓存优化版本)
         
         Args:
             query: [batch, num_heads, chunk_size, head_dim]
@@ -409,6 +410,11 @@ class IndexerLossFunction(torch.autograd.Function):
         if block_topk < 16:
             block_topk = 16
         
+        # 选择合适的 block_h (确保 >= 16 以满足 tl.dot 要求)
+        block_h = min(BLOCK_H, num_heads)
+        if block_h < 16:
+            block_h = 16
+        
         query = query.contiguous()
         key = key.contiguous()
         index_score = index_score.contiguous()
@@ -420,23 +426,24 @@ class IndexerLossFunction(torch.autograd.Function):
         # 中间存储: 累加的 attention [batch, chunk_size, topk]
         attn_sum = torch.zeros(batch_size, chunk_size, topk, device=query.device, dtype=torch.float32)
         
+        # QK 缓存: [batch, chunk_size, topk, block_h]
+        # 仅缓存当前 head_block 的 QK 结果，显存开销较小
+        qk_cache = torch.zeros(batch_size, chunk_size, topk, block_h, device=query.device, dtype=torch.float32)
+        
         # 每个 program 处理一个 (batch, query_row)
         grid = (batch_size * chunk_size,)
         
-        # 选择合适的 block_h (确保 >= 16 以满足 tl.dot 要求)
-        block_h = min(BLOCK_H, num_heads)
-        if block_h < 16:
-            block_h = 16
-        
-        _indexer_loss_fwd_kernel[grid](
+        _indexer_loss_fwd_kernel_opt[grid](
             query, key, index_score, indices, loss_per_row,
             attn_sum,  # 中间存储
+            qk_cache,  # QK 缓存
             batch_size, num_heads, chunk_size, chunk_offset, head_dim, topk, scaling, eps,
             query.stride(0), query.stride(1), query.stride(2), query.stride(3),
             key.stride(0), key.stride(1), key.stride(2),
             index_score.stride(0), index_score.stride(1), index_score.stride(2),
             indices.stride(0), indices.stride(1), indices.stride(2),
             attn_sum.stride(0), attn_sum.stride(1), attn_sum.stride(2),
+            qk_cache.stride(0), qk_cache.stride(1), qk_cache.stride(2), qk_cache.stride(3),
             BLOCK_D=BLOCK_D,
             BLOCK_TOPK=block_topk,
             BLOCK_H=block_h,
@@ -503,17 +510,19 @@ class IndexerLossFunction(torch.autograd.Function):
         return None, None, grad_index_score, None, None, None, None, None
 
 
-def indexer_loss(query, key, index_score, indices, scaling, chunk_offset=0, eps=1e-10, block_topk=None):
+def indexer_loss_opt(query, key, index_score, indices, scaling, chunk_offset=0, eps=1e-10, block_topk=None):
     """
-    计算稀疏注意力索引损失 (Sparse Attention Index Loss)
+    计算稀疏注意力索引损失 (Sparse Attention Index Loss) - QK 缓存优化版本
     
     该函数使用 Triton kernel 实现高效的稀疏注意力损失计算，支持自动梯度反向传播。
+    通过缓存 QK 计算结果，避免在 Pass 2 中重复计算，提升性能。
     
     核心思想:
         1. 计算 sparse attention: softmax(Q @ K[indices] * scaling)
-        2. 将所有 head 的 attention 求和并归一化得到 attn_dist
-        3. 对 index_score 做 softmax 得到 index_prob
-        4. 计算 KL(attn_dist || index_prob) 作为损失
+        2. 缓存 QK 结果，Pass 2 直接读取
+        3. 将所有 head 的 attention 求和并归一化得到 attn_dist
+        4. 对 index_score 做 softmax 得到 index_prob
+        5. 计算 KL(attn_dist || index_prob) 作为损失
     
     Args:
         query: [batch, num_heads, chunk_size, head_dim] - 当前 chunk 的 query
@@ -536,14 +545,14 @@ def indexer_loss(query, key, index_score, indices, scaling, chunk_offset=0, eps=
         >>> index_score = torch.randn(batch, chunk_size, topk, device='cuda', requires_grad=True)
         >>> indices = torch.randint(0, seq_len, (batch, chunk_size, topk), device='cuda')
         >>> scaling = 1.0 / (head_dim ** 0.5)
-        >>> loss = indexer_loss(query, key, index_score, indices, scaling, chunk_offset=seq_len - chunk_size)
+        >>> loss = indexer_loss_opt(query, key, index_score, indices, scaling, chunk_offset=seq_len - chunk_size)
         >>> loss.backward()  # index_score.grad 现在包含梯度
     """
-    return IndexerLossFunction.apply(query, key, index_score, indices, scaling, chunk_offset, eps, block_topk)
+    return IndexerLossFunctionOpt.apply(query, key, index_score, indices, scaling, chunk_offset, eps, block_topk)
 
 
 # ============================================================================
-# PyTorch 参考实现
+# PyTorch 参考实现 (从原文件复用)
 # ============================================================================
 
 def pytorch_reference_fwd(query, key, index_score_full, index_mask, scaling):
@@ -698,9 +707,9 @@ def run_fwd_accuracy_test(config: TestConfig, device: str = 'cuda'):
     # PyTorch 参考
     ref = pytorch_reference_fwd(query, key, index_score_full, index_mask, scaling)
     
-    # Triton 实现
-    tri = indexer_loss(query, key, index_score_sparse, topk_indices, 
-                       scaling, chunk_offset=chunk_offset)
+    # Triton 优化版本
+    tri = indexer_loss_opt(query, key, index_score_sparse, topk_indices, 
+                           scaling, chunk_offset=chunk_offset)
     
     abs_diff = abs(ref.item() - tri.item())
     rel_diff = abs_diff / (abs(ref.item()) + 1e-10)
@@ -719,7 +728,7 @@ def run_fwd_accuracy_test(config: TestConfig, device: str = 'cuda'):
 def test_fwd_accuracy(configs: List[TestConfig]):
     """批量运行前向精度测试"""
     print("\n" + "=" * 100)
-    print("前向精度测试 (PyTorch Full vs Triton Sparse)")
+    print("前向精度测试 (PyTorch Full vs Triton Sparse Optimized)")
     print("=" * 100)
     
     results = []
@@ -765,9 +774,9 @@ def run_bwd_accuracy_test(config: TestConfig, device: str = 'cuda'):
     # PyTorch 参考: 使用 autograd 计算梯度
     ref_grad = pytorch_reference_bwd(query, key, index_score_full, index_mask, topk_indices, scaling)
     
-    # Triton 实现: 使用自定义 backward
-    loss = indexer_loss(query, key, index_score_sparse, topk_indices, 
-                        scaling, chunk_offset=chunk_offset)
+    # Triton 优化版本: 使用自定义 backward
+    loss = indexer_loss_opt(query, key, index_score_sparse, topk_indices, 
+                            scaling, chunk_offset=chunk_offset)
     loss.backward()
     tri_grad = index_score_sparse.grad
     
@@ -789,7 +798,7 @@ def run_bwd_accuracy_test(config: TestConfig, device: str = 'cuda'):
 def test_bwd_accuracy(configs: List[TestConfig]):
     """批量运行反向精度测试"""
     print("\n" + "=" * 100)
-    print("反向精度测试 (PyTorch autograd vs Triton kernel)")
+    print("反向精度测试 (PyTorch autograd vs Triton kernel Optimized)")
     print("=" * 100)
     
     results = []
@@ -811,10 +820,10 @@ def test_bwd_accuracy(configs: List[TestConfig]):
 
 
 # ============================================================================
-# 前向性能测试
+# 性能对比测试 (原版 vs 优化版)
 # ============================================================================
 
-def test_fwd_performance(
+def test_performance_comparison(
     batch_size: int = 1,
     num_heads: int = 16,
     chunk_size: int = 4 * 1024,
@@ -824,23 +833,19 @@ def test_fwd_performance(
     seed: int = 42,
     num_warmup: int = 10,
     num_benchmark: int = 50,
-    triton_only: bool = False,
 ):
-    """前向性能测试"""
+    """性能对比测试: 原版 vs 优化版"""
     import time
+    from indexer_loss_kernel import indexer_loss as indexer_loss_orig
     
     torch.manual_seed(seed)
     device = 'cuda'
     scaling = 1.0 / (head_dim ** 0.5)
     
     print("\n" + "=" * 80)
-    print("前向性能测试" + (" (Triton only)" if triton_only else " (Triton vs PyTorch)"))
+    print("性能对比测试 (原版 vs QK缓存优化版)")
     print("=" * 80)
     print(f"参数: batch={batch_size}, heads={num_heads}, chunk={chunk_size}, seq={seq_len}, dim={head_dim}, topk={topk}")
-    print(f"Sparse 复杂度: O({chunk_size * topk * head_dim * num_heads:,})")
-    if not triton_only:
-        print(f"Full 复杂度:   O({chunk_size * seq_len * head_dim * num_heads:,})")
-        print(f"理论加速比:   {seq_len / topk:.2f}x")
     print("=" * 80)
     
     query = torch.randn(batch_size, num_heads, chunk_size, head_dim, device=device, dtype=torch.bfloat16)
@@ -857,62 +862,52 @@ def test_fwd_performance(
     torch.cuda.synchronize()
     base_memory = torch.cuda.memory_allocated() / (1024**3)
     
-    # Triton 测试
+    # 原版测试
     torch.cuda.reset_peak_memory_stats()
     for _ in range(num_warmup):
-        _ = indexer_loss(query, key, index_score_sparse, topk_indices, scaling, chunk_offset=chunk_offset)
+        _ = indexer_loss_orig(query, key, index_score_sparse, topk_indices, scaling, chunk_offset=chunk_offset)
     torch.cuda.synchronize()
     
     torch.cuda.reset_peak_memory_stats()
     start = time.time()
     for _ in range(num_benchmark):
-        _ = indexer_loss(query, key, index_score_sparse, topk_indices, scaling, chunk_offset=chunk_offset)
+        _ = indexer_loss_orig(query, key, index_score_sparse, topk_indices, scaling, chunk_offset=chunk_offset)
     torch.cuda.synchronize()
-    triton_time = (time.time() - start) / num_benchmark * 1000
-    triton_peak = torch.cuda.max_memory_allocated() / (1024**3)
-    results['triton'] = triton_time
-    memory_stats['triton'] = triton_peak
+    orig_time = (time.time() - start) / num_benchmark * 1000
+    orig_peak = torch.cuda.max_memory_allocated() / (1024**3)
+    results['original'] = orig_time
+    memory_stats['original'] = orig_peak
     
-    # PyTorch 测试
-    if not triton_only:
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-        
-        for _ in range(num_warmup):
-            _ = pytorch_reference_fwd(query, key, index_score_full, index_mask, scaling)
-        torch.cuda.synchronize()
-        
-        torch.cuda.reset_peak_memory_stats()
-        start = time.time()
-        for _ in range(num_benchmark):
-            _ = pytorch_reference_fwd(query, key, index_score_full, index_mask, scaling)
-        torch.cuda.synchronize()
-        pytorch_time = (time.time() - start) / num_benchmark * 1000
-        pytorch_peak = torch.cuda.max_memory_allocated() / (1024**3)
-        results['pytorch'] = pytorch_time
-        memory_stats['pytorch'] = pytorch_peak
+    # 优化版测试
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    for _ in range(num_warmup):
+        _ = indexer_loss_opt(query, key, index_score_sparse, topk_indices, scaling, chunk_offset=chunk_offset)
+    torch.cuda.synchronize()
+    
+    torch.cuda.reset_peak_memory_stats()
+    start = time.time()
+    for _ in range(num_benchmark):
+        _ = indexer_loss_opt(query, key, index_score_sparse, topk_indices, scaling, chunk_offset=chunk_offset)
+    torch.cuda.synchronize()
+    opt_time = (time.time() - start) / num_benchmark * 1000
+    opt_peak = torch.cuda.max_memory_allocated() / (1024**3)
+    results['optimized'] = opt_time
+    memory_stats['optimized'] = opt_peak
     
     print(f"\n>>> 前向性能 (warmup={num_warmup}, iters={num_benchmark})")
-    if triton_only:
-        print(f"  Triton Sparse:  {triton_time:.3f} ms")
-    else:
-        print(f"  PyTorch Full:   {pytorch_time:.3f} ms")
-        print(f"  Triton Sparse:  {triton_time:.3f} ms (加速: {pytorch_time/triton_time:.2f}x)")
+    print(f"  原版:       {orig_time:.3f} ms")
+    print(f"  优化版:     {opt_time:.3f} ms (加速: {orig_time/opt_time:.2f}x)")
     
     print(f"\n>>> 显存峰值")
-    print(f"  基准显存:       {base_memory:.2f} GB")
-    print(f"  Triton 峰值:    {memory_stats['triton']:.2f} GB (增量: {memory_stats['triton'] - base_memory:.2f} GB)")
-    if not triton_only:
-        print(f"  PyTorch 峰值:   {memory_stats['pytorch']:.2f} GB (增量: {memory_stats['pytorch'] - base_memory:.2f} GB)")
+    print(f"  基准显存:   {base_memory:.2f} GB")
+    print(f"  原版峰值:   {memory_stats['original']:.2f} GB (增量: {memory_stats['original'] - base_memory:.2f} GB)")
+    print(f"  优化版峰值: {memory_stats['optimized']:.2f} GB (增量: {memory_stats['optimized'] - base_memory:.2f} GB)")
     
-    return results
+    return results, memory_stats
 
 
-# ============================================================================
-# 反向性能测试
-# ============================================================================
-
-def test_bwd_performance(
+def test_fwd_bwd_performance_comparison(
     batch_size: int = 1,
     num_heads: int = 16,
     chunk_size: int = 4 * 1024,
@@ -922,17 +917,17 @@ def test_bwd_performance(
     seed: int = 42,
     num_warmup: int = 10,
     num_benchmark: int = 50,
-    triton_only: bool = False,
 ):
-    """反向性能测试"""
+    """前向+反向性能对比测试: 原版 vs 优化版"""
     import time
+    from indexer_loss_kernel import indexer_loss as indexer_loss_orig
     
     torch.manual_seed(seed)
     device = 'cuda'
     scaling = 1.0 / (head_dim ** 0.5)
     
     print("\n" + "=" * 80)
-    print("反向性能测试" + (" (Triton only)" if triton_only else " (Triton vs PyTorch)"))
+    print("前向+反向性能对比测试 (原版 vs QK缓存优化版)")
     print("=" * 80)
     print(f"参数: batch={batch_size}, heads={num_heads}, chunk={chunk_size}, seq={seq_len}, dim={head_dim}, topk={topk}")
     print("=" * 80)
@@ -951,11 +946,11 @@ def test_bwd_performance(
     torch.cuda.synchronize()
     base_memory = torch.cuda.memory_allocated() / (1024**3)
     
-    # Triton 反向测试 (前向 + 反向)
+    # 原版测试 (前向 + 反向)
     torch.cuda.reset_peak_memory_stats()
     for _ in range(num_warmup):
         index_score_sparse_copy = index_score_sparse.clone().requires_grad_(True)
-        loss = indexer_loss(query, key, index_score_sparse_copy, topk_indices, scaling, chunk_offset=chunk_offset)
+        loss = indexer_loss_orig(query, key, index_score_sparse_copy, topk_indices, scaling, chunk_offset=chunk_offset)
         loss.backward()
     torch.cuda.synchronize()
     
@@ -963,51 +958,45 @@ def test_bwd_performance(
     start = time.time()
     for _ in range(num_benchmark):
         index_score_sparse_copy = index_score_sparse.clone().requires_grad_(True)
-        loss = indexer_loss(query, key, index_score_sparse_copy, topk_indices, scaling, chunk_offset=chunk_offset)
+        loss = indexer_loss_orig(query, key, index_score_sparse_copy, topk_indices, scaling, chunk_offset=chunk_offset)
         loss.backward()
     torch.cuda.synchronize()
-    triton_time = (time.time() - start) / num_benchmark * 1000
-    triton_peak = torch.cuda.max_memory_allocated() / (1024**3)
-    results['triton_fwd_bwd'] = triton_time
-    memory_stats['triton'] = triton_peak
+    orig_time = (time.time() - start) / num_benchmark * 1000
+    orig_peak = torch.cuda.max_memory_allocated() / (1024**3)
+    results['original_fwd_bwd'] = orig_time
+    memory_stats['original'] = orig_peak
     
-    # PyTorch 反向测试
-    if not triton_only:
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-        
-        for _ in range(num_warmup):
-            index_score_full_copy = index_score_full.clone().requires_grad_(True)
-            loss = pytorch_reference_fwd(query, key, index_score_full_copy, index_mask, scaling)
-            loss.backward()
-        torch.cuda.synchronize()
-        
-        torch.cuda.reset_peak_memory_stats()
-        start = time.time()
-        for _ in range(num_benchmark):
-            index_score_full_copy = index_score_full.clone().requires_grad_(True)
-            loss = pytorch_reference_fwd(query, key, index_score_full_copy, index_mask, scaling)
-            loss.backward()
-        torch.cuda.synchronize()
-        pytorch_time = (time.time() - start) / num_benchmark * 1000
-        pytorch_peak = torch.cuda.max_memory_allocated() / (1024**3)
-        results['pytorch_fwd_bwd'] = pytorch_time
-        memory_stats['pytorch'] = pytorch_peak
+    # 优化版测试 (前向 + 反向)
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    for _ in range(num_warmup):
+        index_score_sparse_copy = index_score_sparse.clone().requires_grad_(True)
+        loss = indexer_loss_opt(query, key, index_score_sparse_copy, topk_indices, scaling, chunk_offset=chunk_offset)
+        loss.backward()
+    torch.cuda.synchronize()
+    
+    torch.cuda.reset_peak_memory_stats()
+    start = time.time()
+    for _ in range(num_benchmark):
+        index_score_sparse_copy = index_score_sparse.clone().requires_grad_(True)
+        loss = indexer_loss_opt(query, key, index_score_sparse_copy, topk_indices, scaling, chunk_offset=chunk_offset)
+        loss.backward()
+    torch.cuda.synchronize()
+    opt_time = (time.time() - start) / num_benchmark * 1000
+    opt_peak = torch.cuda.max_memory_allocated() / (1024**3)
+    results['optimized_fwd_bwd'] = opt_time
+    memory_stats['optimized'] = opt_peak
     
     print(f"\n>>> 前向+反向性能 (warmup={num_warmup}, iters={num_benchmark})")
-    if triton_only:
-        print(f"  Triton Sparse:  {triton_time:.3f} ms")
-    else:
-        print(f"  PyTorch Full:   {pytorch_time:.3f} ms")
-        print(f"  Triton Sparse:  {triton_time:.3f} ms (加速: {pytorch_time/triton_time:.2f}x)")
+    print(f"  原版:       {orig_time:.3f} ms")
+    print(f"  优化版:     {opt_time:.3f} ms (加速: {orig_time/opt_time:.2f}x)")
     
     print(f"\n>>> 显存峰值")
-    print(f"  基准显存:       {base_memory:.2f} GB")
-    print(f"  Triton 峰值:    {memory_stats['triton']:.2f} GB (增量: {memory_stats['triton'] - base_memory:.2f} GB)")
-    if not triton_only:
-        print(f"  PyTorch 峰值:   {memory_stats['pytorch']:.2f} GB (增量: {memory_stats['pytorch'] - base_memory:.2f} GB)")
+    print(f"  基准显存:   {base_memory:.2f} GB")
+    print(f"  原版峰值:   {memory_stats['original']:.2f} GB (增量: {memory_stats['original'] - base_memory:.2f} GB)")
+    print(f"  优化版峰值: {memory_stats['optimized']:.2f} GB (增量: {memory_stats['optimized'] - base_memory:.2f} GB)")
     
-    return results
+    return results, memory_stats
 
 
 # ============================================================================
@@ -1024,20 +1013,14 @@ if __name__ == "__main__":
         TestConfig(name="大head_dim", batch_size=1, num_heads=8, chunk_size=128, seq_len=256, head_dim=256, topk=64),
     ]
     
-    # 大规模精度测试配置 (可选，需要足够显存)
-    large_accuracy_configs = [
-        TestConfig(name="超大规模1", batch_size=1, num_heads=128, chunk_size=4096, seq_len=4096, head_dim=576, topk=2048),
-        TestConfig(name="超大规模2", batch_size=1, num_heads=128, chunk_size=4096, seq_len=8192, head_dim=576, topk=2048),
-    ]
-    
     # ========== 前向精度测试 ==========
     test_fwd_accuracy(accuracy_configs)
     
     # ========== 反向精度测试 ==========
     test_bwd_accuracy(accuracy_configs)
     
-    # ========== 前向性能测试 ==========
-    test_fwd_performance(
+    # ========== 性能对比测试 ==========
+    test_performance_comparison(
         batch_size=1,
         num_heads=128,
         chunk_size=4 * 1024,
@@ -1046,11 +1029,10 @@ if __name__ == "__main__":
         topk=2048,
         num_warmup=3,
         num_benchmark=10,
-        triton_only=False,
     )
     
-    # ========== 反向性能测试 ==========
-    test_bwd_performance(
+    # ========== 前向+反向性能对比测试 ==========
+    test_fwd_bwd_performance_comparison(
         batch_size=1,
         num_heads=128,
         chunk_size=4 * 1024,
@@ -1059,5 +1041,5 @@ if __name__ == "__main__":
         topk=2048,
         num_warmup=3,
         num_benchmark=10,
-        triton_only=False,
     )
+
