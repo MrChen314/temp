@@ -1,7 +1,6 @@
-# 在 kernel 中添加 shared memory 缓存
-for tk_idx in range(num_topk_blocks):
-    # 先预取下一批 indices 的 K 到 shared memory
-    indices_next = tl.load(idx_base + next_offs_tk * stride_ik, ...)
-    # 异步加载到 shared memory
-    k_smem = tl.load(k_ptr, ..., cache_modifier=".cg")  # 使用 L2 cache 旁路
-    # 当前批次从 shared memory 读取计算
+# 在调用 kernel 前对 indices 排序
+sorted_indices, sort_order = indices.sort(dim=-1)
+# 调用 kernel 使用 sorted_indices
+result = kernel(query, key, sorted_indices, ...)
+# 结果按 sort_order 还原顺序
+final_result = result.scatter(-1, sort_order, result)
