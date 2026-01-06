@@ -1,26 +1,13 @@
 # ruff: noqa
-"""
-TileLang 实现的 Indexer Loss Kernel - 2 线程组流水线优化版本
-
-优化点：
-1. Producer 线程组预取 K 数据，使用双缓冲隐藏 global memory 延迟
-2. 计算线程组执行 QK 计算 + Online Softmax + 归一化累加
-
-架构：
-- tx < 128: 计算线程组（QK 计算 + Online Softmax + 归一化累加）
-- tx >= 128: Producer 线程组（按 indices 预取 K 数据到 shared memory）
-"""
-
 import torch
 import tilelang
 from tilelang import language as T
-from dataclasses import dataclass
-from typing import List, Optional
-import torch.nn.functional as F
+from tilelang.engine.callback import register_cuda_postproc_callback
+import argparse
 
 
 @tilelang.jit(
-    out_idx=[-1],  # attn_sum 作为输出
+    out_idx=[-1],
     compile_flags=[
         "-O3",
         "-Wno-deprecated-declarations",
@@ -34,820 +21,739 @@ import torch.nn.functional as F
         "-DNDEBUG",
     ],
 )
-def indexer_loss_fwd_kernel(
-    batch_size,
-    num_heads,
-    chunk_size,
-    head_dim,
+def indexer_loss_fwd(
+    batch,
+    seq_len,
+    seq_len_kv,
+    heads,
+    dim,
+    tail_dim,
     topk,
-    chunk_offset,
-    scaling,
-    block_tk=64,
-    block_h=16,
-    threads=256,
+    kv_stride,
+    kv_group=1,
+    sm_scale=None,
+    is_causal=True,
+    CP0=True,
+    block_I=64,
+    num_stages=0,
+    threads=384,
 ):
     """
-    TileLang 实现的 Indexer Loss Forward Kernel - 2 线程组版本
+    IndexerLoss Forward Kernel with Pipeline Optimization
     
-    每个 program 处理一个 (batch, query_row)。
-    对于每个 head_block：
-    - Pass1: 遍历所有 topk_blocks，计算 online softmax 得到全局 m 和 l
-    - Pass2: 重新遍历，使用全局 m 和 l 计算归一化概率并累加
+    计算 sparse attention 的累加分布 AttnSum，用于后续的 loss 计算。
     
-    流水线优化：Producer 线程组使用双缓冲预取 K 数据
+    线程分组:
+    - 线程1组 (tx < 128): 处理前半 heads，两遍扫描计算 m/l 和 attn_sum
+    - 线程2组 (128 <= tx < 256): 处理后半 heads，两遍扫描计算 m/l 和 attn_sum  
+    - 线程3组 (tx >= 256): producer，负责加载 K 到 shared memory 双 buffer
+    
+    输出:
+    - AttnSum: [batch, seq_len, topk] - 所有 head 的 attention 概率求和
     """
-    assert topk % block_tk == 0, "topk should be divisible by block_tk"
-    
-    # 确保 block_h 满足 tensor core 要求
-    block_h = max(block_h, 16)
-    
-    # 计算块数量
-    NTK = tilelang.cdiv(topk, block_tk)
-    NH = tilelang.cdiv(num_heads, block_h)
-    D = head_dim
-    
-    # 数据类型
+    assert dim == tilelang.math.next_power_of_2(dim), f"haven't check padding correctness yet, dim={dim}"
+    assert tail_dim == tilelang.math.next_power_of_2(tail_dim), f"haven't check padding correctness yet, dim={tail_dim}"
+    assert is_causal == True, "non-casual is not supported"
+    assert topk % block_I == 0, "otherwise will load some index=0 thus causing wrong kv to be loaded"
+    if sm_scale is None:
+        sm_scale = (1.0 / (dim + tail_dim)) ** 0.5 * 1.44269504  # log2(e)
+    else:
+        sm_scale = sm_scale * 1.44269504  # log2(e)
+
+    head_kv = heads // kv_group
+    q_shape = [batch, seq_len, heads, dim + tail_dim]
+    kv_shape = [batch, seq_len_kv, kv_group, dim + tail_dim]
+    indices_shape = [batch, seq_len, kv_group, topk]
+    attn_sum_shape = [batch, seq_len, topk]
+    indices_dtype = T.int32
     dtype = T.bfloat16
     accum_dtype = T.float32
-    indices_dtype = T.int32
-    
-    # Tensor shapes
-    q_shape = [batch_size, num_heads, chunk_size, head_dim]
-    k_shape = [batch_size, chunk_size + chunk_offset, head_dim]
-    indices_shape = [batch_size, chunk_size, topk]
-    attn_sum_shape = [batch_size, chunk_size, topk]
-    
-    BI = block_tk
-    BH = block_h
-    
-    NEG_INF = -1e9
-    LOG2E = 1.44269504  # log2(e)
-    
+
+    G = kv_group
+    H = head_kv
+    padded_H = max(tilelang.math.next_power_of_2(head_kv), 16)
+    if padded_H != H:
+        assert kv_group == 1, (
+            "here we solve the H padding automatically, other wise you should handle Q copy and Output copy with your mask (when kv_group == 1, use g_i * padded_H:(g_i+1) * padded_H would be handled automatically)"
+        )
+    BI = block_I
+    NI = tilelang.cdiv(topk, block_I)
+    assert NI % 2 == 0, "NI should be a multiple of 2"
+    D = dim
+    D_tail = tail_dim
+    KV_stride = kv_stride
+    if head_kv > 64:
+        assert head_kv % 64 == 0, "head_kv should be a multiple of 64"
+        REPLICATE_H = head_kv // 64
+    else:
+        REPLICATE_H = 1
+
+    H_per_block = padded_H if REPLICATE_H == 1 else 64
+    # 每组线程处理一半的 heads
+    H_half = H_per_block // 2
+
     @T.prim_func
     def main(
-        Q: T.Tensor(q_shape, dtype),
-        K: T.Tensor(k_shape, dtype),
-        Indices: T.Tensor(indices_shape, indices_dtype),
-        AttnSum: T.Tensor(attn_sum_shape, accum_dtype),
+        Q: T.Tensor(q_shape, dtype),  # type: ignore
+        KV: T.Tensor(kv_shape, dtype),  # type: ignore
+        Indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore
+        q_start_index_s: T.Tensor(1, indices_dtype),
+        AttnSum: T.Tensor(attn_sum_shape, accum_dtype),  # type: ignore
     ):
-        with T.Kernel(chunk_size, batch_size, threads=threads) as (bx, by):
-            # ===============================================================
-            # Shared Memory 分配
-            # ===============================================================
-            # Q 缓存: [BH, D] - 当前 head_block 的 Q
-            Q_shared = T.alloc_shared([BH, D], dtype)
+        with T.Kernel((seq_len - kv_stride + 1 if CP0 else seq_len) * REPLICATE_H, batch, kv_group, threads=threads) as (bx, by, bz):
+            # Q shared memory - 两组线程共用
+            Q_shared_l = T.alloc_shared([H_per_block, D // 2], dtype)
+            Q_shared_r = T.alloc_shared([H_per_block, D // 2], dtype)
+            Q_tail_shared = T.alloc_shared([H_per_block, D_tail], dtype)
             
-            # K 双缓冲: [BI, D] x 2
-            K_shared_0 = T.alloc_shared([BI, D], dtype)
-            K_shared_1 = T.alloc_shared([BI, D], dtype)
+            # K shared memory - 双 buffer
+            KV_shared_0_l = T.alloc_shared([BI, D // 2], dtype)
+            KV_shared_0_r = T.alloc_shared([BI, D // 2], dtype)
+            KV_shared_1_l = T.alloc_shared([BI, D // 2], dtype)
+            KV_shared_1_r = T.alloc_shared([BI, D // 2], dtype)
+            K_tail_shared_0 = T.alloc_shared([BI, D_tail], dtype)
+            K_tail_shared_1 = T.alloc_shared([BI, D_tail], dtype)
             
-            # 有效性标记双缓冲
-            is_valid_0 = T.alloc_shared([BI], "bool", scope="shared")
-            is_valid_1 = T.alloc_shared([BI], "bool", scope="shared")
+            # K validity mask
+            is_kv_valid_0 = T.alloc_shared([BI], "bool", scope="shared")
+            is_kv_valid_1 = T.alloc_shared([BI], "bool", scope="shared")
             
-            # Softmax 参数的 shared memory 版本（用于避免 layout 冲突）
-            m_block_shared = T.alloc_shared([BH], accum_dtype)
-            m_new_shared = T.alloc_shared([BH], accum_dtype)
-            m_global_shared = T.alloc_shared([BH], accum_dtype)
-            l_global_shared = T.alloc_shared([BH], accum_dtype)
+            # Indices shared memory for second pass
+            indices_shared_0 = T.alloc_shared([BI], indices_dtype)
+            indices_shared_1 = T.alloc_shared([BI], indices_dtype)
+
+            # 线程1组的局部变量
+            acc_s_1 = T.alloc_fragment([H_half, BI], accum_dtype)
+            sumexp_1 = T.alloc_fragment([H_half], accum_dtype)
+            sumexp_i_1 = T.alloc_fragment([H_half], accum_dtype)
+            m_i_1 = T.alloc_fragment([H_half], accum_dtype)
+            m_i_prev_1 = T.alloc_fragment([H_half], accum_dtype)
+            attn_sum_local_1 = T.alloc_fragment([BI], accum_dtype)
             
-            # exp_sum 的 shared memory 缓存
-            exp_sum_shared = T.alloc_shared([BI], accum_dtype)
+            # 线程2组的局部变量
+            acc_s_2 = T.alloc_fragment([H_half, BI], accum_dtype)
+            sumexp_2 = T.alloc_fragment([H_half], accum_dtype)
+            sumexp_i_2 = T.alloc_fragment([H_half], accum_dtype)
+            m_i_2 = T.alloc_fragment([H_half], accum_dtype)
+            m_i_prev_2 = T.alloc_fragment([H_half], accum_dtype)
+            attn_sum_local_2 = T.alloc_fragment([BI], accum_dtype)
             
-            # Fragment 分配
-            acc_qk = T.alloc_fragment([BI, BH], accum_dtype)
-            m_global = T.alloc_fragment([BH], accum_dtype)
-            l_global = T.alloc_fragment([BH], accum_dtype)
-            m_block = T.alloc_fragment([BH], accum_dtype)
-            m_new = T.alloc_fragment([BH], accum_dtype)
-            alpha = T.alloc_fragment([BH], accum_dtype)
+            # 共享的 attn_sum 用于最终合并
+            attn_sum_shared = T.alloc_shared([BI], accum_dtype)
             
-            # 用于 reduce 操作的中间变量
-            block_sum = T.alloc_fragment([BH], accum_dtype)
-            
+            # 用于存储最终的 m 和 l (第一遍扫描结束后)
+            m_final_shared_1 = T.alloc_shared([H_half], accum_dtype)
+            l_final_shared_1 = T.alloc_shared([H_half], accum_dtype)
+            m_final_shared_2 = T.alloc_shared([H_half], accum_dtype)
+            l_final_shared_2 = T.alloc_shared([H_half], accum_dtype)
+
             indices_local = T.alloc_local([1], indices_dtype)
-            
-            # ===============================================================
-            # Barrier 分配（2 线程组）
-            # ===============================================================
-            bar_q = T.alloc_barrier(arrive_count=256)
+
+            # Barriers
+            bar_q = T.alloc_barrier(arrive_count=384)
             bar_k_0_ready = T.alloc_barrier(arrive_count=128)
             bar_k_1_ready = T.alloc_barrier(arrive_count=128)
-            bar_k_0_free = T.alloc_barrier(arrive_count=128)
-            bar_k_1_free = T.alloc_barrier(arrive_count=128)
-            
-            # ===============================================================
-            # 计算索引
-            # ===============================================================
-            b_i = by
-            s_i = bx
-            global_query_pos = chunk_offset + s_i
-            
+            bar_k_0_free = T.alloc_barrier(arrive_count=256)
+            bar_k_1_free = T.alloc_barrier(arrive_count=256)
+            bar_pass1_done = T.alloc_barrier(arrive_count=256)
+            bar_pass2_k_0_ready = T.alloc_barrier(arrive_count=128)
+            bar_pass2_k_1_ready = T.alloc_barrier(arrive_count=128)
+            bar_pass2_k_0_free = T.alloc_barrier(arrive_count=256)
+            bar_pass2_k_1_free = T.alloc_barrier(arrive_count=256)
+            # 线程1组写完后 arrive，线程2组 wait
+            bar_merge_ready = T.alloc_barrier(arrive_count=128)
+            # 线程2组读完后 arrive，线程1组 wait (下一轮才能继续写)
+            bar_merge_done = T.alloc_barrier(arrive_count=128)
+
+            b_i, g_i = by, bz
+            s_i = (bx + (KV_stride - 1 if CP0 else 0)) if REPLICATE_H == 1 else (bx // REPLICATE_H + (KV_stride - 1 if CP0 else 0))
+            q_i = q_start_index_s[0] + s_i
+            max_kv_i = (q_i + 1 - KV_stride) // KV_stride
+
+            H0 = g_i * padded_H + (0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * 64)
+            H1 = H0 + H_per_block
+
             tx = T.get_thread_binding()
-            
-            # ===============================================================
-            # 按 head_block 分组处理
-            # ===============================================================
-            for h_block in T.serial(NH):
-                h_start = h_block * BH
+
+            # 加载 Q 到 shared memory
+            T.copy(Q[b_i, s_i, H0:H1, 0 : D // 2], Q_shared_l)
+            T.copy(Q[b_i, s_i, H0:H1, D // 2 : D], Q_shared_r)
+            T.copy(Q[b_i, s_i, H0:H1, D:], Q_tail_shared)
+            T.barrier_arrive(bar_q)
+
+            if tx < 128:
+                # ================================================================
+                # 线程1组: 处理前半 heads [0, H_half)
+                # ================================================================
+                T.set_max_nreg(240, 1)
+                T.fill(sumexp_1, 0)
+                T.fill(m_i_1, -(2**30))
+                T.barrier_wait(bar_q, 0)
+
+                # ================================================================
+                # Pass 1: 计算 m_global 和 l_global
+                # ================================================================
+                for i_i in T.serial(T.ceildiv(NI, 2)):
+                    # Buffer 0
+                    T.barrier_wait(bar_k_0_ready[0], (i_i & 1))
+
+                    for h_i, bi_i in T.Parallel(H_half, BI):
+                        acc_s_1[h_i, bi_i] = T.if_then_else(is_kv_valid_0[bi_i], 0, -T.infinity(acc_s_1.dtype))
+                    # QK 矩阵乘 - 只用前半 heads
+                    T.gemm(Q_shared_l[0:H_half, :], KV_shared_0_l, acc_s_1, transpose_B=True, wg_wait=-1)
+                    T.gemm(Q_shared_r[0:H_half, :], KV_shared_0_r, acc_s_1, transpose_B=True, wg_wait=-1)
+                    T.gemm(Q_tail_shared[0:H_half, :], K_tail_shared_0, acc_s_1, transpose_B=True, wg_wait=-1)
+
+                    T.wait_wgmma(0)
+
+                    # Online softmax
+                    T.copy(m_i_1, m_i_prev_1)
+                    T.reduce_max(acc_s_1, m_i_1, dim=1, clear=False)
+                    for h_i in T.Parallel(H_half):
+                        m_i_1[h_i] = T.max(m_i_1[h_i], m_i_prev_1[h_i])
+                    for h_i, bi_i in T.Parallel(H_half, BI):
+                        acc_s_1[h_i, bi_i] = T.exp2(acc_s_1[h_i, bi_i] * sm_scale - m_i_1[h_i] * sm_scale)
+                    for h_i, bi_i in T.Parallel(H_half, BI):
+                        acc_s_1[h_i, bi_i] = T.if_then_else(is_kv_valid_0[bi_i], acc_s_1[h_i, bi_i], 0)
+                    T.reduce_sum(acc_s_1, sumexp_i_1, dim=1)
+                    for h_i in T.Parallel(H_half):
+                        sumexp_1[h_i] = sumexp_1[h_i] * T.exp2((m_i_prev_1[h_i] - m_i_1[h_i]) * sm_scale) + sumexp_i_1[h_i]
+
+                    T.barrier_arrive(bar_k_0_free[0])
+
+                    # Buffer 1
+                    T.barrier_wait(bar_k_1_ready[0], (i_i & 1))
+
+                    for h_i, bi_i in T.Parallel(H_half, BI):
+                        acc_s_1[h_i, bi_i] = T.if_then_else(is_kv_valid_1[bi_i], 0, -T.infinity(acc_s_1.dtype))
+                    T.gemm(Q_shared_l[0:H_half, :], KV_shared_1_l, acc_s_1, transpose_B=True, wg_wait=-1)
+                    T.gemm(Q_shared_r[0:H_half, :], KV_shared_1_r, acc_s_1, transpose_B=True, wg_wait=-1)
+                    T.gemm(Q_tail_shared[0:H_half, :], K_tail_shared_1, acc_s_1, transpose_B=True, wg_wait=-1)
+
+                    T.wait_wgmma(0)
+
+                    T.copy(m_i_1, m_i_prev_1)
+                    T.reduce_max(acc_s_1, m_i_1, dim=1, clear=False)
+                    for h_i in T.Parallel(H_half):
+                        m_i_1[h_i] = T.max(m_i_1[h_i], m_i_prev_1[h_i])
+                    for h_i, bi_i in T.Parallel(H_half, BI):
+                        acc_s_1[h_i, bi_i] = T.exp2(acc_s_1[h_i, bi_i] * sm_scale - m_i_1[h_i] * sm_scale)
+                    for h_i, bi_i in T.Parallel(H_half, BI):
+                        acc_s_1[h_i, bi_i] = T.if_then_else(is_kv_valid_1[bi_i], acc_s_1[h_i, bi_i], 0)
+                    T.reduce_sum(acc_s_1, sumexp_i_1, dim=1)
+                    for h_i in T.Parallel(H_half):
+                        sumexp_1[h_i] = sumexp_1[h_i] * T.exp2((m_i_prev_1[h_i] - m_i_1[h_i]) * sm_scale) + sumexp_i_1[h_i]
+
+                    T.barrier_arrive(bar_k_1_free[0])
+
+                # 保存最终的 m 和 l
+                for h_i in T.Parallel(H_half):
+                    m_final_shared_1[h_i] = m_i_1[h_i]
+                    l_final_shared_1[h_i] = sumexp_1[h_i]
                 
-                # 加载 Q 到 shared memory
-                T.copy(Q[b_i, h_start:h_start + BH, s_i, 0:D], Q_shared)
-                T.barrier_arrive(bar_q)
+                T.barrier_arrive(bar_pass1_done)
+                T.barrier_wait(bar_pass1_done, 0)
+
+                # ================================================================
+                # Pass 2: 使用 m_global/l_global 计算归一化 attention 并累加
+                # ================================================================
+                for i_i in T.serial(T.ceildiv(NI, 2)):
+                    # Buffer 0
+                    T.fill(attn_sum_local_1, 0)
+                    T.barrier_wait(bar_pass2_k_0_ready[0], (i_i & 1))
+
+                    for h_i, bi_i in T.Parallel(H_half, BI):
+                        acc_s_1[h_i, bi_i] = T.if_then_else(is_kv_valid_0[bi_i], 0, -T.infinity(acc_s_1.dtype))
+                    T.gemm(Q_shared_l[0:H_half, :], KV_shared_0_l, acc_s_1, transpose_B=True, wg_wait=-1)
+                    T.gemm(Q_shared_r[0:H_half, :], KV_shared_0_r, acc_s_1, transpose_B=True, wg_wait=-1)
+                    T.gemm(Q_tail_shared[0:H_half, :], K_tail_shared_0, acc_s_1, transpose_B=True, wg_wait=-1)
+
+                    T.wait_wgmma(0)
+
+                    # 使用最终的 m/l 归一化
+                    for h_i, bi_i in T.Parallel(H_half, BI):
+                        acc_s_1[h_i, bi_i] = T.exp2(acc_s_1[h_i, bi_i] * sm_scale - m_final_shared_1[h_i] * sm_scale) / l_final_shared_1[h_i]
+                    for h_i, bi_i in T.Parallel(H_half, BI):
+                        acc_s_1[h_i, bi_i] = T.if_then_else(is_kv_valid_0[bi_i], acc_s_1[h_i, bi_i], 0)
+                    
+                    # Head sum 并累加到 attn_sum_local
+                    for bi_i in T.Parallel(BI):
+                        for h_i in T.serial(H_half):
+                            attn_sum_local_1[bi_i] += acc_s_1[h_i, bi_i]
+                    
+                    # 写入 shared memory 供线程2组合并
+                    for bi_i in T.Parallel(BI):
+                        attn_sum_shared[bi_i] = attn_sum_local_1[bi_i]
+                    
+                    # 通知线程2组可以读取
+                    T.barrier_arrive(bar_merge_ready[0])
+                    # 等待线程2组读取完成后才能继续下一次写入
+                    T.barrier_wait(bar_merge_done[0], (i_i * 2) & 1)
+
+                    T.barrier_arrive(bar_pass2_k_0_free[0])
+
+                    # Buffer 1
+                    T.fill(attn_sum_local_1, 0)
+                    T.barrier_wait(bar_pass2_k_1_ready[0], (i_i & 1))
+
+                    for h_i, bi_i in T.Parallel(H_half, BI):
+                        acc_s_1[h_i, bi_i] = T.if_then_else(is_kv_valid_1[bi_i], 0, -T.infinity(acc_s_1.dtype))
+                    T.gemm(Q_shared_l[0:H_half, :], KV_shared_1_l, acc_s_1, transpose_B=True, wg_wait=-1)
+                    T.gemm(Q_shared_r[0:H_half, :], KV_shared_1_r, acc_s_1, transpose_B=True, wg_wait=-1)
+                    T.gemm(Q_tail_shared[0:H_half, :], K_tail_shared_1, acc_s_1, transpose_B=True, wg_wait=-1)
+
+                    T.wait_wgmma(0)
+
+                    for h_i, bi_i in T.Parallel(H_half, BI):
+                        acc_s_1[h_i, bi_i] = T.exp2(acc_s_1[h_i, bi_i] * sm_scale - m_final_shared_1[h_i] * sm_scale) / l_final_shared_1[h_i]
+                    for h_i, bi_i in T.Parallel(H_half, BI):
+                        acc_s_1[h_i, bi_i] = T.if_then_else(is_kv_valid_1[bi_i], acc_s_1[h_i, bi_i], 0)
+                    
+                    for bi_i in T.Parallel(BI):
+                        for h_i in T.serial(H_half):
+                            attn_sum_local_1[bi_i] += acc_s_1[h_i, bi_i]
+                    
+                    # 写入 shared memory 供线程2组合并
+                    for bi_i in T.Parallel(BI):
+                        attn_sum_shared[bi_i] = attn_sum_local_1[bi_i]
+                    
+                    # 通知线程2组可以读取
+                    T.barrier_arrive(bar_merge_ready[0])
+                    # 等待线程2组读取完成后才能继续下一次写入
+                    T.barrier_wait(bar_merge_done[0], (i_i * 2 + 1) & 1)
+
+                    T.barrier_arrive(bar_pass2_k_1_free[0])
+
+            elif tx >= 128 and tx < 256:
+                # ================================================================
+                # 线程2组: 处理后半 heads [H_half, H_per_block)
+                # ================================================================
+                T.set_max_nreg(240, 1)
+                T.fill(sumexp_2, 0)
+                T.fill(m_i_2, -(2**30))
+                T.barrier_wait(bar_q, 0)
+
+                # ================================================================
+                # Pass 1: 计算 m_global 和 l_global
+                # ================================================================
+                for i_i in T.serial(T.ceildiv(NI, 2)):
+                    # Buffer 0
+                    T.barrier_wait(bar_k_0_ready[0], (i_i & 1))
+
+                    for h_i, bi_i in T.Parallel(H_half, BI):
+                        acc_s_2[h_i, bi_i] = T.if_then_else(is_kv_valid_0[bi_i], 0, -T.infinity(acc_s_2.dtype))
+                    # QK 矩阵乘 - 只用后半 heads
+                    T.gemm(Q_shared_l[H_half:H_per_block, :], KV_shared_0_l, acc_s_2, transpose_B=True, wg_wait=-1)
+                    T.gemm(Q_shared_r[H_half:H_per_block, :], KV_shared_0_r, acc_s_2, transpose_B=True, wg_wait=-1)
+                    T.gemm(Q_tail_shared[H_half:H_per_block, :], K_tail_shared_0, acc_s_2, transpose_B=True, wg_wait=-1)
+
+                    T.wait_wgmma(0)
+
+                    T.copy(m_i_2, m_i_prev_2)
+                    T.reduce_max(acc_s_2, m_i_2, dim=1, clear=False)
+                    for h_i in T.Parallel(H_half):
+                        m_i_2[h_i] = T.max(m_i_2[h_i], m_i_prev_2[h_i])
+                    for h_i, bi_i in T.Parallel(H_half, BI):
+                        acc_s_2[h_i, bi_i] = T.exp2(acc_s_2[h_i, bi_i] * sm_scale - m_i_2[h_i] * sm_scale)
+                    for h_i, bi_i in T.Parallel(H_half, BI):
+                        acc_s_2[h_i, bi_i] = T.if_then_else(is_kv_valid_0[bi_i], acc_s_2[h_i, bi_i], 0)
+                    T.reduce_sum(acc_s_2, sumexp_i_2, dim=1)
+                    for h_i in T.Parallel(H_half):
+                        sumexp_2[h_i] = sumexp_2[h_i] * T.exp2((m_i_prev_2[h_i] - m_i_2[h_i]) * sm_scale) + sumexp_i_2[h_i]
+
+                    T.barrier_arrive(bar_k_0_free[0])
+
+                    # Buffer 1
+                    T.barrier_wait(bar_k_1_ready[0], (i_i & 1))
+
+                    for h_i, bi_i in T.Parallel(H_half, BI):
+                        acc_s_2[h_i, bi_i] = T.if_then_else(is_kv_valid_1[bi_i], 0, -T.infinity(acc_s_2.dtype))
+                    T.gemm(Q_shared_l[H_half:H_per_block, :], KV_shared_1_l, acc_s_2, transpose_B=True, wg_wait=-1)
+                    T.gemm(Q_shared_r[H_half:H_per_block, :], KV_shared_1_r, acc_s_2, transpose_B=True, wg_wait=-1)
+                    T.gemm(Q_tail_shared[H_half:H_per_block, :], K_tail_shared_1, acc_s_2, transpose_B=True, wg_wait=-1)
+
+                    T.wait_wgmma(0)
+
+                    T.copy(m_i_2, m_i_prev_2)
+                    T.reduce_max(acc_s_2, m_i_2, dim=1, clear=False)
+                    for h_i in T.Parallel(H_half):
+                        m_i_2[h_i] = T.max(m_i_2[h_i], m_i_prev_2[h_i])
+                    for h_i, bi_i in T.Parallel(H_half, BI):
+                        acc_s_2[h_i, bi_i] = T.exp2(acc_s_2[h_i, bi_i] * sm_scale - m_i_2[h_i] * sm_scale)
+                    for h_i, bi_i in T.Parallel(H_half, BI):
+                        acc_s_2[h_i, bi_i] = T.if_then_else(is_kv_valid_1[bi_i], acc_s_2[h_i, bi_i], 0)
+                    T.reduce_sum(acc_s_2, sumexp_i_2, dim=1)
+                    for h_i in T.Parallel(H_half):
+                        sumexp_2[h_i] = sumexp_2[h_i] * T.exp2((m_i_prev_2[h_i] - m_i_2[h_i]) * sm_scale) + sumexp_i_2[h_i]
+
+                    T.barrier_arrive(bar_k_1_free[0])
+
+                # 保存最终的 m 和 l
+                for h_i in T.Parallel(H_half):
+                    m_final_shared_2[h_i] = m_i_2[h_i]
+                    l_final_shared_2[h_i] = sumexp_2[h_i]
                 
-                if tx < 128:
-                    # =======================================================
-                    # 计算线程组
-                    # =======================================================
-                    T.set_max_nreg(240, 1)
+                T.barrier_arrive(bar_pass1_done)
+                T.barrier_wait(bar_pass1_done, 0)
+
+                # ================================================================
+                # Pass 2: 使用 m_global/l_global 计算归一化 attention 并累加
+                # ================================================================
+                for i_i in T.serial(T.ceildiv(NI, 2)):
+                    # Buffer 0
+                    T.fill(attn_sum_local_2, 0)
+                    T.barrier_wait(bar_pass2_k_0_ready[0], (i_i & 1))
+
+                    for h_i, bi_i in T.Parallel(H_half, BI):
+                        acc_s_2[h_i, bi_i] = T.if_then_else(is_kv_valid_0[bi_i], 0, -T.infinity(acc_s_2.dtype))
+                    T.gemm(Q_shared_l[H_half:H_per_block, :], KV_shared_0_l, acc_s_2, transpose_B=True, wg_wait=-1)
+                    T.gemm(Q_shared_r[H_half:H_per_block, :], KV_shared_0_r, acc_s_2, transpose_B=True, wg_wait=-1)
+                    T.gemm(Q_tail_shared[H_half:H_per_block, :], K_tail_shared_0, acc_s_2, transpose_B=True, wg_wait=-1)
+
+                    T.wait_wgmma(0)
+
+                    for h_i, bi_i in T.Parallel(H_half, BI):
+                        acc_s_2[h_i, bi_i] = T.exp2(acc_s_2[h_i, bi_i] * sm_scale - m_final_shared_2[h_i] * sm_scale) / l_final_shared_2[h_i]
+                    for h_i, bi_i in T.Parallel(H_half, BI):
+                        acc_s_2[h_i, bi_i] = T.if_then_else(is_kv_valid_0[bi_i], acc_s_2[h_i, bi_i], 0)
                     
-                    # 初始化 Online Softmax 状态
-                    T.fill(m_global, NEG_INF)
-                    T.fill(l_global, 0.0)
+                    for bi_i in T.Parallel(BI):
+                        for h_i in T.serial(H_half):
+                            attn_sum_local_2[bi_i] += acc_s_2[h_i, bi_i]
                     
-                    T.barrier_wait(bar_q, 0)
+                    # 等待线程1组写入 shared memory
+                    T.barrier_wait(bar_merge_ready[0], (i_i * 2) & 1)
                     
-                    # Pass 1: 遍历所有 topk_blocks，计算 online softmax
-                    for i_i in T.serial(T.ceildiv(NTK, 2)):
-                        # ----- Buffer 0 -----
-                        T.barrier_wait(bar_k_0_ready[0], (i_i & 1))
-                        
-                        # 初始化 QK（根据有效性设置初值）
-                        for tk_i, h_i in T.Parallel(BI, BH):
-                            acc_qk[tk_i, h_i] = T.if_then_else(is_valid_0[tk_i], 0.0, NEG_INF)
-                        
-                        # QK = K @ Q^T
-                        T.gemm(K_shared_0, Q_shared, acc_qk, transpose_B=True, wg_wait=-1)
-                        T.wait_wgmma(0)
-                        
-                        # 缩放
-                        for tk_i, h_i in T.Parallel(BI, BH):
-                            acc_qk[tk_i, h_i] = acc_qk[tk_i, h_i] * scaling
-                        
-                        # Online Softmax 更新 - 步骤1：计算块内 max
-                        T.reduce_max(acc_qk, m_block, dim=0, clear=True)
-                        # 将 m_block 存入 shared memory 以避免 layout 冲突
-                        T.copy(m_block, m_block_shared)
-                        
-                        # 步骤2：更新全局 max 和 alpha（从 shared memory 读取 m_block）
-                        for h_i in T.Parallel(BH):
-                            m_new[h_i] = T.max(m_global[h_i], m_block_shared[h_i])
-                            alpha[h_i] = T.exp2((m_global[h_i] - m_new[h_i]) * LOG2E)
-                        
-                        # 将 m_new 存入 shared memory 以避免 2D/1D layout 冲突
-                        T.copy(m_new, m_new_shared)
-                        
-                        # 步骤3：计算 exp 值（2D 操作，从 shared memory 读取 m_new）
-                        for tk_i, h_i in T.Parallel(BI, BH):
-                            raw_exp = T.exp2((acc_qk[tk_i, h_i] - m_new_shared[h_i]) * LOG2E)
-                            acc_qk[tk_i, h_i] = T.if_then_else(is_valid_0[tk_i], raw_exp, 0.0)
-                        
-                        # 步骤4：更新 l_global（使用预分配的 block_sum 避免作用域问题）
-                        T.fill(block_sum, 0.0)
-                        for tk_i in T.serial(BI):
-                            for h_i in T.Parallel(BH):
-                                block_sum[h_i] = block_sum[h_i] + acc_qk[tk_i, h_i]
-                        
-                        for h_i in T.Parallel(BH):
-                            l_global[h_i] = l_global[h_i] * alpha[h_i] + block_sum[h_i]
-                            m_global[h_i] = m_new[h_i]
-                        
-                        T.barrier_arrive(bar_k_0_free[0])
-                        
-                        # ----- Buffer 1 -----
-                        T.barrier_wait(bar_k_1_ready[0], (i_i & 1))
-                        
-                        for tk_i, h_i in T.Parallel(BI, BH):
-                            acc_qk[tk_i, h_i] = T.if_then_else(is_valid_1[tk_i], 0.0, NEG_INF)
-                        
-                        T.gemm(K_shared_1, Q_shared, acc_qk, transpose_B=True, wg_wait=-1)
-                        T.wait_wgmma(0)
-                        
-                        for tk_i, h_i in T.Parallel(BI, BH):
-                            acc_qk[tk_i, h_i] = acc_qk[tk_i, h_i] * scaling
-                        
-                        T.reduce_max(acc_qk, m_block, dim=0, clear=True)
-                        T.copy(m_block, m_block_shared)
-                        
-                        for h_i in T.Parallel(BH):
-                            m_new[h_i] = T.max(m_global[h_i], m_block_shared[h_i])
-                            alpha[h_i] = T.exp2((m_global[h_i] - m_new[h_i]) * LOG2E)
-                        
-                        T.copy(m_new, m_new_shared)
-                        
-                        for tk_i, h_i in T.Parallel(BI, BH):
-                            raw_exp = T.exp2((acc_qk[tk_i, h_i] - m_new_shared[h_i]) * LOG2E)
-                            acc_qk[tk_i, h_i] = T.if_then_else(is_valid_1[tk_i], raw_exp, 0.0)
-                        
-                        T.fill(block_sum, 0.0)
-                        for tk_i in T.serial(BI):
-                            for h_i in T.Parallel(BH):
-                                block_sum[h_i] = block_sum[h_i] + acc_qk[tk_i, h_i]
-                        
-                        for h_i in T.Parallel(BH):
-                            l_global[h_i] = l_global[h_i] * alpha[h_i] + block_sum[h_i]
-                            m_global[h_i] = m_new[h_i]
-                        
-                        T.barrier_arrive(bar_k_1_free[0])
+                    # 合并两组结果并写出
+                    tk_start_0 = (i_i * 2) * BI
+                    for bi_i in T.Parallel(BI):
+                        AttnSum[b_i, s_i, tk_start_0 + bi_i] = attn_sum_shared[bi_i] + attn_sum_local_2[bi_i]
                     
-                    # 存储最终的 softmax 参数到 shared memory
-                    # 处理边界情况
-                    for h_i in T.Parallel(BH):
-                        m_global[h_i] = T.if_then_else(m_global[h_i] == NEG_INF, 0.0, m_global[h_i])
-                        l_global[h_i] = T.if_then_else(l_global[h_i] < 1e-9, 1.0, l_global[h_i])
+                    # 通知线程1组可以继续
+                    T.barrier_arrive(bar_merge_done[0])
+
+                    T.barrier_arrive(bar_pass2_k_0_free[0])
+
+                    # Buffer 1
+                    T.fill(attn_sum_local_2, 0)
+                    T.barrier_wait(bar_pass2_k_1_ready[0], (i_i & 1))
+
+                    for h_i, bi_i in T.Parallel(H_half, BI):
+                        acc_s_2[h_i, bi_i] = T.if_then_else(is_kv_valid_1[bi_i], 0, -T.infinity(acc_s_2.dtype))
+                    T.gemm(Q_shared_l[H_half:H_per_block, :], KV_shared_1_l, acc_s_2, transpose_B=True, wg_wait=-1)
+                    T.gemm(Q_shared_r[H_half:H_per_block, :], KV_shared_1_r, acc_s_2, transpose_B=True, wg_wait=-1)
+                    T.gemm(Q_tail_shared[H_half:H_per_block, :], K_tail_shared_1, acc_s_2, transpose_B=True, wg_wait=-1)
+
+                    T.wait_wgmma(0)
+
+                    for h_i, bi_i in T.Parallel(H_half, BI):
+                        acc_s_2[h_i, bi_i] = T.exp2(acc_s_2[h_i, bi_i] * sm_scale - m_final_shared_2[h_i] * sm_scale) / l_final_shared_2[h_i]
+                    for h_i, bi_i in T.Parallel(H_half, BI):
+                        acc_s_2[h_i, bi_i] = T.if_then_else(is_kv_valid_1[bi_i], acc_s_2[h_i, bi_i], 0)
                     
-                    T.copy(m_global, m_global_shared)
-                    T.copy(l_global, l_global_shared)
+                    for bi_i in T.Parallel(BI):
+                        for h_i in T.serial(H_half):
+                            attn_sum_local_2[bi_i] += acc_s_2[h_i, bi_i]
                     
-                    # Pass 2: 重新遍历，使用全局 m 和 l 计算归一化概率并累加
-                    for i_i in T.serial(T.ceildiv(NTK, 2)):
-                        tk_start_0 = (i_i * 2) * BI
-                        tk_start_1 = (i_i * 2 + 1) * BI
-                        
-                        # ----- Buffer 0 -----
-                        # 等待 Producer 重新加载数据
-                        T.barrier_wait(bar_k_0_ready[0], (i_i & 1) + (NTK + 1) // 2)
-                        
-                        for tk_i, h_i in T.Parallel(BI, BH):
-                            acc_qk[tk_i, h_i] = T.if_then_else(is_valid_0[tk_i], 0.0, NEG_INF)
-                        
-                        T.gemm(K_shared_0, Q_shared, acc_qk, transpose_B=True, wg_wait=-1)
-                        T.wait_wgmma(0)
-                        
-                        for tk_i, h_i in T.Parallel(BI, BH):
-                            acc_qk[tk_i, h_i] = acc_qk[tk_i, h_i] * scaling
-                        
-                        # 使用全局 m 和 l 计算归一化概率
-                        # p[tk_i, h_i] = exp(qk - m_global) / l_global
-                        for tk_i, h_i in T.Parallel(BI, BH):
-                            raw_exp = T.exp2((acc_qk[tk_i, h_i] - m_global_shared[h_i]) * LOG2E)
-                            p_val = raw_exp / l_global_shared[h_i]
-                            acc_qk[tk_i, h_i] = T.if_then_else(is_valid_0[tk_i], p_val, 0.0)
-                        
-                        # 对 head 求和（使用预分配的 exp_sum_shared 避免作用域问题）
-                        for tk_i in T.Parallel(BI):
-                            exp_sum_shared[tk_i] = 0.0
-                        for h_i in T.serial(BH):
-                            for tk_i in T.Parallel(BI):
-                                exp_sum_shared[tk_i] = exp_sum_shared[tk_i] + acc_qk[tk_i, h_i]
-                        
-                        # 写入到输出
-                        for tk_i in T.Parallel(BI):
-                            curr_tk = tk_start_0 + tk_i
-                            if curr_tk < topk:
-                                if h_block == 0:
-                                    AttnSum[b_i, s_i, curr_tk] = exp_sum_shared[tk_i]
-                                else:
-                                    old_val = AttnSum[b_i, s_i, curr_tk]
-                                    AttnSum[b_i, s_i, curr_tk] = old_val + exp_sum_shared[tk_i]
-                        
-                        T.barrier_arrive(bar_k_0_free[0])
-                        
-                        # ----- Buffer 1 -----
-                        T.barrier_wait(bar_k_1_ready[0], (i_i & 1) + (NTK + 1) // 2)
-                        
-                        for tk_i, h_i in T.Parallel(BI, BH):
-                            acc_qk[tk_i, h_i] = T.if_then_else(is_valid_1[tk_i], 0.0, NEG_INF)
-                        
-                        T.gemm(K_shared_1, Q_shared, acc_qk, transpose_B=True, wg_wait=-1)
-                        T.wait_wgmma(0)
-                        
-                        for tk_i, h_i in T.Parallel(BI, BH):
-                            acc_qk[tk_i, h_i] = acc_qk[tk_i, h_i] * scaling
-                        
-                        for tk_i, h_i in T.Parallel(BI, BH):
-                            raw_exp = T.exp2((acc_qk[tk_i, h_i] - m_global_shared[h_i]) * LOG2E)
-                            p_val = raw_exp / l_global_shared[h_i]
-                            acc_qk[tk_i, h_i] = T.if_then_else(is_valid_1[tk_i], p_val, 0.0)
-                        
-                        for tk_i in T.Parallel(BI):
-                            exp_sum_shared[tk_i] = 0.0
-                        for h_i in T.serial(BH):
-                            for tk_i in T.Parallel(BI):
-                                exp_sum_shared[tk_i] = exp_sum_shared[tk_i] + acc_qk[tk_i, h_i]
-                        
-                        for tk_i in T.Parallel(BI):
-                            curr_tk = tk_start_1 + tk_i
-                            if curr_tk < topk:
-                                if h_block == 0:
-                                    AttnSum[b_i, s_i, curr_tk] = exp_sum_shared[tk_i]
-                                else:
-                                    old_val = AttnSum[b_i, s_i, curr_tk]
-                                    AttnSum[b_i, s_i, curr_tk] = old_val + exp_sum_shared[tk_i]
-                        
-                        T.barrier_arrive(bar_k_1_free[0])
+                    # 等待线程1组写入 shared memory
+                    T.barrier_wait(bar_merge_ready[0], (i_i * 2 + 1) & 1)
                     
-                else:
-                    # =======================================================
-                    # Producer 线程组：预取 K 数据到 shared memory
-                    # =======================================================
-                    T.set_max_nreg(80, 0)
+                    # 合并两组结果并写出
+                    tk_start_1 = (i_i * 2 + 1) * BI
+                    for bi_i in T.Parallel(BI):
+                        AttnSum[b_i, s_i, tk_start_1 + bi_i] = attn_sum_shared[bi_i] + attn_sum_local_2[bi_i]
                     
-                    # Pass 1 的数据加载
-                    for i_i in T.serial(T.ceildiv(NTK, 2)):
-                        # ----- Buffer 0 -----
-                        T.barrier_wait(bar_k_0_free[0], ((i_i & 1) ^ 1))
-                        
-                        thread_id = tx - 128  # 0-127
-                        rows_per_thread = T.ceildiv(BI, 128)
-                        
-                        for r in T.serial(rows_per_thread):
-                            row_idx = thread_id * rows_per_thread + r
-                            if row_idx < BI:
-                                tk_global_idx = (i_i * 2) * BI + row_idx
-                                if tk_global_idx < topk:
-                                    indices_local[0] = Indices[b_i, s_i, tk_global_idx]
-                                    is_valid_0[row_idx] = indices_local[0] <= global_query_pos
-                                    
-                                    if is_valid_0[row_idx]:
-                                        with T.attr("default", "async_scope", 1):
-                                            for d in T.serial(D):
-                                                K_shared_0[row_idx, d] = K[b_i, indices_local[0], d]
-                                else:
-                                    is_valid_0[row_idx] = False
-                        
-                        T.cp_async_barrier_noinc(bar_k_0_ready[0])
-                        
-                        # ----- Buffer 1 -----
-                        T.barrier_wait(bar_k_1_free[0], ((i_i & 1) ^ 1))
-                        
-                        for r in T.serial(rows_per_thread):
-                            row_idx = thread_id * rows_per_thread + r
-                            if row_idx < BI:
-                                tk_global_idx = (i_i * 2 + 1) * BI + row_idx
-                                if tk_global_idx < topk:
-                                    indices_local[0] = Indices[b_i, s_i, tk_global_idx]
-                                    is_valid_1[row_idx] = indices_local[0] <= global_query_pos
-                                    
-                                    if is_valid_1[row_idx]:
-                                        with T.attr("default", "async_scope", 1):
-                                            for d in T.serial(D):
-                                                K_shared_1[row_idx, d] = K[b_i, indices_local[0], d]
-                                else:
-                                    is_valid_1[row_idx] = False
-                        
-                        T.cp_async_barrier_noinc(bar_k_1_ready[0])
-                    
-                    # Pass 2 的数据加载（重复加载以支持第二轮计算）
-                    for i_i in T.serial(T.ceildiv(NTK, 2)):
-                        # ----- Buffer 0 -----
-                        T.barrier_wait(bar_k_0_free[0], ((i_i & 1) ^ 1) + (NTK + 1) // 2)
-                        
-                        thread_id = tx - 128
-                        rows_per_thread = T.ceildiv(BI, 128)
-                        
-                        for r in T.serial(rows_per_thread):
-                            row_idx = thread_id * rows_per_thread + r
-                            if row_idx < BI:
-                                tk_global_idx = (i_i * 2) * BI + row_idx
-                                if tk_global_idx < topk:
-                                    indices_local[0] = Indices[b_i, s_i, tk_global_idx]
-                                    is_valid_0[row_idx] = indices_local[0] <= global_query_pos
-                                    
-                                    if is_valid_0[row_idx]:
-                                        with T.attr("default", "async_scope", 1):
-                                            for d in T.serial(D):
-                                                K_shared_0[row_idx, d] = K[b_i, indices_local[0], d]
-                                else:
-                                    is_valid_0[row_idx] = False
-                        
-                        T.cp_async_barrier_noinc(bar_k_0_ready[0])
-                        
-                        # ----- Buffer 1 -----
-                        T.barrier_wait(bar_k_1_free[0], ((i_i & 1) ^ 1) + (NTK + 1) // 2)
-                        
-                        for r in T.serial(rows_per_thread):
-                            row_idx = thread_id * rows_per_thread + r
-                            if row_idx < BI:
-                                tk_global_idx = (i_i * 2 + 1) * BI + row_idx
-                                if tk_global_idx < topk:
-                                    indices_local[0] = Indices[b_i, s_i, tk_global_idx]
-                                    is_valid_1[row_idx] = indices_local[0] <= global_query_pos
-                                    
-                                    if is_valid_1[row_idx]:
-                                        with T.attr("default", "async_scope", 1):
-                                            for d in T.serial(D):
-                                                K_shared_1[row_idx, d] = K[b_i, indices_local[0], d]
-                                else:
-                                    is_valid_1[row_idx] = False
-                        
-                        T.cp_async_barrier_noinc(bar_k_1_ready[0])
-    
+                    # 通知线程1组可以继续
+                    T.barrier_arrive(bar_merge_done[0])
+
+                    T.barrier_arrive(bar_pass2_k_1_free[0])
+
+            elif tx >= 256:
+                # ================================================================
+                # 线程3组: Producer - 负责加载 K 到 shared memory
+                # ================================================================
+                T.set_max_nreg(80, 0)
+                
+                # Pass 1: 加载 K 给第一遍扫描
+                for i_i in T.serial(T.ceildiv(NI, 2)):
+                    # Buffer 0
+                    T.barrier_wait(bar_k_0_free[0], ((i_i & 1) ^ 1))
+                    for r in T.serial(4):
+                        indices_local[0] = Indices[b_i, s_i, g_i, (i_i * 2) * BI + r * 16 + (tx - 256) // 8]
+                        indices_shared_0[r * 16 + (tx - 256) // 8] = indices_local[0]
+                        is_kv_valid_0[r * 16 + (tx - 256) // 8] = indices_local[0] <= max_kv_i
+                        if is_kv_valid_0[r * 16 + (tx - 256) // 8]:
+                            with T.attr("default", "async_scope", 1):
+                                for u in T.serial(4):
+                                    for v in T.vectorized(8):
+                                        KV_shared_0_l[r * 16 + (tx - 256) // 8, 64 * u + (tx - 256) % 8 * 8 + v] = KV[
+                                            b_i, indices_local[0], g_i, 64 * u + (tx - 256) % 8 * 8 + v
+                                        ]
+                                        KV_shared_0_r[r * 16 + (tx - 256) // 8, 64 * u + (tx - 256) % 8 * 8 + v] = KV[
+                                            b_i, indices_local[0], g_i, D // 2 + 64 * u + (tx - 256) % 8 * 8 + v
+                                        ]
+                            with T.attr("default", "async_scope", 1):
+                                for v in T.vectorized(8):
+                                    K_tail_shared_0[r * 16 + (tx - 256) // 8, (tx - 256) % 8 * 8 + v] = KV[
+                                        b_i, indices_local[0], g_i, D + (tx - 256) % 8 * 8 + v
+                                    ]
+                    T.cp_async_barrier_noinc(bar_k_0_ready[0])
+
+                    # Buffer 1
+                    T.barrier_wait(bar_k_1_free[0], ((i_i & 1) ^ 1))
+                    for r in T.serial(4):
+                        indices_local[0] = Indices[b_i, s_i, g_i, (i_i * 2 + 1) * BI + r * 16 + (tx - 256) // 8]
+                        indices_shared_1[r * 16 + (tx - 256) // 8] = indices_local[0]
+                        is_kv_valid_1[r * 16 + (tx - 256) // 8] = indices_local[0] <= max_kv_i
+                        if is_kv_valid_1[r * 16 + (tx - 256) // 8]:
+                            with T.attr("default", "async_scope", 1):
+                                for u in T.serial(4):
+                                    for v in T.vectorized(8):
+                                        KV_shared_1_l[r * 16 + (tx - 256) // 8, 64 * u + (tx - 256) % 8 * 8 + v] = KV[
+                                            b_i, indices_local[0], g_i, 64 * u + (tx - 256) % 8 * 8 + v
+                                        ]
+                                        KV_shared_1_r[r * 16 + (tx - 256) // 8, 64 * u + (tx - 256) % 8 * 8 + v] = KV[
+                                            b_i, indices_local[0], g_i, D // 2 + 64 * u + (tx - 256) % 8 * 8 + v
+                                        ]
+                            with T.attr("default", "async_scope", 1):
+                                for v in T.vectorized(8):
+                                    K_tail_shared_1[r * 16 + (tx - 256) // 8, (tx - 256) % 8 * 8 + v] = KV[
+                                        b_i, indices_local[0], g_i, D + (tx - 256) % 8 * 8 + v
+                                    ]
+                    T.cp_async_barrier_noinc(bar_k_1_ready[0])
+
+                # 等待 Pass 1 完成
+                T.barrier_arrive(bar_pass1_done)
+                T.barrier_wait(bar_pass1_done, 0)
+
+                # Pass 2: 重新加载 K 给第二遍扫描
+                for i_i in T.serial(T.ceildiv(NI, 2)):
+                    # Buffer 0
+                    T.barrier_wait(bar_pass2_k_0_free[0], ((i_i & 1) ^ 1))
+                    for r in T.serial(4):
+                        indices_local[0] = Indices[b_i, s_i, g_i, (i_i * 2) * BI + r * 16 + (tx - 256) // 8]
+                        is_kv_valid_0[r * 16 + (tx - 256) // 8] = indices_local[0] <= max_kv_i
+                        if is_kv_valid_0[r * 16 + (tx - 256) // 8]:
+                            with T.attr("default", "async_scope", 1):
+                                for u in T.serial(4):
+                                    for v in T.vectorized(8):
+                                        KV_shared_0_l[r * 16 + (tx - 256) // 8, 64 * u + (tx - 256) % 8 * 8 + v] = KV[
+                                            b_i, indices_local[0], g_i, 64 * u + (tx - 256) % 8 * 8 + v
+                                        ]
+                                        KV_shared_0_r[r * 16 + (tx - 256) // 8, 64 * u + (tx - 256) % 8 * 8 + v] = KV[
+                                            b_i, indices_local[0], g_i, D // 2 + 64 * u + (tx - 256) % 8 * 8 + v
+                                        ]
+                            with T.attr("default", "async_scope", 1):
+                                for v in T.vectorized(8):
+                                    K_tail_shared_0[r * 16 + (tx - 256) // 8, (tx - 256) % 8 * 8 + v] = KV[
+                                        b_i, indices_local[0], g_i, D + (tx - 256) % 8 * 8 + v
+                                    ]
+                    T.cp_async_barrier_noinc(bar_pass2_k_0_ready[0])
+
+                    # Buffer 1
+                    T.barrier_wait(bar_pass2_k_1_free[0], ((i_i & 1) ^ 1))
+                    for r in T.serial(4):
+                        indices_local[0] = Indices[b_i, s_i, g_i, (i_i * 2 + 1) * BI + r * 16 + (tx - 256) // 8]
+                        is_kv_valid_1[r * 16 + (tx - 256) // 8] = indices_local[0] <= max_kv_i
+                        if is_kv_valid_1[r * 16 + (tx - 256) // 8]:
+                            with T.attr("default", "async_scope", 1):
+                                for u in T.serial(4):
+                                    for v in T.vectorized(8):
+                                        KV_shared_1_l[r * 16 + (tx - 256) // 8, 64 * u + (tx - 256) % 8 * 8 + v] = KV[
+                                            b_i, indices_local[0], g_i, 64 * u + (tx - 256) % 8 * 8 + v
+                                        ]
+                                        KV_shared_1_r[r * 16 + (tx - 256) // 8, 64 * u + (tx - 256) % 8 * 8 + v] = KV[
+                                            b_i, indices_local[0], g_i, D // 2 + 64 * u + (tx - 256) % 8 * 8 + v
+                                        ]
+                            with T.attr("default", "async_scope", 1):
+                                for v in T.vectorized(8):
+                                    K_tail_shared_1[r * 16 + (tx - 256) // 8, (tx - 256) % 8 * 8 + v] = KV[
+                                        b_i, indices_local[0], g_i, D + (tx - 256) % 8 * 8 + v
+                                    ]
+                    T.cp_async_barrier_noinc(bar_pass2_k_1_ready[0])
+
     return main
 
 
-def indexer_loss_fwd_tilelang(
-    query, key, indices, scaling, chunk_offset=0, 
-    block_tk=64, block_h=16, threads=256,
-    return_kernel=False, print_kernel=False
+def indexer_loss_fwd_interface(
+    q, kv, indices, q_start_index_s, kv_stride, sm_scale=None, is_casual=True, return_kernel=False, print_kernel=False
 ):
     """
-    TileLang 实现的 Indexer Loss 前向传播
+    IndexerLoss Forward Interface
     
     Args:
-        query: [batch, num_heads, chunk_size, head_dim]
-        key: [batch, kv_len, head_dim]
-        indices: [batch, chunk_size, topk]
-        scaling: attention scaling factor
-        chunk_offset: 当前 chunk 在完整序列中的起始位置
-        block_tk: topk 分块大小
-        block_h: head 分块大小
-        threads: 线程数
-        return_kernel: 是否返回编译后的 kernel
-        print_kernel: 是否打印 kernel 源码
+        q: [batch, seq_len, heads, dim + tail_dim]
+        kv: [batch, seq_len_kv, kv_group, dim + tail_dim]
+        indices: [batch, seq_len, kv_group, topk]
+        q_start_index_s: chunk offset
+        kv_stride: KV stride
+        sm_scale: attention scaling factor
+        is_casual: whether to use causal mask
+        return_kernel: whether to return compiled kernel
+        print_kernel: whether to print kernel source
     
     Returns:
-        attn_sum: [batch, chunk_size, topk]
+        attn_sum: [batch, seq_len, topk] - 所有 head 的 attention 概率求和
     """
-    assert query.is_contiguous() and key.is_contiguous() and indices.is_contiguous()
-    
-    batch_size, num_heads, chunk_size, head_dim = query.shape
-    _, kv_len, _ = key.shape
-    _, _, topk = indices.shape
-    
-    # 调整 block 大小
-    block_tk = min(block_tk, topk)
-    # 确保 block_tk 能整除 topk
-    while topk % block_tk != 0:
-        block_tk -= 1
-    block_tk = max(block_tk, 16)
-    
-    block_h = min(block_h, num_heads)
-    block_h = max(block_h, 16)
-    
-    # 转换数据类型
-    query_bf16 = query.to(torch.bfloat16) if query.dtype != torch.bfloat16 else query
-    key_bf16 = key.to(torch.bfloat16) if key.dtype != torch.bfloat16 else key
-    indices_i32 = indices.to(torch.int32) if indices.dtype != torch.int32 else indices
-    
-    # 创建输出 tensor
-    attn_sum = torch.zeros(batch_size, chunk_size, topk, device=query.device, dtype=torch.float32)
-    
-    # 编译 kernel
-    kernel = indexer_loss_fwd_kernel(
-        batch_size, num_heads, chunk_size, head_dim, topk,
-        chunk_offset, scaling, block_tk, block_h, threads
-    )
-    
+    assert q.is_contiguous() and kv.is_contiguous() and indices.is_contiguous()
+    batch, seq_len, heads, dim_plus_tail_dim = q.shape
+    _, seq_len_kv, kv_group, _ = kv.shape
+
+    assert dim_plus_tail_dim == 576, "you should assign dim otherwise"
+    dim = 512
+
+    assert kv.shape[-1] == dim_plus_tail_dim
+    tail_dim = dim_plus_tail_dim - dim
+    assert kv.shape[0] == batch
+    _, _, _, topk = indices.shape
+    assert indices.shape == (batch, seq_len, kv_group, topk)
+
+    if q_start_index_s != 0:
+        assert q_start_index_s > kv_stride, (
+            "If it is because each cp has too short length, you should fix the logic involving CP0 (cp_rank == 0), to make sure q with pos < KV_Stride - 1 is masked (or you may just ignore how this is handled if nan in these q's Out would not effect others, which is reported to be likely to happen by wangding)"
+        )
+    CP0 = q_start_index_s == 0
+
+    kernel = indexer_loss_fwd(batch, seq_len, seq_len_kv, heads, dim, tail_dim, topk, kv_stride, kv_group, sm_scale, is_casual, CP0)
     if print_kernel:
         print(kernel.get_kernel_source())
-    
-    # 执行 kernel
-    attn_sum, = kernel(query_bf16, key_bf16, indices_i32, attn_sum)
-    
+    attn_sum = kernel(q, kv, indices, torch.tensor([q_start_index_s], dtype=torch.int32, device="cuda"))
     if return_kernel:
-        return attn_sum, kernel
+        return kernel, attn_sum
+    if q_start_index_s == 0 and kv_stride > 1:
+        attn_sum[:, : kv_stride - 1, :] = 0
+    return attn_sum
+
+
+def ref_indexer_loss_fwd_interface(q, kv, indices, q_start_index_s, kv_stride=1, sm_scale=None, is_casual=True):
+    """
+    PyTorch Reference Implementation for IndexerLoss Forward
+    
+    计算 sparse attention 的累加分布 AttnSum。
+    
+    Args:
+        q: [batch, seq_len, heads, dim + tail_dim]
+        kv: [batch, seq_len_kv, kv_group, dim + tail_dim]
+        indices: [batch, seq_len, kv_group, topk]
+        q_start_index_s: chunk offset
+        kv_stride: KV stride
+        sm_scale: attention scaling factor
+        is_casual: whether to use causal mask
+    
+    Returns:
+        attn_sum: [batch, seq_len, topk] - 所有 head 的 attention 概率求和
+    """
+    q = q.float()
+    kv = kv.float()
+    indices = indices.transpose(1, 2)  # [batch, kv_group, seq_len, topk]
+    b, sq, h, dim_q = q.shape
+    b, sk, g, _ = kv.shape
+    if q_start_index_s is None:
+        q_start_index_s = sk * kv_stride - sq
+
+    assert kv.shape[-1] == 576, "you should assign dim otherwise"
+    dim = 512
+    k = kv  # [batch, seq_len_kv, kv_group, dim + tail_dim]
+
+    g_index = g
+    h_index = h // g
+    
+    # Causal mask for compressed KV
+    compressed_casual_mask = torch.arange(q_start_index_s, sq + q_start_index_s, dtype=torch.int32, device="cuda").view(
+        -1, 1
+    ) >= torch.arange(kv_stride - 1, sk * kv_stride, kv_stride, dtype=torch.int32, device="cuda").view(1, -1)
+
+    # Sparse mask based on indices
+    mask = q.new_zeros(b, g_index, sq, sk + 1, dtype=torch.bool).scatter(3, indices.long(), 1)
+    mask = mask[..., :-1]
+    mask = mask & compressed_casual_mask.view(1, 1, sq, sk)
+    mask[:, :, : kv_stride - 1, 0] = True
+    mask = mask.view(b, g_index, 1, sq, sk)  # [b, g, 1, sq, sk]
+
+    q = q.view(b, sq, g, -1, dim_q)  # [b, sq, g, h_per_g, dim_q]
+    
+    # Compute attention scores
+    score = torch.einsum("bmghd,bngd->bghmn", q, k)  # [b, g, h_per_g, sq, sk]
+    sm_scale = dim_q**-0.5 if sm_scale is None else sm_scale
+    score = score.masked_fill(~mask, float("-inf")).mul(sm_scale)
+    p = score.softmax(dim=-1)  # [b, g, h_per_g, sq, sk]
+    
+    # Sum over all heads: [b, g, h_per_g, sq, sk] -> [b, sq, sk]
+    p_sum = p.sum(dim=(1, 2))  # [b, sq, sk]
+    
+    # Gather to get attn_sum for topk indices
+    # indices: [batch, kv_group, seq_len, topk]
+    # 需要将 p_sum 按 indices gather
+    indices_for_gather = indices[:, 0, :, :]  # [batch, seq_len, topk] (假设 kv_group=1)
+    attn_sum = torch.gather(p_sum, dim=-1, index=indices_for_gather.long())  # [batch, seq_len, topk]
     
     return attn_sum
 
 
-# ============================================================================
-# Autograd Function
-# ============================================================================
-
-class IndexerLossFunctionTileLang(torch.autograd.Function):
-    """
-    TileLang 版本的 Indexer Loss Autograd Function
-    """
-    
-    @staticmethod
-    def forward(ctx, query, key, index_score, indices, scaling, chunk_offset=0, eps=1e-10, 
-                block_tk=64, block_h=16):
-        """前向传播"""
-        batch_size, num_heads, chunk_size, head_dim = query.shape
-        topk = indices.shape[-1]
-        
-        block_tk = min(block_tk, topk)
-        while topk % block_tk != 0:
-            block_tk -= 1
-        block_tk = max(block_tk, 16)
-        
-        block_h = min(block_h, num_heads)
-        block_h = max(block_h, 16)
-        
-        # 计算 attn_sum
-        attn_sum = indexer_loss_fwd_tilelang(
-            query, key, indices, scaling, chunk_offset,
-            block_tk=block_tk, block_h=block_h
-        )
-        
-        # 返回 dummy loss
-        dummy_loss = torch.tensor(0.0, device=query.device, dtype=torch.float32, requires_grad=True)
-        
-        # 保存反向传播需要的张量
-        ctx.save_for_backward(index_score, indices, attn_sum)
-        ctx.chunk_offset = chunk_offset
-        ctx.eps = eps
-        ctx.batch_size = batch_size
-        
-        return dummy_loss
-    
-    @staticmethod
-    def backward(ctx, grad_output):
-        """反向传播: grad = index_prob - attn_dist"""
-        index_score, indices, attn_sum = ctx.saved_tensors
-        chunk_offset = ctx.chunk_offset
-        eps = ctx.eps
-        batch_size = ctx.batch_size
-        
-        _, chunk_size, topk = index_score.shape
-        device = index_score.device
-        
-        NEG_INF = -1e9
-        
-        # 计算 attn_total
-        attn_total = attn_sum.sum(dim=-1, keepdim=True)
-        attn_total = torch.clamp(attn_total, min=eps)
-        
-        # 计算 attn_dist
-        attn_dist = attn_sum / attn_total
-        
-        # 创建 causal mask
-        query_positions = chunk_offset + torch.arange(chunk_size, device=device).view(1, -1, 1)
-        causal_mask = indices > query_positions
-        
-        # 计算 index_prob = softmax(index_score)
-        index_score_masked = index_score.masked_fill(causal_mask, NEG_INF)
-        index_prob = F.softmax(index_score_masked, dim=-1)
-        
-        # 梯度 = index_prob - attn_dist
-        grad = index_prob - attn_dist
-        grad = grad.masked_fill(causal_mask, 0.0)
-        
-        # 乘以上游梯度并除以 batch_size
-        grad = grad * grad_output / batch_size
-        
-        return None, None, grad, None, None, None, None, None, None
-
-
-def indexer_loss_tilelang(query, key, index_score, indices, scaling, chunk_offset=0, eps=1e-10,
-                          block_tk=64, block_h=16):
-    """TileLang 版本的 Indexer Loss 函数"""
-    return IndexerLossFunctionTileLang.apply(
-        query, key, index_score, indices, scaling, chunk_offset, eps, block_tk, block_h
-    )
-
-
-# ============================================================================
-# PyTorch 参考实现
-# ============================================================================
-
-def pytorch_reference_attn_sum(query, key, index_mask, topk_indices, scaling):
-    """PyTorch 参考实现: 计算 attn_sum"""
-    query = query.to(torch.float32)
-    key = key.to(torch.float32)
-    
-    attn = torch.matmul(query, key.unsqueeze(1).transpose(-1, -2)) * scaling
-    attn = attn.masked_fill(index_mask, -1e9)
-    attn = torch.softmax(attn, dim=-1)
-    
-    attn_sum_full = attn.sum(dim=1)
-    attn_sum_sparse = torch.gather(attn_sum_full, dim=-1, index=topk_indices)
-    
-    return attn_sum_sparse
-
-
-def generate_index_mask_from_score(index_score, topk, device='cuda', chunk_offset=0):
-    """从 index_score 生成 index_mask 和 topk_indices"""
-    batch_size, chunk_size, seq_len = index_score.shape
-    
-    query_positions = chunk_offset + torch.arange(chunk_size, device=device).view(-1, 1)
-    key_positions = torch.arange(seq_len, device=device).view(1, -1)
-    causal_mask = key_positions > query_positions
-    
-    causal_index_score = index_score.masked_fill(causal_mask, float('-inf'))
-    topk_indices = causal_index_score.topk(topk, dim=-1)[1]
-    
-    index_mask = torch.full(causal_index_score.shape, True, device=device)
-    index_mask = index_mask.scatter_(-1, topk_indices, False)
-    index_mask = torch.logical_or(index_mask, causal_mask)
-    index_mask = index_mask.unsqueeze(1)
-    
-    return index_mask, topk_indices
-
-
-# ============================================================================
-# 测试配置
-# ============================================================================
-
-@dataclass
-class TestConfig:
-    """测试配置"""
-    name: str
-    batch_size: int = 1
-    num_heads: int = 8
-    chunk_size: int = 256
-    seq_len: int = 256
-    head_dim: int = 64
-    topk: int = 32
-    seed: int = 42
-    
-    def __str__(self):
-        return (f"batch={self.batch_size}, heads={self.num_heads}, "
-                f"chunk={self.chunk_size}, seq={self.seq_len}, "
-                f"dim={self.head_dim}, topk={self.topk}")
-
-
-# ============================================================================
-# 精度测试
-# ============================================================================
-
-def run_fwd_accuracy_test(config: TestConfig, device: str = 'cuda'):
-    """运行单个前向精度测试"""
-    torch.manual_seed(config.seed)
-    scaling = 1.0 / (config.head_dim ** 0.5)
-    
-    query = torch.randn(config.batch_size, config.num_heads, config.chunk_size, 
-                        config.head_dim, device=device, dtype=torch.bfloat16)
-    key = torch.randn(config.batch_size, config.seq_len, config.head_dim, 
-                      device=device, dtype=torch.bfloat16)
-    index_score_full = torch.randn(config.batch_size, config.chunk_size, config.seq_len, 
-                                   device=device, dtype=torch.bfloat16)
-    
-    chunk_offset = config.seq_len - config.chunk_size
-    index_mask, topk_indices = generate_index_mask_from_score(
-        index_score_full, config.topk, device, chunk_offset=chunk_offset)
-    
-    # PyTorch 参考
-    ref_attn_sum = pytorch_reference_attn_sum(query, key, index_mask, topk_indices, scaling)
-    
-    # TileLang 版本
-    try:
-        tl_attn_sum = indexer_loss_fwd_tilelang(
-            query, key, topk_indices, scaling, chunk_offset=chunk_offset
-        )
-        
-        abs_diff = (ref_attn_sum - tl_attn_sum).abs().max().item()
-        rel_diff = abs_diff / (ref_attn_sum.abs().max().item() + 1e-10)
-        passed = rel_diff < 1e-2
-        
-        return {
-            'config': config,
-            'ref_max': ref_attn_sum.abs().max().item(),
-            'tl_max': tl_attn_sum.abs().max().item(),
-            'abs_diff': abs_diff,
-            'rel_diff': rel_diff,
-            'passed': passed,
-            'error': None
-        }
-    except Exception as e:
-        import traceback
-        return {
-            'config': config,
-            'ref_max': ref_attn_sum.abs().max().item(),
-            'tl_max': 0.0,
-            'abs_diff': float('inf'),
-            'rel_diff': float('inf'),
-            'passed': False,
-            'error': str(e) + "\n" + traceback.format_exc()
-        }
-
-
-def test_fwd_accuracy(configs: List[TestConfig]):
-    """批量运行前向精度测试"""
-    print("\n" + "=" * 100)
-    print("前向精度测试 (PyTorch attn_sum vs TileLang attn_sum)")
-    print("=" * 100)
-    
-    results = []
-    for config in configs:
-        result = run_fwd_accuracy_test(config)
-        results.append(result)
-    
-    print(f"\n{'Name':<12} {'Config':<55} {'RefMax':<12} {'TLMax':<12} {'RelDiff':<12} {'Pass':<6}")
-    print("-" * 109)
-    for r in results:
-        if r['error']:
-            print(f"{r['config'].name:<12} {str(r['config']):<55} Error")
-            print(f"  Error: {r['error'][:200]}")
-        else:
-            print(f"{r['config'].name:<12} {str(r['config']):<55} "
-                  f"{r['ref_max']:<12.6f} {r['tl_max']:<12.6f} {r['rel_diff']:<12.2e} {'✓' if r['passed'] else '✗':<6}")
-    
-    passed_count = sum(1 for r in results if r['passed'])
-    print("-" * 109)
-    print(f"前向测试 (attn_sum): {passed_count}/{len(results)} 通过")
-    
-    return results
-
-
-# ============================================================================
-# 性能测试
-# ============================================================================
-
-def test_performance_comparison(
-    batch_size: int = 1,
-    num_heads: int = 16,
-    chunk_size: int = 4 * 1024,
-    seq_len: int = 8 * 1024,
-    head_dim: int = 128,
-    topk: int = 512,
-    seed: int = 42,
-    num_warmup: int = 10,
-    num_benchmark: int = 50,
+def test_indexer_loss_fwd_pipelined(
+    B=1, S=4096, SKV=8192, H=128, HKV=1, DQK=576, DV=512, topk=2048, dtype=torch.bfloat16, q_start_s_index=1024, check_correctness=True
 ):
-    """性能对比测试: Triton vs TileLang"""
-    import time
-    from indexer_loss_kernel_opt import compute_attn_sum_opt
-    
-    torch.manual_seed(seed)
-    device = 'cuda'
-    scaling = 1.0 / (head_dim ** 0.5)
-    
-    print("\n" + "=" * 80)
-    print("性能对比测试 (Triton vs TileLang)")
-    print("=" * 80)
-    print(f"参数: batch={batch_size}, heads={num_heads}, chunk={chunk_size}, seq={seq_len}, dim={head_dim}, topk={topk}")
-    print("=" * 80)
-    
-    query = torch.randn(batch_size, num_heads, chunk_size, head_dim, device=device, dtype=torch.bfloat16)
-    key = torch.randn(batch_size, seq_len, head_dim, device=device, dtype=torch.bfloat16)
-    
-    chunk_offset = seq_len - chunk_size
-    index_score_full = torch.randn(batch_size, chunk_size, seq_len, device=device, dtype=torch.bfloat16)
-    index_mask, topk_indices = generate_index_mask_from_score(index_score_full, topk, device, chunk_offset=chunk_offset)
-    
-    results = {}
-    memory_stats = {}
-    
-    torch.cuda.synchronize()
-    base_memory = torch.cuda.memory_allocated() / (1024**3)
-    
-    # Triton 优化版测试
-    torch.cuda.reset_peak_memory_stats()
-    for _ in range(num_warmup):
-        _ = compute_attn_sum_opt(query, key, topk_indices, scaling, chunk_offset=chunk_offset)
-    torch.cuda.synchronize()
-    
-    torch.cuda.reset_peak_memory_stats()
-    start = time.time()
-    for _ in range(num_benchmark):
-        _ = compute_attn_sum_opt(query, key, topk_indices, scaling, chunk_offset=chunk_offset)
-    torch.cuda.synchronize()
-    triton_time = (time.time() - start) / num_benchmark * 1000
-    triton_peak = torch.cuda.max_memory_allocated() / (1024**3)
-    results['triton'] = triton_time
-    memory_stats['triton'] = triton_peak
-    
-    print(f"\n>>> Triton 性能: {triton_time:.3f} ms")
-    
-    # TileLang 版本测试
-    try:
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-        for _ in range(num_warmup):
-            _ = indexer_loss_fwd_tilelang(query, key, topk_indices, scaling, chunk_offset=chunk_offset)
-        torch.cuda.synchronize()
-        
-        torch.cuda.reset_peak_memory_stats()
-        start = time.time()
-        for _ in range(num_benchmark):
-            _ = indexer_loss_fwd_tilelang(query, key, topk_indices, scaling, chunk_offset=chunk_offset)
-        torch.cuda.synchronize()
-        tl_time = (time.time() - start) / num_benchmark * 1000
-        tl_peak = torch.cuda.max_memory_allocated() / (1024**3)
-        results['tilelang'] = tl_time
-        memory_stats['tilelang'] = tl_peak
-        
-        print(f">>> TileLang 性能: {tl_time:.3f} ms (加速: {triton_time/tl_time:.2f}x)")
-        
-        print(f"\n>>> 显存峰值")
-        print(f"  基准显存:    {base_memory:.2f} GB")
-        print(f"  Triton 峰值: {memory_stats['triton']:.2f} GB")
-        print(f"  TileLang 峰值: {memory_stats['tilelang']:.2f} GB")
-    except Exception as e:
-        import traceback
-        print(f"\n>>> TileLang 执行失败: {e}")
-        traceback.print_exc()
-        results['tilelang'] = float('inf')
-        memory_stats['tilelang'] = 0.0
-    
-    return results, memory_stats
+    """
+    Test IndexerLoss Forward Kernel
+    """
+    KV_stride = 1
 
+    torch.random.manual_seed(0)
+    q = torch.randn((B, S, H, DQK), dtype=dtype, device="cuda").requires_grad_(False) / 10
+    kv = torch.randn((B, SKV, HKV, DQK), dtype=dtype, device="cuda").requires_grad_(False) / 10
+    q_start_s_index_t = torch.tensor([q_start_s_index], dtype=torch.int32, device="cuda")
 
-# ============================================================================
-# 主测试入口
-# ============================================================================
+    q.clamp_(-10, 10)
+    kv.clamp_(-10, 10)
+
+    indices = torch.full((B, S, HKV, topk), SKV, dtype=torch.int32, device="cuda")
+    for b in range(B):
+        for t in range(S):
+            for h in range(HKV):
+                i_i = torch.randperm(min(max(1, ((t + q_start_s_index) // KV_stride)), SKV))[:topk]
+                indices[b, t, h, : len(i_i)] = i_i
+
+    kernel, tl_attn_sum = indexer_loss_fwd_interface(q, kv, indices, q_start_s_index, KV_stride, return_kernel=True, print_kernel=True)
+
+    def fn():
+        attn_sum = kernel(q, kv, indices, q_start_s_index_t)
+        if q_start_s_index == 0 and KV_stride > 1:
+            attn_sum[:, : KV_stride - 1, :] = 0
+        return attn_sum
+
+    if check_correctness:
+        ref_attn_sum = ref_indexer_loss_fwd_interface(q, kv, indices, q_start_s_index, KV_stride)
+        print(f"tl_attn_sum shape: {tl_attn_sum.shape}")
+        print(f"ref_attn_sum shape: {ref_attn_sum.shape}")
+        print(f"tl_attn_sum sample: {tl_attn_sum[0, 0, :10]}")
+        print(f"ref_attn_sum sample: {ref_attn_sum[0, 0, :10]}")
+        
+        try:
+            torch.testing.assert_close(tl_attn_sum, ref_attn_sum.to(tl_attn_sum.dtype), rtol=1e-2, atol=1e-2)
+            print("Correctness test PASSED!")
+        except AssertionError as e:
+            print(f"Correctness test FAILED: {e}")
+            max_diff = (tl_attn_sum - ref_attn_sum.to(tl_attn_sum.dtype)).abs().max()
+            print(f"Max difference: {max_diff}")
+
+    from tilelang.profiler import do_bench
+
+    ms = do_bench(
+        fn,
+        rep=10,
+        warmup=10,
+    )
+    print(f"Average time: {ms:.3f} ms")
+    print(f"fwd io bandwidth = ", (B * S * DQK * topk * 2) / (ms * 1e-3) / 1e12)
+    print(f"fwd tflops = ", (B * S * DQK * topk * 2 * H) / (ms * 1e-3) / 1e12)
+
 
 if __name__ == "__main__":
-    # 精度测试配置（使用较小的规模以便于调试）
-    accuracy_configs = [
-        TestConfig(name="小规模", batch_size=1, num_heads=16, chunk_size=32, seq_len=64, head_dim=64, topk=32),
-        TestConfig(name="中等规模", batch_size=1, num_heads=32, chunk_size=64, seq_len=128, head_dim=64, topk=64),
-        TestConfig(name="大规模", batch_size=1, num_heads=64, chunk_size=128, seq_len=256, head_dim=128, topk=128),
-    ]
-    
-    # ========== 前向精度测试 ==========
-    test_fwd_accuracy(accuracy_configs)
-    
-    # ========== 性能对比测试 ==========
-    test_performance_comparison(
-        batch_size=1,
-        num_heads=128,
-        chunk_size=4 * 1024,
-        seq_len=8 * 1024,
-        head_dim=576,
-        topk=2048,
-        num_warmup=3,
-        num_benchmark=10,
-    )
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--test_correctness", action="store_true")
+    args = parser.parse_args()
+    if args.test_correctness:
+        B, S, SKV, H, HKV, DQK, DV, topk, dtype = 1, 1024, 8192, 128, 1, 576, 512, 2048, torch.bfloat16
+    else:
+        B, S, SKV, H, HKV, DQK, DV, topk, dtype = 1, 4096, 8192, 128, 1, 576, 512, 2048, torch.bfloat16
+    test_indexer_loss_fwd_pipelined(B, S, SKV, H, HKV, DQK, DV, topk, dtype, check_correctness=args.test_correctness)
