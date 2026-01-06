@@ -1,6 +1,8 @@
-# 在调用 kernel 前对 indices 排序
-sorted_indices, sort_order = indices.sort(dim=-1)
-# 调用 kernel 使用 sorted_indices
-result = kernel(query, key, sorted_indices, ...)
-# 结果按 sort_order 还原顺序
-final_result = result.scatter(-1, sort_order, result)
+保留tilelang pipeline的Q_shared_l、Q_shared_r、Q_tail_shared和K_shared_l、K_shared_r、K_tail_shared，删除V相关的操作
+
+线程分组
+线程1组：qk矩阵乘算出m_global和l_global
+线程2组：qk矩阵乘算出attn_sum
+线程3组：producer，负责维护buffer
+
+前向kernel只算attn_sum，给反向用
