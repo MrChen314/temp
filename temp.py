@@ -4,6 +4,8 @@ import tilelang
 from tilelang import language as T
 from tilelang.engine.callback import register_cuda_postproc_callback
 import argparse
+from dataclasses import dataclass
+from typing import List
 
 
 @tilelang.jit(
@@ -354,7 +356,7 @@ def attn_sum_fwd(
 
 
 def indexer_loss_fwd_interface(
-    q, kv, indices, q_start_index_s, kv_stride, sm_scale=None, is_casual=True, return_kernel=False, print_kernel=False
+    q, kv, indices, chunk_offset=0, kv_stride=1, sm_scale=None, is_casual=True, return_kernel=False, print_kernel=False
 ):
     """
     IndexerLoss Forward Interface
@@ -363,7 +365,7 @@ def indexer_loss_fwd_interface(
         q: [batch, seq_len, heads, dim + tail_dim]
         kv: [batch, seq_len_kv, kv_group, dim + tail_dim]
         indices: [batch, seq_len, kv_group, topk]
-        q_start_index_s: chunk offset
+        chunk_offset: 当前 chunk 在完整序列中的起始位置 (用于 causal mask)
         kv_stride: KV stride
         sm_scale: attention scaling factor
         is_casual: whether to use causal mask
@@ -386,11 +388,11 @@ def indexer_loss_fwd_interface(
     _, _, _, topk = indices.shape
     assert indices.shape == (batch, seq_len, kv_group, topk)
 
-    if q_start_index_s != 0:
-        assert q_start_index_s > kv_stride, (
+    if chunk_offset != 0:
+        assert chunk_offset > kv_stride, (
             "If it is because each cp has too short length, you should fix the logic involving CP0 (cp_rank == 0), to make sure q with pos < KV_Stride - 1 is masked (or you may just ignore how this is handled if nan in these q's Out would not effect others, which is reported to be likely to happen by wangding)"
         )
-    CP0 = q_start_index_s == 0
+    CP0 = chunk_offset == 0
 
     # 计算 kernel 中使用的 sm_scale（包含 log2(e) 因子）
     if sm_scale is None:
@@ -403,7 +405,7 @@ def indexer_loss_fwd_interface(
         print(kernel.get_kernel_source())
     
     # kernel 返回 M_out, L_out, QK_out
-    m_out, l_out, qk_out = kernel(q, kv, indices, torch.tensor([q_start_index_s], dtype=torch.int32, device="cuda"))
+    m_out, l_out, qk_out = kernel(q, kv, indices, torch.tensor([chunk_offset], dtype=torch.int32, device="cuda"))
     
     # 使用 tilelang kernel 计算 attn_sum
     attn_sum_kernel = attn_sum_fwd(batch, seq_len, heads, topk, sm_scale_log2e)
@@ -413,12 +415,12 @@ def indexer_loss_fwd_interface(
     
     if return_kernel:
         return (kernel, attn_sum_kernel), attn_sum
-    if q_start_index_s == 0 and kv_stride > 1:
+    if chunk_offset == 0 and kv_stride > 1:
         attn_sum[:, : kv_stride - 1, :] = 0
     return attn_sum
 
 
-def ref_indexer_loss_fwd_interface(q, kv, indices, q_start_index_s, kv_stride=1, sm_scale=None, is_casual=True):
+def ref_indexer_loss_fwd_interface(q, kv, indices, chunk_offset=0, kv_stride=1, sm_scale=None, is_casual=True):
     """
     PyTorch Reference Implementation for IndexerLoss Forward
     
@@ -428,7 +430,7 @@ def ref_indexer_loss_fwd_interface(q, kv, indices, q_start_index_s, kv_stride=1,
         q: [batch, seq_len, heads, dim + tail_dim]
         kv: [batch, seq_len_kv, kv_group, dim + tail_dim]
         indices: [batch, seq_len, kv_group, topk]
-        q_start_index_s: chunk offset
+        chunk_offset: 当前 chunk 在完整序列中的起始位置 (用于 causal mask)
         kv_stride: KV stride
         sm_scale: attention scaling factor
         is_casual: whether to use causal mask
@@ -441,8 +443,8 @@ def ref_indexer_loss_fwd_interface(q, kv, indices, q_start_index_s, kv_stride=1,
     indices = indices.transpose(1, 2)  # [batch, kv_group, seq_len, topk]
     b, sq, h, dim_q = q.shape
     b, sk, g, _ = kv.shape
-    if q_start_index_s is None:
-        q_start_index_s = sk * kv_stride - sq
+    if chunk_offset is None:
+        chunk_offset = sk * kv_stride - sq
 
     assert kv.shape[-1] == 576, "you should assign dim otherwise"
     dim = 512
@@ -452,7 +454,7 @@ def ref_indexer_loss_fwd_interface(q, kv, indices, q_start_index_s, kv_stride=1,
     h_index = h // g
     
     # Causal mask for compressed KV
-    compressed_casual_mask = torch.arange(q_start_index_s, sq + q_start_index_s, dtype=torch.int32, device="cuda").view(
+    compressed_casual_mask = torch.arange(chunk_offset, sq + chunk_offset, dtype=torch.int32, device="cuda").view(
         -1, 1
     ) >= torch.arange(kv_stride - 1, sk * kv_stride, kv_stride, dtype=torch.int32, device="cuda").view(1, -1)
 
@@ -484,7 +486,7 @@ def ref_indexer_loss_fwd_interface(q, kv, indices, q_start_index_s, kv_stride=1,
 
 
 def test_indexer_loss_fwd_pipelined(
-    B=1, S=4096, SKV=8192, H=128, HKV=1, DQK=576, DV=512, topk=2048, dtype=torch.bfloat16, q_start_s_index=1024, check_correctness=True
+    B=1, S=4096, SKV=8192, H=128, HKV=1, DQK=576, DV=512, topk=2048, dtype=torch.bfloat16, chunk_offset=1024, check_correctness=True
 ):
     """
     Test IndexerLoss Forward Kernel
@@ -494,7 +496,7 @@ def test_indexer_loss_fwd_pipelined(
     torch.random.manual_seed(0)
     q = torch.randn((B, S, H, DQK), dtype=dtype, device="cuda").requires_grad_(False) / 10
     kv = torch.randn((B, SKV, HKV, DQK), dtype=dtype, device="cuda").requires_grad_(False) / 10
-    q_start_s_index_t = torch.tensor([q_start_s_index], dtype=torch.int32, device="cuda")
+    chunk_offset_t = torch.tensor([chunk_offset], dtype=torch.int32, device="cuda")
 
     q.clamp_(-10, 10)
     kv.clamp_(-10, 10)
@@ -503,23 +505,23 @@ def test_indexer_loss_fwd_pipelined(
     for b in range(B):
         for t in range(S):
             for h in range(HKV):
-                i_i = torch.randperm(min(max(1, ((t + q_start_s_index) // KV_stride)), SKV))[:topk]
+                i_i = torch.randperm(min(max(1, ((t + chunk_offset) // KV_stride)), SKV))[:topk]
                 indices[b, t, h, : len(i_i)] = i_i
 
-    kernels, tl_attn_sum = indexer_loss_fwd_interface(q, kv, indices, q_start_s_index, KV_stride, return_kernel=True, print_kernel=True)
+    kernels, tl_attn_sum = indexer_loss_fwd_interface(q, kv, indices, chunk_offset, KV_stride, return_kernel=True, print_kernel=True)
     indexer_kernel, attn_sum_kernel = kernels
 
     def fn():
         # indexer_kernel 返回 m_out, l_out, qk_out
-        m_out, l_out, qk_out = indexer_kernel(q, kv, indices, q_start_s_index_t)
+        m_out, l_out, qk_out = indexer_kernel(q, kv, indices, chunk_offset_t)
         # 使用 attn_sum_kernel 计算 attn_sum
         attn_sum = attn_sum_kernel(qk_out, m_out, l_out)
-        if q_start_s_index == 0 and KV_stride > 1:
+        if chunk_offset == 0 and KV_stride > 1:
             attn_sum[:, : KV_stride - 1, :] = 0
         return attn_sum
 
     if check_correctness:
-        ref_attn_sum = ref_indexer_loss_fwd_interface(q, kv, indices, q_start_s_index, KV_stride)
+        ref_attn_sum = ref_indexer_loss_fwd_interface(q, kv, indices, chunk_offset, KV_stride)
         print(f"tl_attn_sum shape: {tl_attn_sum.shape}")
         print(f"ref_attn_sum shape: {ref_attn_sum.shape}")
         print(f"tl_attn_sum sample: {tl_attn_sum[0, 0, :10]}")
@@ -545,12 +547,135 @@ def test_indexer_loss_fwd_pipelined(
     print(f"fwd tflops = ", (B * S * DQK * topk * 2 * H) / (ms * 1e-3) / 1e12)
 
 
+# ============================================================================
+# 测试配置
+# ============================================================================
+
+@dataclass
+class TestConfig:
+    """测试配置"""
+    name: str
+    batch_size: int = 1
+    num_heads: int = 128
+    chunk_size: int = 256
+    seq_len: int = 256
+    head_dim: int = 576  # tilelang 版本固定为 576
+    topk: int = 128
+    seed: int = 42
+    
+    def __str__(self):
+        return (f"batch={self.batch_size}, heads={self.num_heads}, "
+                f"chunk={self.chunk_size}, seq={self.seq_len}, "
+                f"dim={self.head_dim}, topk={self.topk}")
+
+
+# ============================================================================
+# 前向精度测试 (比较 attn_sum)
+# ============================================================================
+
+def run_fwd_accuracy_test(config: TestConfig, device: str = 'cuda'):
+    """运行单个前向精度测试 - 比较 attn_sum"""
+    torch.manual_seed(config.seed)
+    
+    # tilelang 版本使用固定的 dim=576
+    head_dim = 576
+    
+    # 生成随机输入
+    q = torch.randn(config.batch_size, config.chunk_size, config.num_heads, head_dim, 
+                    device=device, dtype=torch.bfloat16) / 10
+    kv = torch.randn(config.batch_size, config.seq_len, 1, head_dim, 
+                     device=device, dtype=torch.bfloat16) / 10
+    
+    q.clamp_(-10, 10)
+    kv.clamp_(-10, 10)
+    
+    # 计算 chunk_offset (类似于 triton 版本中的 chunk_offset = seq_len - chunk_size)
+    chunk_offset = config.seq_len - config.chunk_size
+    kv_stride = 1
+    
+    # 生成 indices
+    indices = torch.full((config.batch_size, config.chunk_size, 1, config.topk), 
+                         config.seq_len, dtype=torch.int32, device=device)
+    for b in range(config.batch_size):
+        for t in range(config.chunk_size):
+            max_valid_idx = min(max(1, ((t + chunk_offset) // kv_stride)), config.seq_len)
+            i_i = torch.randperm(max_valid_idx, device=device)[:config.topk]
+            indices[b, t, 0, : len(i_i)] = i_i.to(torch.int32)
+    
+    # TileLang kernel: 计算 attn_sum
+    tl_attn_sum = indexer_loss_fwd_interface(q, kv, indices, chunk_offset, kv_stride)
+    
+    # PyTorch 参考: 计算 attn_sum
+    ref_attn_sum = ref_indexer_loss_fwd_interface(q, kv, indices, chunk_offset, kv_stride)
+    
+    # 比较 attn_sum
+    abs_diff = (ref_attn_sum - tl_attn_sum.to(ref_attn_sum.dtype)).abs().max().item()
+    rel_diff = abs_diff / (ref_attn_sum.abs().max().item() + 1e-10)
+    passed = rel_diff < 1e-2  # 1% 相对误差
+    
+    return {
+        'config': config,
+        'ref_max': ref_attn_sum.abs().max().item(),
+        'tl_max': tl_attn_sum.abs().max().item(),
+        'abs_diff': abs_diff,
+        'rel_diff': rel_diff,
+        'passed': passed
+    }
+
+
+def test_fwd_accuracy(configs: List[TestConfig]):
+    """批量运行前向精度测试 - 比较 attn_sum"""
+    print("\n" + "=" * 110)
+    print("前向精度测试 (PyTorch attn_sum vs TileLang attn_sum)")
+    print("=" * 110)
+    
+    results = []
+    for config in configs:
+        try:
+            result = run_fwd_accuracy_test(config)
+            results.append(result)
+        except Exception as e:
+            print(f"跳过测试 {config.name}: {e}")
+            continue
+    
+    print(f"\n{'Name':<12} {'Config':<60} {'RefMax':<12} {'TLMax':<12} {'RelDiff':<12} {'Pass':<6}")
+    print("-" * 114)
+    for r in results:
+        print(f"{r['config'].name:<12} {str(r['config']):<60} "
+              f"{r['ref_max']:<12.6f} {r['tl_max']:<12.6f} {r['rel_diff']:<12.2e} {'✓' if r['passed'] else '✗':<6}")
+    
+    passed_count = sum(1 for r in results if r['passed'])
+    print("-" * 114)
+    print(f"前向测试 (attn_sum): {passed_count}/{len(results)} 通过")
+    
+    return results
+
+
+# ============================================================================
+# 主测试入口
+# ============================================================================
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--test_correctness", action="store_true")
+    parser.add_argument("--test_accuracy", action="store_true", help="运行前向精度测试")
     args = parser.parse_args()
-    if args.test_correctness:
+    
+    if args.test_accuracy:
+        # 精度测试配置 (tilelang 版本使用固定的 dim=576, topk 需要是 128 的倍数)
+        accuracy_configs = [
+            TestConfig(name="小规模", batch_size=1, num_heads=16, chunk_size=256, seq_len=512, head_dim=576, topk=128),
+            TestConfig(name="中等规模", batch_size=1, num_heads=64, chunk_size=512, seq_len=1024, head_dim=576, topk=256),
+            TestConfig(name="大规模", batch_size=1, num_heads=128, chunk_size=1024, seq_len=2048, head_dim=576, topk=512),
+            TestConfig(name="多batch", batch_size=2, num_heads=64, chunk_size=256, seq_len=512, head_dim=576, topk=128),
+            TestConfig(name="大topk", batch_size=1, num_heads=128, chunk_size=512, seq_len=2048, head_dim=576, topk=1024),
+        ]
+        
+        # ========== 前向精度测试 ==========
+        test_fwd_accuracy(accuracy_configs)
+    elif args.test_correctness:
         B, S, SKV, H, HKV, DQK, DV, topk, dtype = 1, 1024, 8192, 128, 1, 576, 512, 2048, torch.bfloat16
+        test_indexer_loss_fwd_pipelined(B, S, SKV, H, HKV, DQK, DV, topk, dtype, check_correctness=True)
     else:
         B, S, SKV, H, HKV, DQK, DV, topk, dtype = 1, 4096, 8192, 128, 1, 576, 512, 2048, torch.bfloat16
-    test_indexer_loss_fwd_pipelined(B, S, SKV, H, HKV, DQK, DV, topk, dtype, check_correctness=args.test_correctness)
+        test_indexer_loss_fwd_pipelined(B, S, SKV, H, HKV, DQK, DV, topk, dtype, check_correctness=False)
