@@ -941,38 +941,34 @@ def test_fwd_accuracy(configs: List[TestConfig]):
 # 反向精度测试
 # ============================================================================
 
-def pytorch_reference_bwd(q, kv, index_score_full, indices, chunk_offset, kv_stride=1, sm_scale=None, attn_sum=None):
+def pytorch_reference_loss(q, kv, index_score, indices, chunk_offset, kv_stride=1, sm_scale=None):
     """
-    PyTorch 参考实现: 使用 autograd 计算反向传播
+    PyTorch 参考实现: 计算 KL 散度 loss
     
     Args:
         q: [batch, chunk_size, heads, dim + tail_dim]
         kv: [batch, seq_len_kv, kv_group, dim + tail_dim]
-        index_score_full: [batch, chunk_size, topk] - 需要梯度
+        index_score: [batch, chunk_size, topk] - 需要梯度
         indices: [batch, chunk_size, kv_group, topk]
         chunk_offset: chunk 偏移
         kv_stride: KV stride
         sm_scale: attention scaling factor
-        attn_sum: [batch, chunk_size, topk] - 可选，外部传入的 attn_sum
     
     Returns:
-        grad_index_score: [batch, chunk_size, topk] - 梯度
+        kl_loss: 标量 loss 值
     """
-    if not index_score_full.requires_grad:
-        index_score_full = index_score_full.detach().clone().requires_grad_(True)
-    
+    import torch.nn.functional as F
     eps = 1e-10
     
-    # 计算 attn_sum (如果没有外部传入)
-    if attn_sum is None:
-        attn_sum = ref_indexer_loss_fwd_interface(q, kv, indices, chunk_offset, kv_stride, sm_scale)
+    # 计算 attn_sum
+    attn_sum = ref_indexer_loss_fwd_interface(q, kv, indices, chunk_offset, kv_stride, sm_scale)
     
     # 计算 attn_dist
     attn_total = attn_sum.sum(dim=-1, keepdim=True) + eps
     attn_dist = attn_sum / attn_total
     
     # 计算 index_prob (对 index_score 做 softmax)
-    batch, chunk_size, topk = index_score_full.shape
+    batch, chunk_size, topk = index_score.shape
     indices_2d = indices[:, :, 0, :]  # [batch, chunk_size, topk]
     
     # 创建 causal mask
@@ -980,16 +976,43 @@ def pytorch_reference_bwd(q, kv, index_score_full, indices, chunk_offset, kv_str
     max_kv_i = (query_positions + 1 - kv_stride) // kv_stride  # [chunk_size, 1]
     causal_mask = indices_2d > max_kv_i.unsqueeze(0)  # [batch, chunk_size, topk]
     
-    index_score_masked = index_score_full.masked_fill(causal_mask, float('-inf'))
-    index_prob = torch.softmax(index_score_masked, dim=-1)
+    index_score_masked = index_score.masked_fill(causal_mask, float('-inf'))
+    index_prob = torch.softmax(index_score_masked, dim=-1) + eps
     
-    # KL 散度的梯度
-    # Loss = sum_k attn_dist_k * log(attn_dist_k / index_prob_k)
-    # dL/d(index_score_j) = index_prob_j - attn_dist_j
-    grad = index_prob - attn_dist.to(index_prob.dtype)
-    grad = grad.masked_fill(causal_mask, 0.0)
+    # KL 散度: KL(attn_dist || index_prob)
+    kl_loss = F.kl_div(index_prob.log(), attn_dist.to(index_prob.dtype) + eps, reduction='batchmean')
     
-    return grad
+    return kl_loss
+
+
+def pytorch_reference_bwd(q, kv, index_score, indices, chunk_offset, kv_stride=1, sm_scale=None):
+    """
+    PyTorch 参考实现: 使用 autograd 计算反向传播
+    
+    先计算前向 loss，然后调用 loss.backward() 获取梯度。
+    
+    Args:
+        q: [batch, chunk_size, heads, dim + tail_dim]
+        kv: [batch, seq_len_kv, kv_group, dim + tail_dim]
+        index_score: [batch, chunk_size, topk] - 需要梯度
+        indices: [batch, chunk_size, kv_group, topk]
+        chunk_offset: chunk 偏移
+        kv_stride: KV stride
+        sm_scale: attention scaling factor
+    
+    Returns:
+        grad_index_score: [batch, chunk_size, topk] - 梯度
+    """
+    if not index_score.requires_grad:
+        index_score = index_score.detach().clone().requires_grad_(True)
+    
+    # 计算前向 loss
+    loss = pytorch_reference_loss(q, kv, index_score, indices, chunk_offset, kv_stride, sm_scale)
+    
+    # 反向传播获取梯度
+    loss.backward()
+    
+    return index_score.grad
 
 
 def run_bwd_accuracy_test(config: TestConfig, device: str = 'cuda'):
@@ -1023,16 +1046,15 @@ def run_bwd_accuracy_test(config: TestConfig, device: str = 'cuda'):
     index_score = torch.randn(config.batch_size, config.chunk_size, config.topk, 
                               device=device, dtype=torch.float32)
     
-    # 使用 TileLang 前向计算 attn_sum (确保两个反向实现使用相同的 attn_sum)
-    tl_attn_sum = indexer_loss_fwd_interface(q, kv, indices, chunk_offset, kv_stride)
+    # PyTorch 参考: 使用 autograd 计算梯度 (先算 loss 再 backward)
+    index_score_ref = index_score.clone().requires_grad_(True)
+    ref_grad = pytorch_reference_bwd(q, kv, index_score_ref, indices, chunk_offset, kv_stride)
     
-    # PyTorch 参考: 使用相同的 attn_sum 计算梯度
-    ref_grad = pytorch_reference_bwd(q, kv, index_score.clone(), indices, chunk_offset, kv_stride, 
-                                     attn_sum=tl_attn_sum)
-    
-    # Triton 反向 kernel: 直接调用反向 kernel (使用相同的 attn_sum)
-    indices_2d = indices[:, :, 0, :]  # [batch, chunk_size, topk]
-    tri_grad = indexer_loss_bwd_triton(index_score, indices_2d, tl_attn_sum, chunk_offset)
+    # Triton 版本: 使用自定义 backward
+    index_score_tri = index_score.clone().requires_grad_(True)
+    loss = indexer_loss_opt(q, kv, index_score_tri, indices, chunk_offset, kv_stride)
+    loss.backward()
+    tri_grad = index_score_tri.grad
     
     # 使用 indexer_loss_bwd_kernel.py 的比较标准
     def calc_diff(a, b):
