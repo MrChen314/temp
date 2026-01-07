@@ -355,6 +355,269 @@ def attn_sum_fwd(
     return main
 
 
+@tilelang.jit(out_idx=[-1])
+def indexer_loss_bwd(
+    batch,
+    chunk_size,
+    topk,
+    chunk_offset,
+    kv_stride=1,
+    eps=1e-10,
+    block_T=64,
+    threads=128,
+):
+    """
+    IndexerLoss Backward Kernel
+    
+    计算 index_score 的梯度: grad = index_prob - attn_dist
+    
+    数学推导：
+    Loss = KL(attn_dist || index_prob) = sum_k attn_dist_k * log(attn_dist_k / index_prob_k)
+    
+    由于 attn_dist 不依赖于 index_score（只依赖于 Q, K），所以：
+    d Loss / d index_score_j = index_prob_j - attn_dist_j
+    
+    输入:
+    - IndexScore: [batch, chunk_size, topk] - index 分数
+    - Indices: [batch, chunk_size, topk] - 索引 (用于 causal mask)
+    - AttnSum: [batch, chunk_size, topk] - 前向保存的 attn_sum
+    
+    输出:
+    - dIndexScore: [batch, chunk_size, topk] - 梯度
+    """
+    accum_dtype = T.float32
+    indices_dtype = T.int32
+    
+    is_shape = [batch, chunk_size, topk]
+    indices_shape = [batch, chunk_size, topk]
+    attn_sum_shape = [batch, chunk_size, topk]
+    grad_shape = [batch, chunk_size, topk]
+    
+    NT = tilelang.cdiv(topk, block_T)
+    NEG_INF = -(2**30)
+    KV_stride = kv_stride
+    
+    @T.prim_func
+    def main(
+        IndexScore: T.Tensor(is_shape, accum_dtype),  # type: ignore
+        Indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore
+        AttnSum: T.Tensor(attn_sum_shape, accum_dtype),  # type: ignore
+        dIndexScore: T.Tensor(grad_shape, accum_dtype),  # type: ignore
+    ):
+        with T.Kernel(chunk_size, batch, threads=threads) as (bx, by):
+            # 局部变量
+            is_local = T.alloc_fragment([block_T], accum_dtype)
+            indices_local = T.alloc_fragment([block_T], indices_dtype)
+            attn_sum_local = T.alloc_fragment([block_T], accum_dtype)
+            grad_local = T.alloc_fragment([block_T], accum_dtype)
+            
+            s_i = bx
+            global_query_pos = chunk_offset + s_i
+            max_kv_i = (global_query_pos + 1 - KV_stride) // KV_stride
+            
+            # =========================================================================
+            # Step 1: 计算 attn_total (attn_sum 的总和，用于归一化成 attn_dist)
+            # =========================================================================
+            attn_total = T.alloc_fragment([1], accum_dtype)
+            T.fill(attn_total, 0)
+            
+            for t_i in T.serial(NT):
+                T.copy(AttnSum[by, bx, t_i * block_T : (t_i + 1) * block_T], attn_sum_local)
+                for t_j in T.Parallel(block_T):
+                    attn_total[0] = attn_total[0] + attn_sum_local[t_j]
+            
+            # 防止除零
+            for i in T.Parallel(1):
+                attn_total[i] = T.if_then_else(attn_total[i] < eps, 1.0, attn_total[i])
+            
+            # =========================================================================
+            # Step 2: 对 index_score 做 Online Softmax 得到 index_prob
+            # =========================================================================
+            is_m_global = T.alloc_fragment([1], accum_dtype)
+            is_l_global = T.alloc_fragment([1], accum_dtype)
+            T.fill(is_m_global, NEG_INF)
+            T.fill(is_l_global, 0)
+            
+            for t_i in T.serial(NT):
+                T.copy(IndexScore[by, bx, t_i * block_T : (t_i + 1) * block_T], is_local)
+                T.copy(Indices[by, bx, t_i * block_T : (t_i + 1) * block_T], indices_local)
+                
+                # 应用 causal mask
+                for t_j in T.Parallel(block_T):
+                    is_local[t_j] = T.if_then_else(indices_local[t_j] > max_kv_i, NEG_INF, is_local[t_j])
+                
+                # 找当前块的 max
+                is_m_block = T.alloc_fragment([1], accum_dtype)
+                T.fill(is_m_block, NEG_INF)
+                for t_j in T.Parallel(block_T):
+                    is_m_block[0] = T.max(is_m_block[0], is_local[t_j])
+                
+                # 更新全局 max 和 sum
+                for i in T.Parallel(1):
+                    is_m_new = T.max(is_m_global[i], is_m_block[i])
+                    # 计算 exp 并累加
+                    is_l_global[i] = is_l_global[i] * T.exp(is_m_global[i] - is_m_new)
+                    is_m_global[i] = is_m_new
+                
+                for t_j in T.Parallel(block_T):
+                    exp_val = T.exp(is_local[t_j] - is_m_global[0])
+                    exp_val = T.if_then_else(indices_local[t_j] > max_kv_i, 0.0, exp_val)
+                    is_l_global[0] = is_l_global[0] + exp_val
+            
+            # 防止除零
+            for i in T.Parallel(1):
+                is_m_global[i] = T.if_then_else(is_m_global[i] == NEG_INF, 0.0, is_m_global[i])
+                is_l_global[i] = T.if_then_else(is_l_global[i] < 1e-9, 1.0, is_l_global[i])
+            
+            # =========================================================================
+            # Step 3: 计算梯度 grad = index_prob - attn_dist
+            # =========================================================================
+            for t_i in T.serial(NT):
+                T.copy(IndexScore[by, bx, t_i * block_T : (t_i + 1) * block_T], is_local)
+                T.copy(Indices[by, bx, t_i * block_T : (t_i + 1) * block_T], indices_local)
+                T.copy(AttnSum[by, bx, t_i * block_T : (t_i + 1) * block_T], attn_sum_local)
+                
+                for t_j in T.Parallel(block_T):
+                    # 应用 causal mask
+                    is_val = T.if_then_else(indices_local[t_j] > max_kv_i, NEG_INF, is_local[t_j])
+                    # 计算 index_prob
+                    index_prob = T.exp(is_val - is_m_global[0]) / is_l_global[0]
+                    # 计算 attn_dist
+                    attn_dist = attn_sum_local[t_j] / attn_total[0]
+                    # 梯度 = index_prob - attn_dist
+                    grad = index_prob - attn_dist
+                    grad_local[t_j] = T.if_then_else(indices_local[t_j] > max_kv_i, 0.0, grad)
+                
+                # 写出梯度
+                T.copy(grad_local, dIndexScore[by, bx, t_i * block_T : (t_i + 1) * block_T])
+    
+    return main
+
+
+class IndexerLossFunctionOpt(torch.autograd.Function):
+    """
+    自定义 autograd Function，实现稀疏注意力索引损失的前向和反向传播 (TileLang 版本)
+    
+    前向传播:
+        1. 计算 sparse attention (Q @ K[indices]) 并应用 online softmax
+        2. 将所有 head 的 attention 累加到 attn_sum
+        3. 返回 dummy loss (实际 loss 计算在反向传播中不需要)
+    
+    反向传播:
+        由于 attn_dist 不依赖于 index_score（只依赖于 Q, K），所以：
+        grad_index_score = index_prob - attn_dist
+    """
+    
+    @staticmethod
+    def forward(ctx, q, kv, index_score, indices, chunk_offset=0, kv_stride=1, sm_scale=None, eps=1e-10):
+        """
+        前向传播 - 计算 attn_sum
+        
+        Args:
+            q: [batch, chunk_size, heads, dim + tail_dim]
+            kv: [batch, seq_len_kv, kv_group, dim + tail_dim]
+            index_score: [batch, chunk_size, topk] - 稀疏版本的 index 分数
+            indices: [batch, chunk_size, kv_group, topk] - 每个 query 选择的 topk 个 key 索引
+            chunk_offset: 当前 chunk 在完整序列中的起始位置 (用于 causal mask)
+            kv_stride: KV stride
+            sm_scale: attention scaling factor
+            eps: 数值稳定 epsilon
+        
+        Returns:
+            loss: dummy loss 值 (供 loss.backward() 调用)
+        """
+        batch, chunk_size, heads, dim_plus_tail_dim = q.shape
+        _, seq_len_kv, kv_group, _ = kv.shape
+        topk = indices.shape[-1]
+        
+        # 计算 attn_sum
+        attn_sum = indexer_loss_fwd_interface(q, kv, indices, chunk_offset, kv_stride, sm_scale)
+        
+        # 返回 dummy loss (用于触发 backward)
+        dummy_loss = torch.tensor(0.0, device=q.device, dtype=torch.float32, requires_grad=True)
+        
+        # 保存反向传播需要的张量
+        # indices 需要转换为 [batch, chunk_size, topk] 格式
+        indices_2d = indices[:, :, 0, :]  # 假设 kv_group=1
+        ctx.save_for_backward(index_score, indices_2d, attn_sum)
+        ctx.chunk_offset = chunk_offset
+        ctx.kv_stride = kv_stride
+        ctx.eps = eps
+        ctx.batch_size = batch
+        
+        return dummy_loss
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        """
+        反向传播
+        
+        只计算 index_score 的梯度 (Q, K 视为常量，不需要梯度)
+        
+        数学推导:
+        Loss = KL(attn_dist || index_prob) = sum_k attn_dist_k * log(attn_dist_k / index_prob_k)
+        
+        d Loss / d index_score_j = index_prob_j - attn_dist_j
+        """
+        index_score, indices, attn_sum = ctx.saved_tensors
+        chunk_offset = ctx.chunk_offset
+        kv_stride = ctx.kv_stride
+        eps = ctx.eps
+        batch_size = ctx.batch_size
+        
+        batch, chunk_size, topk = index_score.shape
+        
+        # 编译反向 kernel
+        bwd_kernel = indexer_loss_bwd(batch, chunk_size, topk, chunk_offset, kv_stride, eps)
+        
+        # 运行反向 kernel
+        grad_index_score = bwd_kernel(index_score, indices, attn_sum)
+        
+        # 乘以上游梯度并除以 batch_size (对应前向 loss = sum / batch_size)
+        grad_index_score = grad_index_score * grad_output / batch_size
+        
+        # 返回对应输入的梯度
+        # (q, kv, index_score, indices, chunk_offset, kv_stride, sm_scale, eps)
+        return None, None, grad_index_score, None, None, None, None, None
+
+
+def indexer_loss_opt(q, kv, index_score, indices, chunk_offset=0, kv_stride=1, sm_scale=None, eps=1e-10):
+    """
+    计算稀疏注意力索引损失 (Sparse Attention Index Loss) - TileLang 版本
+    
+    该函数使用 TileLang kernel 实现高效的稀疏注意力计算，支持自动梯度反向传播。
+    
+    核心思想:
+        1. 计算 sparse attention: softmax(Q @ K[indices] * scaling)
+        2. 将所有 head 的 attention 求和得到 attn_sum
+        3. 反向传播时计算 grad = index_prob - attn_dist
+    
+    Args:
+        q: [batch, chunk_size, heads, dim + tail_dim] - 当前 chunk 的 query
+        kv: [batch, seq_len_kv, kv_group, dim + tail_dim] - 完整的 KV
+        index_score: [batch, chunk_size, topk] - 稀疏版本的 index 分数，需要梯度
+        indices: [batch, chunk_size, kv_group, topk] - 每个 query 选择的 topk 个 key 索引
+        chunk_offset: 当前 chunk 在完整序列中的起始位置 (用于 causal mask)，默认为 0
+        kv_stride: KV stride，默认为 1
+        sm_scale: attention scaling factor
+        eps: 数值稳定 epsilon，默认为 1e-10
+    
+    Returns:
+        loss: dummy loss 值 (供 loss.backward() 调用)
+    
+    Example:
+        >>> batch, heads, chunk_size, head_dim = 1, 128, 256, 576
+        >>> seq_len, topk = 1024, 128
+        >>> q = torch.randn(batch, chunk_size, heads, head_dim, device='cuda', dtype=torch.bfloat16)
+        >>> kv = torch.randn(batch, seq_len, 1, head_dim, device='cuda', dtype=torch.bfloat16)
+        >>> index_score = torch.randn(batch, chunk_size, topk, device='cuda', requires_grad=True)
+        >>> indices = torch.randint(0, seq_len, (batch, chunk_size, 1, topk), device='cuda', dtype=torch.int32)
+        >>> loss = indexer_loss_opt(q, kv, index_score, indices, chunk_offset=seq_len - chunk_size)
+        >>> loss.backward()  # index_score.grad 现在包含梯度
+    """
+    return IndexerLossFunctionOpt.apply(q, kv, index_score, indices, chunk_offset, kv_stride, sm_scale, eps)
+
+
 def indexer_loss_fwd_interface(
     q, kv, indices, chunk_offset=0, kv_stride=1, sm_scale=None, is_casual=True, return_kernel=False, print_kernel=False
 ):
@@ -652,6 +915,247 @@ def test_fwd_accuracy(configs: List[TestConfig]):
 
 
 # ============================================================================
+# 反向精度测试
+# ============================================================================
+
+def pytorch_reference_bwd(q, kv, index_score_full, indices, chunk_offset, kv_stride=1, sm_scale=None):
+    """
+    PyTorch 参考实现: 使用 autograd 计算反向传播
+    
+    Args:
+        q: [batch, chunk_size, heads, dim + tail_dim]
+        kv: [batch, seq_len_kv, kv_group, dim + tail_dim]
+        index_score_full: [batch, chunk_size, topk] - 需要梯度
+        indices: [batch, chunk_size, kv_group, topk]
+        chunk_offset: chunk 偏移
+        kv_stride: KV stride
+        sm_scale: attention scaling factor
+    
+    Returns:
+        grad_index_score: [batch, chunk_size, topk] - 梯度
+    """
+    if not index_score_full.requires_grad:
+        index_score_full = index_score_full.detach().clone().requires_grad_(True)
+    
+    eps = 1e-10
+    
+    # 计算 attn_sum
+    attn_sum = ref_indexer_loss_fwd_interface(q, kv, indices, chunk_offset, kv_stride, sm_scale)
+    
+    # 计算 attn_dist
+    attn_total = attn_sum.sum(dim=-1, keepdim=True) + eps
+    attn_dist = attn_sum / attn_total
+    
+    # 计算 index_prob (对 index_score 做 softmax)
+    batch, chunk_size, topk = index_score_full.shape
+    indices_2d = indices[:, :, 0, :]  # [batch, chunk_size, topk]
+    
+    # 创建 causal mask
+    query_positions = chunk_offset + torch.arange(chunk_size, device=q.device).view(-1, 1)
+    max_kv_i = (query_positions + 1 - kv_stride) // kv_stride  # [chunk_size, 1]
+    causal_mask = indices_2d > max_kv_i.unsqueeze(0)  # [batch, chunk_size, topk]
+    
+    index_score_masked = index_score_full.masked_fill(causal_mask, float('-inf'))
+    index_prob = torch.softmax(index_score_masked, dim=-1)
+    
+    # KL 散度的梯度
+    # Loss = sum_k attn_dist_k * log(attn_dist_k / index_prob_k)
+    # dL/d(index_score_j) = index_prob_j - attn_dist_j
+    grad = index_prob - attn_dist.to(index_prob.dtype)
+    grad = grad.masked_fill(causal_mask, 0.0)
+    
+    return grad
+
+
+def run_bwd_accuracy_test(config: TestConfig, device: str = 'cuda'):
+    """运行单个反向精度测试"""
+    torch.manual_seed(config.seed)
+    
+    head_dim = 576
+    
+    # 生成随机输入
+    q = torch.randn(config.batch_size, config.chunk_size, config.num_heads, head_dim, 
+                    device=device, dtype=torch.bfloat16) / 10
+    kv = torch.randn(config.batch_size, config.seq_len, 1, head_dim, 
+                     device=device, dtype=torch.bfloat16) / 10
+    
+    q.clamp_(-10, 10)
+    kv.clamp_(-10, 10)
+    
+    chunk_offset = config.seq_len - config.chunk_size
+    kv_stride = 1
+    
+    # 生成 indices
+    indices = torch.full((config.batch_size, config.chunk_size, 1, config.topk), 
+                         config.seq_len, dtype=torch.int32, device=device)
+    for b in range(config.batch_size):
+        for t in range(config.chunk_size):
+            max_valid_idx = min(max(1, ((t + chunk_offset) // kv_stride)), config.seq_len)
+            i_i = torch.randperm(max_valid_idx, device=device)[:config.topk]
+            indices[b, t, 0, : len(i_i)] = i_i.to(torch.int32)
+    
+    # 生成 index_score
+    index_score = torch.randn(config.batch_size, config.chunk_size, config.topk, 
+                              device=device, dtype=torch.float32)
+    
+    # PyTorch 参考: 计算梯度
+    ref_grad = pytorch_reference_bwd(q, kv, index_score.clone(), indices, chunk_offset, kv_stride)
+    
+    # TileLang 版本: 使用自定义 backward
+    index_score_tl = index_score.clone().requires_grad_(True)
+    loss = indexer_loss_opt(q, kv, index_score_tl, indices, chunk_offset, kv_stride)
+    loss.backward()
+    tl_grad = index_score_tl.grad
+    
+    # 比较梯度
+    abs_diff = (ref_grad - tl_grad).abs().max().item()
+    rel_diff = abs_diff / (ref_grad.abs().max().item() + 1e-10)
+    passed = rel_diff < 1e-2  # 1% 相对误差
+    
+    return {
+        'config': config,
+        'ref_grad_max': ref_grad.abs().max().item(),
+        'tl_grad_max': tl_grad.abs().max().item(),
+        'abs_diff': abs_diff,
+        'rel_diff': rel_diff,
+        'passed': passed
+    }
+
+
+def test_bwd_accuracy(configs: List[TestConfig]):
+    """批量运行反向精度测试"""
+    print("\n" + "=" * 110)
+    print("反向精度测试 (PyTorch autograd vs TileLang kernel)")
+    print("=" * 110)
+    
+    results = []
+    for config in configs:
+        try:
+            result = run_bwd_accuracy_test(config)
+            results.append(result)
+        except Exception as e:
+            print(f"跳过测试 {config.name}: {e}")
+            continue
+    
+    print(f"\n{'Name':<12} {'Config':<60} {'RefMax':<12} {'TLMax':<12} {'RelDiff':<12} {'Pass':<6}")
+    print("-" * 114)
+    for r in results:
+        print(f"{r['config'].name:<12} {str(r['config']):<60} "
+              f"{r['ref_grad_max']:<12.2e} {r['tl_grad_max']:<12.2e} {r['rel_diff']:<12.2e} {'✓' if r['passed'] else '✗':<6}")
+    
+    passed_count = sum(1 for r in results if r['passed'])
+    print("-" * 114)
+    print(f"反向测试: {passed_count}/{len(results)} 通过")
+    
+    return results
+
+
+# ============================================================================
+# 前向+反向性能对比测试
+# ============================================================================
+
+def test_fwd_bwd_performance(
+    batch_size: int = 1,
+    num_heads: int = 128,
+    chunk_size: int = 1024,
+    seq_len: int = 2048,
+    head_dim: int = 576,
+    topk: int = 512,
+    seed: int = 42,
+    num_warmup: int = 5,
+    num_benchmark: int = 20,
+):
+    """前向+反向性能测试"""
+    import time
+    
+    torch.manual_seed(seed)
+    device = 'cuda'
+    
+    print("\n" + "=" * 80)
+    print("前向+反向性能测试 (TileLang)")
+    print("=" * 80)
+    print(f"参数: batch={batch_size}, heads={num_heads}, chunk={chunk_size}, seq={seq_len}, dim={head_dim}, topk={topk}")
+    print("=" * 80)
+    
+    q = torch.randn(batch_size, chunk_size, num_heads, head_dim, device=device, dtype=torch.bfloat16) / 10
+    kv = torch.randn(batch_size, seq_len, 1, head_dim, device=device, dtype=torch.bfloat16) / 10
+    q.clamp_(-10, 10)
+    kv.clamp_(-10, 10)
+    
+    chunk_offset = seq_len - chunk_size
+    kv_stride = 1
+    
+    # 生成 indices
+    indices = torch.full((batch_size, chunk_size, 1, topk), seq_len, dtype=torch.int32, device=device)
+    for b in range(batch_size):
+        for t in range(chunk_size):
+            max_valid_idx = min(max(1, ((t + chunk_offset) // kv_stride)), seq_len)
+            i_i = torch.randperm(max_valid_idx, device=device)[:topk]
+            indices[b, t, 0, : len(i_i)] = i_i.to(torch.int32)
+    
+    index_score = torch.randn(batch_size, chunk_size, topk, device=device, dtype=torch.float32)
+    
+    torch.cuda.synchronize()
+    base_memory = torch.cuda.memory_allocated() / (1024**3)
+    
+    # 仅前向测试
+    torch.cuda.reset_peak_memory_stats()
+    for _ in range(num_warmup):
+        _ = indexer_loss_fwd_interface(q, kv, indices, chunk_offset, kv_stride)
+    torch.cuda.synchronize()
+    
+    torch.cuda.reset_peak_memory_stats()
+    start = time.time()
+    for _ in range(num_benchmark):
+        _ = indexer_loss_fwd_interface(q, kv, indices, chunk_offset, kv_stride)
+    torch.cuda.synchronize()
+    fwd_time = (time.time() - start) / num_benchmark * 1000
+    fwd_peak = torch.cuda.max_memory_allocated() / (1024**3)
+    
+    # 前向+反向测试
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    for _ in range(num_warmup):
+        index_score_copy = index_score.clone().requires_grad_(True)
+        loss = indexer_loss_opt(q, kv, index_score_copy, indices, chunk_offset, kv_stride)
+        loss.backward()
+    torch.cuda.synchronize()
+    
+    torch.cuda.reset_peak_memory_stats()
+    start = time.time()
+    for _ in range(num_benchmark):
+        index_score_copy = index_score.clone().requires_grad_(True)
+        loss = indexer_loss_opt(q, kv, index_score_copy, indices, chunk_offset, kv_stride)
+        loss.backward()
+    torch.cuda.synchronize()
+    fwd_bwd_time = (time.time() - start) / num_benchmark * 1000
+    fwd_bwd_peak = torch.cuda.max_memory_allocated() / (1024**3)
+    
+    print(f"\n>>> 性能 (warmup={num_warmup}, iters={num_benchmark})")
+    print(f"  仅前向:     {fwd_time:.3f} ms")
+    print(f"  前向+反向:  {fwd_bwd_time:.3f} ms")
+    print(f"  反向开销:   {fwd_bwd_time - fwd_time:.3f} ms")
+    
+    print(f"\n>>> 显存峰值")
+    print(f"  基准显存:   {base_memory:.2f} GB")
+    print(f"  前向峰值:   {fwd_peak:.2f} GB (增量: {fwd_peak - base_memory:.2f} GB)")
+    print(f"  前向+反向峰值: {fwd_bwd_peak:.2f} GB (增量: {fwd_bwd_peak - base_memory:.2f} GB)")
+    
+    # 计算 TFLOPS
+    flops_fwd = batch_size * chunk_size * head_dim * topk * 2 * num_heads
+    print(f"\n>>> 计算吞吐量")
+    print(f"  前向 TFLOPS: {flops_fwd / (fwd_time * 1e-3) / 1e12:.2f}")
+    print(f"  前向+反向 TFLOPS: {flops_fwd * 2 / (fwd_bwd_time * 1e-3) / 1e12:.2f}")
+    
+    return {
+        'fwd_time': fwd_time,
+        'fwd_bwd_time': fwd_bwd_time,
+        'fwd_peak': fwd_peak,
+        'fwd_bwd_peak': fwd_bwd_peak,
+    }
+
+
+# ============================================================================
 # 主测试入口
 # ============================================================================
 
@@ -659,20 +1163,37 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--test_correctness", action="store_true")
     parser.add_argument("--test_accuracy", action="store_true", help="运行前向精度测试")
+    parser.add_argument("--test_bwd_accuracy", action="store_true", help="运行反向精度测试")
+    parser.add_argument("--test_performance", action="store_true", help="运行前向+反向性能测试")
     args = parser.parse_args()
     
+    # 精度测试配置 (tilelang 版本使用固定的 dim=576, topk 需要是 64 的倍数)
+    accuracy_configs = [
+        TestConfig(name="小规模", batch_size=1, num_heads=16, chunk_size=256, seq_len=512, head_dim=576, topk=128),
+        TestConfig(name="中等规模", batch_size=1, num_heads=64, chunk_size=512, seq_len=1024, head_dim=576, topk=256),
+        TestConfig(name="大规模", batch_size=1, num_heads=128, chunk_size=1024, seq_len=2048, head_dim=576, topk=512),
+        TestConfig(name="多batch", batch_size=2, num_heads=64, chunk_size=256, seq_len=512, head_dim=576, topk=128),
+        TestConfig(name="大topk", batch_size=1, num_heads=128, chunk_size=512, seq_len=2048, head_dim=576, topk=1024),
+    ]
+    
     if args.test_accuracy:
-        # 精度测试配置 (tilelang 版本使用固定的 dim=576, topk 需要是 128 的倍数)
-        accuracy_configs = [
-            TestConfig(name="小规模", batch_size=1, num_heads=16, chunk_size=256, seq_len=512, head_dim=576, topk=128),
-            TestConfig(name="中等规模", batch_size=1, num_heads=64, chunk_size=512, seq_len=1024, head_dim=576, topk=256),
-            TestConfig(name="大规模", batch_size=1, num_heads=128, chunk_size=1024, seq_len=2048, head_dim=576, topk=512),
-            TestConfig(name="多batch", batch_size=2, num_heads=64, chunk_size=256, seq_len=512, head_dim=576, topk=128),
-            TestConfig(name="大topk", batch_size=1, num_heads=128, chunk_size=512, seq_len=2048, head_dim=576, topk=1024),
-        ]
-        
         # ========== 前向精度测试 ==========
         test_fwd_accuracy(accuracy_configs)
+    elif args.test_bwd_accuracy:
+        # ========== 反向精度测试 ==========
+        test_bwd_accuracy(accuracy_configs)
+    elif args.test_performance:
+        # ========== 前向+反向性能测试 ==========
+        test_fwd_bwd_performance(
+            batch_size=1,
+            num_heads=128,
+            chunk_size=1024,
+            seq_len=2048,
+            head_dim=576,
+            topk=512,
+            num_warmup=3,
+            num_benchmark=10,
+        )
     elif args.test_correctness:
         B, S, SKV, H, HKV, DQK, DV, topk, dtype = 1, 1024, 8192, 128, 1, 576, 512, 2048, torch.bfloat16
         test_indexer_loss_fwd_pipelined(B, S, SKV, H, HKV, DQK, DV, topk, dtype, check_correctness=True)
