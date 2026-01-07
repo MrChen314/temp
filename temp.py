@@ -285,6 +285,73 @@ def indexer_loss_fwd(
 
     return main
 
+@tilelang.jit(out_idx=[-1])
+def attn_sum_fwd(
+    batch,
+    seq_len,
+    heads,
+    topk,
+    sm_scale_log2e,
+    block_T=64,
+    threads=128,
+):
+    """
+    Attention Sum Forward Kernel
+    
+    计算 softmax 概率并沿 head 维度求和。
+    
+    输入:
+    - QK_out: [batch, seq_len, heads, topk] - 已乘以 sm_scale 的 QK 结果
+    - M_out: [batch, seq_len, heads] - 每个 head 的 max 值
+    - L_out: [batch, seq_len, heads] - 每个 head 的 sum of exp2
+    
+    输出:
+    - AttnSum: [batch, seq_len, topk] - 沿 head 维度求和的 attention 概率
+    """
+    accum_dtype = T.float32
+    
+    qk_shape = [batch, seq_len, heads, topk]
+    m_shape = [batch, seq_len, heads]
+    l_shape = [batch, seq_len, heads]
+    attn_sum_shape = [batch, seq_len, topk]
+    
+    NT = tilelang.cdiv(topk, block_T)
+    
+    @T.prim_func
+    def main(
+        QK_out: T.Tensor(qk_shape, accum_dtype),  # type: ignore
+        M_out: T.Tensor(m_shape, accum_dtype),  # type: ignore
+        L_out: T.Tensor(l_shape, accum_dtype),  # type: ignore
+        AttnSum: T.Tensor(attn_sum_shape, accum_dtype),  # type: ignore
+    ):
+        with T.Kernel(seq_len, batch, threads=threads) as (bx, by):
+            # 分配本地内存
+            qk_local = T.alloc_fragment([heads, block_T], accum_dtype)
+            m_local = T.alloc_fragment([heads], accum_dtype)
+            l_local = T.alloc_fragment([heads], accum_dtype)
+            attn_sum_local = T.alloc_fragment([block_T], accum_dtype)
+            
+            # 加载 M 和 L (每个 seq position 只需加载一次)
+            T.copy(M_out[by, bx, 0:heads], m_local)
+            T.copy(L_out[by, bx, 0:heads], l_local)
+            
+            # 对 topk 分块处理
+            for t_i in T.serial(NT):
+                # 加载 QK block
+                T.copy(QK_out[by, bx, 0:heads, t_i * block_T : (t_i + 1) * block_T], qk_local)
+                
+                # 计算 attn_prob = exp2(qk - m * sm_scale) / l
+                for h_i, t_j in T.Parallel(heads, block_T):
+                    qk_local[h_i, t_j] = T.exp2(qk_local[h_i, t_j] - m_local[h_i] * sm_scale_log2e) / l_local[h_i]
+                
+                # 沿 head 维度求和
+                T.reduce_sum(qk_local, attn_sum_local, dim=0)
+                
+                # 写出结果
+                T.copy(attn_sum_local, AttnSum[by, bx, t_i * block_T : (t_i + 1) * block_T])
+    
+    return main
+
 
 def indexer_loss_fwd_interface(
     q, kv, indices, q_start_index_s, kv_stride, sm_scale=None, is_casual=True, return_kernel=False, print_kernel=False
@@ -338,18 +405,14 @@ def indexer_loss_fwd_interface(
     # kernel 返回 M_out, L_out, QK_out
     m_out, l_out, qk_out = kernel(q, kv, indices, torch.tensor([q_start_index_s], dtype=torch.int32, device="cuda"))
     
-    # 根据 m, l, qk 计算 attn_sum
-    # qk_out: [batch, seq_len, heads, topk] - 已乘以 sm_scale_log2e
-    # m_out: [batch, seq_len, heads] - max 值
-    # l_out: [batch, seq_len, heads] - sum of exp2
-    # attn_prob = exp2(qk_out - m_out * sm_scale_log2e) / l_out
-    attn_prob = torch.exp2(qk_out - m_out.unsqueeze(-1) * sm_scale_log2e) / l_out.unsqueeze(-1)
-    
-    # 沿 head 维度求和
-    attn_sum = attn_prob.sum(dim=2)  # [batch, seq_len, topk]
+    # 使用 tilelang kernel 计算 attn_sum
+    attn_sum_kernel = attn_sum_fwd(batch, seq_len, heads, topk, sm_scale_log2e)
+    if print_kernel:
+        print(attn_sum_kernel.get_kernel_source())
+    attn_sum = attn_sum_kernel(qk_out, m_out, l_out)
     
     if return_kernel:
-        return kernel, attn_sum
+        return (kernel, attn_sum_kernel), attn_sum
     if q_start_index_s == 0 and kv_stride > 1:
         attn_sum[:, : kv_stride - 1, :] = 0
     return attn_sum
@@ -443,17 +506,14 @@ def test_indexer_loss_fwd_pipelined(
                 i_i = torch.randperm(min(max(1, ((t + q_start_s_index) // KV_stride)), SKV))[:topk]
                 indices[b, t, h, : len(i_i)] = i_i
 
-    kernel, tl_attn_sum = indexer_loss_fwd_interface(q, kv, indices, q_start_s_index, KV_stride, return_kernel=True, print_kernel=True)
-
-    # 计算 sm_scale（与接口中相同）
-    sm_scale_log2e = (1.0 / DQK) ** 0.5 * 1.44269504
+    kernels, tl_attn_sum = indexer_loss_fwd_interface(q, kv, indices, q_start_s_index, KV_stride, return_kernel=True, print_kernel=True)
+    indexer_kernel, attn_sum_kernel = kernels
 
     def fn():
-        # kernel 返回 m_out, l_out, qk_out
-        m_out, l_out, qk_out = kernel(q, kv, indices, q_start_s_index_t)
-        # 计算 attn_sum
-        attn_prob = torch.exp2(qk_out - m_out.unsqueeze(-1) * sm_scale_log2e) / l_out.unsqueeze(-1)
-        attn_sum = attn_prob.sum(dim=2)
+        # indexer_kernel 返回 m_out, l_out, qk_out
+        m_out, l_out, qk_out = indexer_kernel(q, kv, indices, q_start_s_index_t)
+        # 使用 attn_sum_kernel 计算 attn_sum
+        attn_sum = attn_sum_kernel(qk_out, m_out, l_out)
         if q_start_s_index == 0 and KV_stride > 1:
             attn_sum[:, : KV_stride - 1, :] = 0
         return attn_sum
