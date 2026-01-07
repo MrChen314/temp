@@ -1,12 +1,16 @@
-保留tilelang pipeline的Q_shared_l、Q_shared_r、Q_tail_shared和K_shared_l、K_shared_r、K_tail_shared，删除V相关的操作
+====================================================================================================
+反向精度测试 (PyTorch autograd vs Triton kernel)
+====================================================================================================
+/home/users/chenquanlin/temp.py:1036: UserWarning: Converting a tensor with requires_grad=True to a scalar may lead to unexpected behavior.
+Consider using tensor.detach() first. (Triggered internally at /opt/pytorch/pytorch/aten/src/ATen/native/Scalar.cpp:22.)
+  max_diff = abs_diff.max().item()
 
-线程分组
-线程1组：qk矩阵乘算出m_global和l_global
-线程2组：qk矩阵乘算出attn_sum
-线程3组：producer，负责维护buffer
-
-前向kernel只算attn_sum，给反向用
-
-
-#tilelang_kernel_pipeline.py目前是sparse mla的实现，但  #indexer_loss_kernel.py的_indexer_loss_fwd_kernel实现可参考tilelang的pipeline优化
-根据  #线程分组.txt，修改  #tilelang_kernel_pipeline.py中的sparse_mla_fwd为_indexer_loss_fwd_kernel_tilelang，实现一般优化的indexer_loss_kernel
+Name         Config                                                  MaxDiff      RelDiff(%)   Pass  
+-------------------------------------------------------------------------------------------------
+小规模          batch=1, heads=16, chunk=256, seq=512, dim=576, topk=128 1.49e-08     2.95e-05     ✓     
+中等规模         batch=1, heads=64, chunk=512, seq=1024, dim=576, topk=256 1.49e-08     2.54e-05     ✓     
+大规模          batch=1, heads=128, chunk=1024, seq=2048, dim=576, topk=512 1.49e-08     2.22e-05     ✓     
+多batch       batch=2, heads=64, chunk=256, seq=512, dim=576, topk=128 1.12e-01     4.78e+01     ✗     
+大topk        batch=1, heads=128, chunk=512, seq=2048, dim=576, topk=1024 7.45e-09     1.92e-05     ✓     
+-------------------------------------------------------------------------------------------------
+反向测试: 4/5 通过
