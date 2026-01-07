@@ -1,11 +1,18 @@
 # ruff: noqa
 import torch
+import triton
+import triton.language as tl
 import tilelang
 from tilelang import language as T
 from tilelang.engine.callback import register_cuda_postproc_callback
 import argparse
 from dataclasses import dataclass
 from typing import List
+
+# 反向传播的常量配置
+BWD_BLOCK_TOPK = 256
+BWD_NUM_STAGES = 3
+BWD_NUM_WARPS = 8
 
 
 @tilelang.jit(
@@ -355,143 +362,160 @@ def attn_sum_fwd(
     return main
 
 
-@tilelang.jit(out_idx=[-1])
-def indexer_loss_bwd(
-    batch,
-    chunk_size,
-    topk,
-    chunk_offset,
-    kv_stride=1,
-    eps=1e-10,
-    block_T=64,
-    threads=128,
+@triton.jit
+def _indexer_loss_bwd_kernel(
+    # 输入
+    IndexScore_ptr,  # [batch, chunk_size, topk]
+    Indices_ptr,     # [batch, chunk_size, topk]
+    AttnSum_ptr,     # [batch, chunk_size, topk] - 前向保存的中间结果
+    # 输出
+    dIndexScore_ptr, # [batch, chunk_size, topk]
+    # 标量参数
+    batch_size, chunk_size, chunk_offset,
+    topk: tl.constexpr,
+    eps: tl.constexpr,
+    # strides
+    stride_isb, stride_iss, stride_isk,
+    stride_ib, stride_is, stride_ik,
+    stride_asb, stride_ass, stride_ask,
+    stride_disb, stride_diss, stride_disk,
+    BLOCK_TOPK: tl.constexpr,
 ):
     """
-    IndexerLoss Backward Kernel
-    
-    计算 index_score 的梯度: grad = index_prob - attn_dist
+    反向传播 kernel：计算 index_score 的梯度
     
     数学推导：
     Loss = KL(attn_dist || index_prob) = sum_k attn_dist_k * log(attn_dist_k / index_prob_k)
     
     由于 attn_dist 不依赖于 index_score（只依赖于 Q, K），所以：
+    d Loss / d index_score_j = d/d(index_score_j) [ -sum_k attn_dist_k * log(index_prob_k) ]
+    
+    使用 softmax 的梯度公式：
     d Loss / d index_score_j = index_prob_j - attn_dist_j
-    
-    输入:
-    - IndexScore: [batch, chunk_size, topk] - index 分数
-    - Indices: [batch, chunk_size, topk] - 索引 (用于 causal mask)
-    - AttnSum: [batch, chunk_size, topk] - 前向保存的 attn_sum
-    
-    输出:
-    - dIndexScore: [batch, chunk_size, topk] - 梯度
     """
-    accum_dtype = T.float32
-    indices_dtype = T.int32
+    pid = tl.program_id(0)
+    pid_batch = pid // chunk_size
+    pid_row = pid % chunk_size
     
-    is_shape = [batch, chunk_size, topk]
-    indices_shape = [batch, chunk_size, topk]
-    attn_sum_shape = [batch, chunk_size, topk]
-    grad_shape = [batch, chunk_size, topk]
+    NEG_INF = -1e9
+    global_query_pos = chunk_offset + pid_row
+    num_topk_blocks = tl.cdiv(topk, BLOCK_TOPK)
     
-    NT = tilelang.cdiv(topk, block_T)
-    NEG_INF = -(2**30)
-    KV_stride = kv_stride
+    # 基地址
+    idx_base = Indices_ptr + pid_batch * stride_ib + pid_row * stride_is
+    is_base = IndexScore_ptr + pid_batch * stride_isb + pid_row * stride_iss
+    attn_sum_base = AttnSum_ptr + pid_batch * stride_asb + pid_row * stride_ass
+    dis_base = dIndexScore_ptr + pid_batch * stride_disb + pid_row * stride_diss
     
-    @T.prim_func
-    def main(
-        IndexScore: T.Tensor(is_shape, accum_dtype),  # type: ignore
-        Indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore
-        AttnSum: T.Tensor(attn_sum_shape, accum_dtype),  # type: ignore
-        dIndexScore: T.Tensor(grad_shape, accum_dtype),  # type: ignore
-    ):
-        with T.Kernel(chunk_size, batch, threads=threads) as (bx, by):
-            # 局部变量
-            is_local = T.alloc_fragment([block_T], accum_dtype)
-            indices_local = T.alloc_fragment([block_T], indices_dtype)
-            attn_sum_local = T.alloc_fragment([block_T], accum_dtype)
-            grad_local = T.alloc_fragment([block_T], accum_dtype)
-            
-            s_i = bx
-            global_query_pos = chunk_offset + s_i
-            max_kv_i = (global_query_pos + 1 - KV_stride) // KV_stride
-            
-            # =========================================================================
-            # Step 1: 计算 attn_total (attn_sum 的总和，用于归一化成 attn_dist)
-            # =========================================================================
-            attn_total = T.alloc_fragment([1], accum_dtype)
-            T.fill(attn_total, 0)
-            
-            for t_i in T.serial(NT):
-                T.copy(AttnSum[by, bx, t_i * block_T : (t_i + 1) * block_T], attn_sum_local)
-                for t_j in T.Parallel(block_T):
-                    attn_total[0] = attn_total[0] + attn_sum_local[t_j]
-            
-            # 防止除零
-            for i in T.Parallel(1):
-                attn_total[i] = T.if_then_else(attn_total[i] < eps, 1.0, attn_total[i])
-            
-            # =========================================================================
-            # Step 2: 对 index_score 做 Online Softmax 得到 index_prob
-            # =========================================================================
-            is_m_global = T.alloc_fragment([1], accum_dtype)
-            is_l_global = T.alloc_fragment([1], accum_dtype)
-            T.fill(is_m_global, NEG_INF)
-            T.fill(is_l_global, 0)
-            
-            for t_i in T.serial(NT):
-                T.copy(IndexScore[by, bx, t_i * block_T : (t_i + 1) * block_T], is_local)
-                T.copy(Indices[by, bx, t_i * block_T : (t_i + 1) * block_T], indices_local)
-                
-                # 应用 causal mask
-                for t_j in T.Parallel(block_T):
-                    is_local[t_j] = T.if_then_else(indices_local[t_j] > max_kv_i, NEG_INF, is_local[t_j])
-                
-                # 找当前块的 max
-                is_m_block = T.alloc_fragment([1], accum_dtype)
-                T.fill(is_m_block, NEG_INF)
-                for t_j in T.Parallel(block_T):
-                    is_m_block[0] = T.max(is_m_block[0], is_local[t_j])
-                
-                # 更新全局 max 和 sum
-                for i in T.Parallel(1):
-                    is_m_new = T.max(is_m_global[i], is_m_block[i])
-                    # 计算 exp 并累加
-                    is_l_global[i] = is_l_global[i] * T.exp(is_m_global[i] - is_m_new)
-                    is_m_global[i] = is_m_new
-                
-                for t_j in T.Parallel(block_T):
-                    exp_val = T.exp(is_local[t_j] - is_m_global[0])
-                    exp_val = T.if_then_else(indices_local[t_j] > max_kv_i, 0.0, exp_val)
-                    is_l_global[0] = is_l_global[0] + exp_val
-            
-            # 防止除零
-            for i in T.Parallel(1):
-                is_m_global[i] = T.if_then_else(is_m_global[i] == NEG_INF, 0.0, is_m_global[i])
-                is_l_global[i] = T.if_then_else(is_l_global[i] < 1e-9, 1.0, is_l_global[i])
-            
-            # =========================================================================
-            # Step 3: 计算梯度 grad = index_prob - attn_dist
-            # =========================================================================
-            for t_i in T.serial(NT):
-                T.copy(IndexScore[by, bx, t_i * block_T : (t_i + 1) * block_T], is_local)
-                T.copy(Indices[by, bx, t_i * block_T : (t_i + 1) * block_T], indices_local)
-                T.copy(AttnSum[by, bx, t_i * block_T : (t_i + 1) * block_T], attn_sum_local)
-                
-                for t_j in T.Parallel(block_T):
-                    # 应用 causal mask
-                    is_val = T.if_then_else(indices_local[t_j] > max_kv_i, NEG_INF, is_local[t_j])
-                    # 计算 index_prob
-                    index_prob = T.exp(is_val - is_m_global[0]) / is_l_global[0]
-                    # 计算 attn_dist
-                    attn_dist = attn_sum_local[t_j] / attn_total[0]
-                    # 梯度 = index_prob - attn_dist
-                    grad = index_prob - attn_dist
-                    grad_local[t_j] = T.if_then_else(indices_local[t_j] > max_kv_i, 0.0, grad)
-                
-                # 写出梯度
-                T.copy(grad_local, dIndexScore[by, bx, t_i * block_T : (t_i + 1) * block_T])
+    # =========================================================================
+    # Step 1: 计算 attn_total (attn_sum 的总和，用于归一化成 attn_dist)
+    # =========================================================================
+    attn_total = 0.0
+    for tk_idx in range(num_topk_blocks):
+        tk_start = tk_idx * BLOCK_TOPK
+        offs_tk = tk_start + tl.arange(0, BLOCK_TOPK)
+        tk_mask = offs_tk < topk
+        attn_sum_block = tl.load(attn_sum_base + offs_tk * stride_ask, mask=tk_mask, other=0.0)
+        attn_total += tl.sum(attn_sum_block)
     
-    return main
+    attn_total = tl.where(attn_total < eps, 1.0, attn_total)
+    
+    # =========================================================================
+    # Step 2: 对 index_score 做 Online Softmax 得到 index_prob
+    # =========================================================================
+    is_m_global = NEG_INF
+    is_l_global = 0.0
+    
+    for tk_idx in range(num_topk_blocks):
+        tk_start = tk_idx * BLOCK_TOPK
+        offs_tk = tk_start + tl.arange(0, BLOCK_TOPK)
+        tk_mask = offs_tk < topk
+        
+        indices_block = tl.load(idx_base + offs_tk * stride_ik, mask=tk_mask, other=0).to(tl.int64)
+        causal_mask_block = (indices_block > global_query_pos) | (~tk_mask)
+        
+        is_val = tl.load(is_base + offs_tk * stride_isk, mask=tk_mask, other=NEG_INF)
+        is_val = tl.where(causal_mask_block, NEG_INF, is_val)
+        
+        is_m_block = tl.max(is_val)
+        is_m_new = tl.maximum(is_m_global, is_m_block)
+        is_exp_val = tl.exp(is_val - is_m_new)
+        is_exp_val = tl.where(causal_mask_block, 0.0, is_exp_val)
+        is_l_global = is_l_global * tl.exp(is_m_global - is_m_new) + tl.sum(is_exp_val)
+        is_m_global = is_m_new
+    
+    is_m_global = tl.where(is_m_global == NEG_INF, 0.0, is_m_global)
+    is_l_global = tl.where(is_l_global < 1e-9, 1.0, is_l_global)
+    
+    # =========================================================================
+    # Step 3: 计算梯度 grad_index_score = index_prob - attn_dist
+    # =========================================================================
+    for tk_idx in range(num_topk_blocks):
+        tk_start = tk_idx * BLOCK_TOPK
+        offs_tk = tk_start + tl.arange(0, BLOCK_TOPK)
+        tk_mask = offs_tk < topk
+        
+        indices_block = tl.load(idx_base + offs_tk * stride_ik, mask=tk_mask, other=0).to(tl.int64)
+        causal_mask_block = (indices_block > global_query_pos) | (~tk_mask)
+        
+        # 计算 attn_dist = attn_sum / attn_total
+        attn_sum_block = tl.load(attn_sum_base + offs_tk * stride_ask, mask=tk_mask, other=0.0)
+        attn_dist = attn_sum_block / attn_total
+        
+        # 计算 index_prob = softmax(index_score)
+        is_val = tl.load(is_base + offs_tk * stride_isk, mask=tk_mask, other=NEG_INF)
+        is_val = tl.where(causal_mask_block, NEG_INF, is_val)
+        index_prob = tl.exp(is_val - is_m_global) / is_l_global
+        
+        # 梯度 = index_prob - attn_dist
+        grad = index_prob - attn_dist
+        grad = tl.where(causal_mask_block, 0.0, grad)
+        
+        # 写出梯度
+        dis_ptrs = dis_base + offs_tk * stride_disk
+        tl.store(dis_ptrs, grad, mask=tk_mask)
+
+
+def indexer_loss_bwd_triton(index_score, indices, attn_sum, chunk_offset, eps=1e-10):
+    """
+    反向传播的 Triton kernel 包装函数
+    
+    Args:
+        index_score: [batch, chunk_size, topk] - index 分数
+        indices: [batch, chunk_size, topk] - 索引 (用于 causal mask)
+        attn_sum: [batch, chunk_size, topk] - 前向保存的 attn_sum
+        chunk_offset: chunk 偏移
+        eps: 数值稳定 epsilon
+    
+    Returns:
+        grad_index_score: [batch, chunk_size, topk] - 梯度
+    """
+    batch_size, chunk_size, topk = index_score.shape
+    
+    # 选择合适的 block_topk
+    block_topk = min(BWD_BLOCK_TOPK, topk)
+    if block_topk < 16:
+        block_topk = 16
+    
+    # 输出: index_score 的梯度
+    grad_index_score = torch.zeros_like(index_score, dtype=torch.float32)
+    
+    # 每个 program 处理一个 (batch, query_row)
+    grid = (batch_size * chunk_size,)
+    
+    _indexer_loss_bwd_kernel[grid](
+        index_score, indices, attn_sum,
+        grad_index_score,
+        batch_size, chunk_size, chunk_offset, topk, eps,
+        index_score.stride(0), index_score.stride(1), index_score.stride(2),
+        indices.stride(0), indices.stride(1), indices.stride(2),
+        attn_sum.stride(0), attn_sum.stride(1), attn_sum.stride(2),
+        grad_index_score.stride(0), grad_index_score.stride(1), grad_index_score.stride(2),
+        BLOCK_TOPK=block_topk,
+        num_stages=BWD_NUM_STAGES, num_warps=BWD_NUM_WARPS,
+    )
+    
+    return grad_index_score
 
 
 class IndexerLossFunctionOpt(torch.autograd.Function):
@@ -561,17 +585,11 @@ class IndexerLossFunctionOpt(torch.autograd.Function):
         """
         index_score, indices, attn_sum = ctx.saved_tensors
         chunk_offset = ctx.chunk_offset
-        kv_stride = ctx.kv_stride
         eps = ctx.eps
         batch_size = ctx.batch_size
         
-        batch, chunk_size, topk = index_score.shape
-        
-        # 编译反向 kernel
-        bwd_kernel = indexer_loss_bwd(batch, chunk_size, topk, chunk_offset, kv_stride, eps)
-        
-        # 运行反向 kernel
-        grad_index_score = bwd_kernel(index_score, indices, attn_sum)
+        # 使用 Triton 反向 kernel
+        grad_index_score = indexer_loss_bwd_triton(index_score, indices, attn_sum, chunk_offset, eps)
         
         # 乘以上游梯度并除以 batch_size (对应前向 loss = sum / batch_size)
         grad_index_score = grad_index_score * grad_output / batch_size
@@ -871,16 +889,21 @@ def run_fwd_accuracy_test(config: TestConfig, device: str = 'cuda'):
     # PyTorch 参考: 计算 attn_sum
     ref_attn_sum = ref_indexer_loss_fwd_interface(q, kv, indices, chunk_offset, kv_stride)
     
-    # 比较 attn_sum
-    abs_diff = (ref_attn_sum - tl_attn_sum.to(ref_attn_sum.dtype)).abs().max().item()
-    rel_diff = abs_diff / (ref_attn_sum.abs().max().item() + 1e-10)
-    passed = rel_diff < 1e-2  # 1% 相对误差
+    # 使用 indexer_loss_bwd_kernel.py 的比较标准
+    def calc_diff(a, b):
+        abs_diff = torch.abs(a - b)
+        max_diff = abs_diff.max().item()
+        rel_diff = (abs_diff / (1e-4 + torch.abs(a))).mean().item() * 100
+        return max_diff, rel_diff
+    
+    max_diff, rel_diff = calc_diff(ref_attn_sum, tl_attn_sum.to(ref_attn_sum.dtype))
+    passed = rel_diff < 1e-3  # 相对误差 < 0.001%
     
     return {
         'config': config,
         'ref_max': ref_attn_sum.abs().max().item(),
         'tl_max': tl_attn_sum.abs().max().item(),
-        'abs_diff': abs_diff,
+        'max_diff': max_diff,
         'rel_diff': rel_diff,
         'passed': passed
     }
@@ -901,14 +924,14 @@ def test_fwd_accuracy(configs: List[TestConfig]):
             print(f"跳过测试 {config.name}: {e}")
             continue
     
-    print(f"\n{'Name':<12} {'Config':<60} {'RefMax':<12} {'TLMax':<12} {'RelDiff':<12} {'Pass':<6}")
-    print("-" * 114)
+    print(f"\n{'Name':<12} {'Config':<55} {'MaxDiff':<12} {'RelDiff(%)':<12} {'Pass':<6}")
+    print("-" * 97)
     for r in results:
-        print(f"{r['config'].name:<12} {str(r['config']):<60} "
-              f"{r['ref_max']:<12.6f} {r['tl_max']:<12.6f} {r['rel_diff']:<12.2e} {'✓' if r['passed'] else '✗':<6}")
+        print(f"{r['config'].name:<12} {str(r['config']):<55} "
+              f"{r['max_diff']:<12.2e} {r['rel_diff']:<12.2e} {'✓' if r['passed'] else '✗':<6}")
     
     passed_count = sum(1 for r in results if r['passed'])
-    print("-" * 114)
+    print("-" * 97)
     print(f"前向测试 (attn_sum): {passed_count}/{len(results)} 通过")
     
     return results
@@ -1001,22 +1024,27 @@ def run_bwd_accuracy_test(config: TestConfig, device: str = 'cuda'):
     # PyTorch 参考: 计算梯度
     ref_grad = pytorch_reference_bwd(q, kv, index_score.clone(), indices, chunk_offset, kv_stride)
     
-    # TileLang 版本: 使用自定义 backward
+    # TileLang 版本: 使用自定义 backward (Triton kernel)
     index_score_tl = index_score.clone().requires_grad_(True)
     loss = indexer_loss_opt(q, kv, index_score_tl, indices, chunk_offset, kv_stride)
     loss.backward()
-    tl_grad = index_score_tl.grad
+    tri_grad = index_score_tl.grad
     
-    # 比较梯度
-    abs_diff = (ref_grad - tl_grad).abs().max().item()
-    rel_diff = abs_diff / (ref_grad.abs().max().item() + 1e-10)
-    passed = rel_diff < 1e-2  # 1% 相对误差
+    # 使用 indexer_loss_bwd_kernel.py 的比较标准
+    def calc_diff(a, b):
+        abs_diff = torch.abs(a - b)
+        max_diff = abs_diff.max().item()
+        rel_diff = (abs_diff / (1e-4 + torch.abs(a))).mean().item() * 100
+        return max_diff, rel_diff
+    
+    max_diff, rel_diff = calc_diff(ref_grad, tri_grad)
+    passed = rel_diff < 1e-3  # 相对误差 < 0.001%
     
     return {
         'config': config,
         'ref_grad_max': ref_grad.abs().max().item(),
-        'tl_grad_max': tl_grad.abs().max().item(),
-        'abs_diff': abs_diff,
+        'tri_grad_max': tri_grad.abs().max().item(),
+        'max_diff': max_diff,
         'rel_diff': rel_diff,
         'passed': passed
     }
@@ -1024,9 +1052,9 @@ def run_bwd_accuracy_test(config: TestConfig, device: str = 'cuda'):
 
 def test_bwd_accuracy(configs: List[TestConfig]):
     """批量运行反向精度测试"""
-    print("\n" + "=" * 110)
-    print("反向精度测试 (PyTorch autograd vs TileLang kernel)")
-    print("=" * 110)
+    print("\n" + "=" * 100)
+    print("反向精度测试 (PyTorch autograd vs Triton kernel)")
+    print("=" * 100)
     
     results = []
     for config in configs:
@@ -1037,14 +1065,14 @@ def test_bwd_accuracy(configs: List[TestConfig]):
             print(f"跳过测试 {config.name}: {e}")
             continue
     
-    print(f"\n{'Name':<12} {'Config':<60} {'RefMax':<12} {'TLMax':<12} {'RelDiff':<12} {'Pass':<6}")
-    print("-" * 114)
+    print(f"\n{'Name':<12} {'Config':<55} {'MaxDiff':<12} {'RelDiff(%)':<12} {'Pass':<6}")
+    print("-" * 97)
     for r in results:
-        print(f"{r['config'].name:<12} {str(r['config']):<60} "
-              f"{r['ref_grad_max']:<12.2e} {r['tl_grad_max']:<12.2e} {r['rel_diff']:<12.2e} {'✓' if r['passed'] else '✗':<6}")
+        print(f"{r['config'].name:<12} {str(r['config']):<55} "
+              f"{r['max_diff']:<12.2e} {r['rel_diff']:<12.2e} {'✓' if r['passed'] else '✗':<6}")
     
     passed_count = sum(1 for r in results if r['passed'])
-    print("-" * 114)
+    print("-" * 97)
     print(f"反向测试: {passed_count}/{len(results)} 通过")
     
     return results
