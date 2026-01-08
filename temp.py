@@ -40,6 +40,20 @@ def indexer_loss_fwd(
     num_stages=0,
     threads=256,
 ):
+    """
+    IndexerLoss Forward Kernel with Pipeline Optimization
+    
+    Compute sparse attention m, l, and qk matrix multiplication results for attn_sum calculation.
+    
+    Thread Groups (Simplified Design):
+    - Thread Group 1 (tx < 128): Compute m, l and qk matmul for all heads
+    - Thread Group 3 (tx >= 128): Producer, responsible for loading K to shared memory with double buffering
+    
+    Outputs:
+    - M_out: [batch, seq_len, heads] - max value for each head
+    - L_out: [batch, seq_len, heads] - sum of exp values for each head
+    - QK_out: [batch, seq_len, heads, topk] - QK results scaled by sm_scale
+    """
     assert dim == tilelang.math.next_power_of_2(dim), f"haven't check padding correctness yet, dim={dim}"
     assert tail_dim == tilelang.math.next_power_of_2(tail_dim), f"haven't check padding correctness yet, dim={tail_dim}"
     assert is_causal == True, "non-casual is not supported"
@@ -92,10 +106,12 @@ def indexer_loss_fwd(
         QK_out: T.Tensor(qk_out_shape, accum_dtype),  # type: ignore
     ):
         with T.Kernel((seq_len - k_stride + 1 if CP0 else seq_len) * REPLICATE_H, batch, k_group, threads=threads) as (bx, by, bz):
+            # Q shared memory - shared by all threads
             Q_shared_l = T.alloc_shared([H_per_block, D // 2], dtype)
             Q_shared_r = T.alloc_shared([H_per_block, D // 2], dtype)
             Q_tail_shared = T.alloc_shared([H_per_block, D_tail], dtype)
             
+            # K shared memory - double buffer
             K_shared_0_l = T.alloc_shared([BI, D // 2], dtype)
             K_shared_0_r = T.alloc_shared([BI, D // 2], dtype)
             K_shared_1_l = T.alloc_shared([BI, D // 2], dtype)
@@ -103,9 +119,11 @@ def indexer_loss_fwd(
             K_tail_shared_0 = T.alloc_shared([BI, D_tail], dtype)
             K_tail_shared_1 = T.alloc_shared([BI, D_tail], dtype)
             
+            # K validity mask - double buffer
             is_k_valid_0 = T.alloc_shared([BI], "bool", scope="shared")
             is_k_valid_1 = T.alloc_shared([BI], "bool", scope="shared")
 
+            # Local variables for thread group 1 - process all heads
             acc_s = T.alloc_fragment([H_per_block, BI], accum_dtype)
             sumexp = T.alloc_fragment([H_per_block], accum_dtype)
             sumexp_i = T.alloc_fragment([H_per_block], accum_dtype)
@@ -114,7 +132,9 @@ def indexer_loss_fwd(
 
             indices_local = T.alloc_local([1], indices_dtype)
 
+            # Barriers - simplified
             bar_q = T.alloc_barrier(arrive_count=256)
+            # K buffer synchronization
             bar_k_0_ready = T.alloc_barrier(arrive_count=128)
             bar_k_1_ready = T.alloc_barrier(arrive_count=128)
             bar_k_0_free = T.alloc_barrier(arrive_count=128)
@@ -130,28 +150,35 @@ def indexer_loss_fwd(
 
             tx = T.get_thread_binding()
 
+            # Load Q to shared memory
             T.copy(Q[b_i, s_i, H0:H1, 0 : D // 2], Q_shared_l)
             T.copy(Q[b_i, s_i, H0:H1, D // 2 : D], Q_shared_r)
             T.copy(Q[b_i, s_i, H0:H1, D:], Q_tail_shared)
             T.barrier_arrive(bar_q)
 
             if tx < 128:
+                # ================================================================
+                # Thread Group 1: Compute m, l and qk matmul for all heads
+                # ================================================================
                 T.set_max_nreg(240, 1)
                 T.fill(sumexp, 0)
                 T.fill(m_i, -(2**30))
                 T.barrier_wait(bar_q, 0)
 
                 for i_i in T.serial(T.ceildiv(NI, 2)):
+                    # Buffer 0
                     T.barrier_wait(bar_k_0_ready[0], (i_i & 1))
 
                     for h_i, bi_i in T.Parallel(H_per_block, BI):
                         acc_s[h_i, bi_i] = T.if_then_else(is_k_valid_0[bi_i], 0, -T.infinity(acc_s.dtype))
+                    # QK matmul - process all heads
                     T.gemm(Q_shared_l, K_shared_0_l, acc_s, transpose_B=True, wg_wait=-1)
                     T.gemm(Q_shared_r, K_shared_0_r, acc_s, transpose_B=True, wg_wait=-1)
                     T.gemm(Q_tail_shared, K_tail_shared_0, acc_s, transpose_B=True, wg_wait=-1)
 
                     T.wait_wgmma(0)
 
+                    # Write qk * sm_scale results
                     tk_start_0 = (i_i * 2) * BI
                     for h_i, bi_i in T.Parallel(H_per_block, BI):
                         QK_out[b_i, s_i, H0 + h_i, tk_start_0 + bi_i] = acc_s[h_i, bi_i] * sm_scale
@@ -182,6 +209,7 @@ def indexer_loss_fwd(
 
                     T.wait_wgmma(0)
 
+                    # Write qk * sm_scale results
                     tk_start_1 = (i_i * 2 + 1) * BI
                     for h_i, bi_i in T.Parallel(H_per_block, BI):
                         QK_out[b_i, s_i, H0 + h_i, tk_start_1 + bi_i] = acc_s[h_i, bi_i] * sm_scale
@@ -200,13 +228,18 @@ def indexer_loss_fwd(
 
                     T.barrier_arrive(bar_k_1_free[0])
 
+                # Write final m and l
                 for h_i in T.Parallel(H_per_block):
                     M_out[b_i, s_i, H0 + h_i] = m_i[h_i]
                     L_out[b_i, s_i, H0 + h_i] = sumexp[h_i]
 
             elif tx >= 128:
+                # ================================================================
+                # Thread Group 3: Producer - Load K to shared memory
+                # ================================================================
                 T.set_max_nreg(80, 0)
                 
+                # Load K for thread group 1
                 for i_i in T.serial(T.ceildiv(NI, 2)):
                     # Buffer 0
                     T.barrier_wait(bar_k_0_free[0], ((i_i & 1) ^ 1))
@@ -267,6 +300,16 @@ def attn_sum_fwd(
 ):
     """
     Attention Sum Forward Kernel
+    
+    Compute softmax probabilities and sum along head dimension.
+    
+    Inputs:
+    - QK_out: [batch, seq_len, heads, topk] - QK results scaled by sm_scale
+    - M_out: [batch, seq_len, heads] - max value for each head
+    - L_out: [batch, seq_len, heads] - sum of exp2 values for each head
+    
+    Outputs:
+    - AttnSum: [batch, seq_len, topk] - attention probabilities summed over head dimension
     """
     accum_dtype = T.float32
     
@@ -285,21 +328,29 @@ def attn_sum_fwd(
         AttnSum: T.Tensor(attn_sum_shape, accum_dtype),  # type: ignore
     ):
         with T.Kernel(seq_len, batch, threads=threads) as (bx, by):
+            # Allocate local memory
             qk_local = T.alloc_fragment([heads, block_T], accum_dtype)
             m_local = T.alloc_fragment([heads], accum_dtype)
             l_local = T.alloc_fragment([heads], accum_dtype)
             attn_sum_local = T.alloc_fragment([block_T], accum_dtype)
             
+            # Load M and L (only once per seq position)
             T.copy(M_out[by, bx, 0:heads], m_local)
             T.copy(L_out[by, bx, 0:heads], l_local)
             
+            # Process topk in blocks
             for t_i in T.serial(NT):
+                # Load QK block
                 T.copy(QK_out[by, bx, 0:heads, t_i * block_T : (t_i + 1) * block_T], qk_local)
                 
+                # Compute attn_prob = exp2(qk - m * sm_scale) / l
                 for h_i, t_j in T.Parallel(heads, block_T):
                     qk_local[h_i, t_j] = T.exp2(qk_local[h_i, t_j] - m_local[h_i] * sm_scale_log2e) / l_local[h_i]
                 
+                # Sum along head dimension
                 T.reduce_sum(qk_local, attn_sum_local, dim=0)
+                
+                # Write output
                 T.copy(attn_sum_local, AttnSum[by, bx, t_i * block_T : (t_i + 1) * block_T])
     
     return main
@@ -315,14 +366,14 @@ def calc_attn_dist(
         q: [batch, seq_len, heads, dim + tail_dim]
         k: [batch, seq_len_k, k_group, dim + tail_dim]
         indices: [batch, seq_len, k_group, topk]
-        chunk_offset: the starting position of the current chunk within the full sequence (used for causal mask)
+        chunk_offset: starting position of current chunk in full sequence (for causal mask)
         sm_scale: attention scaling factor
         k_stride: K stride
         is_casual: whether to use causal mask
         eps: epsilon for numerical stability
     
     Returns:
-        attn_dist: [batch, seq_len, topk] - 归一化的 attention 分布
+        attn_dist: [batch, seq_len, topk] - normalized attention distribution
     """
     assert q.is_contiguous() and k.is_contiguous() and indices.is_contiguous()
     batch, seq_len, heads, dim_plus_tail_dim = q.shape
@@ -348,7 +399,7 @@ def calc_attn_dist(
     attn_sum_kernel = attn_sum_fwd(batch, seq_len, heads, topk, sm_scale_log2e)
     attn_sum = attn_sum_kernel(qk_out, m_out, l_out)
 
-    # 归一化得到 attn_dist
+    # Normalize to get attn_dist
     attn_total = attn_sum.sum(dim=-1, keepdim=True) + eps
     attn_dist = attn_sum / attn_total
 
@@ -356,18 +407,18 @@ def calc_attn_dist(
 
 
 # ============================================================================
-# 测试配置
+# Test Configuration
 # ============================================================================
 
 @dataclass
 class TestConfig:
-    """测试配置"""
+    """Test Configuration"""
     name: str
     batch_size: int = 1
     num_heads: int = 128
     chunk_size: int = 256
     seq_len: int = 256
-    head_dim: int = 576  # tilelang 版本固定为 576
+    head_dim: int = 576  # tilelang version fixed at 576
     topk: int = 128
     seed: int = 42
     
@@ -378,27 +429,27 @@ class TestConfig:
 
 
 # ============================================================================
-# PyTorch 参考实现
+# PyTorch Reference Implementation
 # ============================================================================
 
 def ref_calc_attn_dist(q, k, indices, chunk_offset=0, k_stride=1, sm_scale=None, is_casual=True, eps=1e-10):
     """
     PyTorch Reference Implementation for calc_attn_dist
     
-    计算 sparse attention 的归一化分布 attn_dist。
+    Compute normalized sparse attention distribution attn_dist.
     
     Args:
         q: [batch, seq_len, heads, dim + tail_dim]
         k: [batch, seq_len_k, k_group, dim + tail_dim]
         indices: [batch, seq_len, k_group, topk]
-        chunk_offset: 当前 chunk 在完整序列中的起始位置 (用于 causal mask)
+        chunk_offset: starting position of current chunk in full sequence (for causal mask)
         k_stride: K stride
         sm_scale: attention scaling factor
         is_casual: whether to use causal mask
         eps: epsilon for numerical stability
     
     Returns:
-        attn_dist: [batch, seq_len, topk] - 归一化的 attention 分布
+        attn_dist: [batch, seq_len, topk] - normalized attention distribution
     """
     q = q.float()
     k = k.float()
@@ -438,12 +489,10 @@ def ref_calc_attn_dist(q, k, indices, chunk_offset=0, k_stride=1, sm_scale=None,
     p_sum = p.sum(dim=(1, 2))  # [b, sq, sk]
     
     # Gather to get attn_sum for topk indices
-    # indices_transposed: [batch, k_group, seq_len, topk]
-    # 需要将 p_sum 按 indices gather
-    indices_for_gather = indices_transposed[:, 0, :, :]  # [batch, seq_len, topk] (假设 k_group=1)
+    indices_for_gather = indices_transposed[:, 0, :, :]  # [batch, seq_len, topk] (assume k_group=1)
     attn_sum = torch.gather(p_sum, dim=-1, index=indices_for_gather.long())  # [batch, seq_len, topk]
     
-    # 归一化得到 attn_dist
+    # Normalize to get attn_dist
     attn_total = attn_sum.sum(dim=-1, keepdim=True) + eps
     attn_dist = attn_sum / attn_total
     
@@ -451,17 +500,19 @@ def ref_calc_attn_dist(q, k, indices, chunk_offset=0, k_stride=1, sm_scale=None,
 
 
 # ============================================================================
-# 前向精度测试
+# Forward Accuracy Test
 # ============================================================================
 
 def run_fwd_accuracy_test(config: TestConfig, device: str = 'cuda'):
-    """运行单个前向精度测试 - 比较 attn_dist"""
+    """
+    Run single forward accuracy test - compare attn_dist
+    """
     torch.manual_seed(config.seed)
     
-    # tilelang 版本使用固定的 dim=576
+    # tilelang version uses fixed dim=576
     head_dim = 576
     
-    # 生成随机输入
+    # Generate random inputs
     q = torch.randn(config.batch_size, config.chunk_size, config.num_heads, head_dim, 
                     device=device, dtype=torch.bfloat16) / 10
     k = torch.randn(config.batch_size, config.seq_len, 1, head_dim, 
@@ -470,11 +521,11 @@ def run_fwd_accuracy_test(config: TestConfig, device: str = 'cuda'):
     q.clamp_(-10, 10)
     k.clamp_(-10, 10)
     
-    # 计算 chunk_offset
+    # Compute chunk_offset
     chunk_offset = config.seq_len - config.chunk_size
     k_stride = 1
     
-    # 生成 indices
+    # Generate indices
     indices = torch.full((config.batch_size, config.chunk_size, 1, config.topk), 
                          config.seq_len, dtype=torch.int32, device=device)
     for b in range(config.batch_size):
@@ -483,13 +534,13 @@ def run_fwd_accuracy_test(config: TestConfig, device: str = 'cuda'):
             i_i = torch.randperm(max_valid_idx, device=device)[:config.topk]
             indices[b, t, 0, : len(i_i)] = i_i.to(torch.int32)
     
-    # TileLang kernel: 计算 attn_dist
+    # TileLang kernel: compute attn_dist
     tl_attn_dist = calc_attn_dist(q, k, indices, chunk_offset, k_stride=k_stride)
     
-    # PyTorch 参考: 计算 attn_dist
+    # PyTorch reference: compute attn_dist
     ref_attn_dist = ref_calc_attn_dist(q, k, indices, chunk_offset, k_stride=k_stride)
     
-    # 比较结果
+    # Compare results
     def calc_diff(a, b):
         abs_diff = torch.abs(a - b)
         max_diff = abs_diff.max().item()
@@ -497,7 +548,7 @@ def run_fwd_accuracy_test(config: TestConfig, device: str = 'cuda'):
         return max_diff, rel_diff
     
     max_diff, rel_diff = calc_diff(ref_attn_dist, tl_attn_dist.to(ref_attn_dist.dtype))
-    passed = rel_diff < 1e-3  # 相对误差 < 0.001%
+    passed = rel_diff < 1e-3  # relative error < 0.001%
     
     return {
         'config': config,
@@ -510,9 +561,11 @@ def run_fwd_accuracy_test(config: TestConfig, device: str = 'cuda'):
 
 
 def test_fwd_accuracy(configs: List[TestConfig]):
-    """批量运行前向精度测试 - 比较 attn_dist"""
+    """
+    Batch run forward accuracy tests - compare attn_dist
+    """
     print("\n" + "=" * 110)
-    print("前向精度测试 (PyTorch attn_dist vs TileLang attn_dist)")
+    print("Forward Accuracy Test (PyTorch attn_dist vs TileLang attn_dist)")
     print("=" * 110)
     
     results = []
@@ -521,7 +574,7 @@ def test_fwd_accuracy(configs: List[TestConfig]):
             result = run_fwd_accuracy_test(config)
             results.append(result)
         except Exception as e:
-            print(f"跳过测试 {config.name}: {e}")
+            print(f"Skip test {config.name}: {e}")
             continue
     
     print(f"\n{'Name':<12} {'Config':<55} {'MaxDiff':<12} {'RelDiff(%)':<12} {'Pass':<6}")
@@ -532,13 +585,13 @@ def test_fwd_accuracy(configs: List[TestConfig]):
     
     passed_count = sum(1 for r in results if r['passed'])
     print("-" * 97)
-    print(f"前向测试 (attn_dist): {passed_count}/{len(results)} 通过")
+    print(f"Forward Test (attn_dist): {passed_count}/{len(results)} passed")
     
     return results
 
 
 # ============================================================================
-# 前向性能测试
+# Forward Performance Test
 # ============================================================================
 
 def test_fwd_performance(
@@ -552,16 +605,18 @@ def test_fwd_performance(
     num_warmup: int = 5,
     num_benchmark: int = 20,
 ):
-    """前向性能测试"""
+    """
+    Forward performance test
+    """
     import time
     
     torch.manual_seed(seed)
     device = 'cuda'
     
     print("\n" + "=" * 80)
-    print("前向性能测试 (TileLang calc_attn_dist)")
+    print("Forward Performance Test (TileLang calc_attn_dist)")
     print("=" * 80)
-    print(f"参数: batch={batch_size}, heads={num_heads}, chunk={chunk_size}, seq={seq_len}, dim={head_dim}, topk={topk}")
+    print(f"Parameters: batch={batch_size}, heads={num_heads}, chunk={chunk_size}, seq={seq_len}, dim={head_dim}, topk={topk}")
     print("=" * 80)
     
     q = torch.randn(batch_size, chunk_size, num_heads, head_dim, device=device, dtype=torch.bfloat16) / 10
@@ -572,7 +627,7 @@ def test_fwd_performance(
     chunk_offset = seq_len - chunk_size
     k_stride = 1
     
-    # 生成 indices
+    # Generate indices
     indices = torch.full((batch_size, chunk_size, 1, topk), seq_len, dtype=torch.int32, device=device)
     for b in range(batch_size):
         for t in range(chunk_size):
@@ -583,7 +638,7 @@ def test_fwd_performance(
     torch.cuda.synchronize()
     base_memory = torch.cuda.memory_allocated() / (1024**3)
     
-    # 仅前向测试
+    # Forward only test
     torch.cuda.reset_peak_memory_stats()
     for _ in range(num_warmup):
         _ = calc_attn_dist(q, k, indices, chunk_offset, k_stride=k_stride)
@@ -597,23 +652,137 @@ def test_fwd_performance(
     fwd_time = (time.time() - start) / num_benchmark * 1000
     fwd_peak = torch.cuda.max_memory_allocated() / (1024**3)
     
-    print(f"\n>>> 性能 (warmup={num_warmup}, iters={num_benchmark})")
-    print(f"  前向时间:   {fwd_time:.3f} ms")
+    print(f"\n>>> Performance (warmup={num_warmup}, iters={num_benchmark})")
+    print(f"  Forward time:   {fwd_time:.3f} ms")
     
-    print(f"\n>>> 显存峰值")
-    print(f"  基准显存:   {base_memory:.2f} GB")
-    print(f"  前向峰值:   {fwd_peak:.2f} GB (增量: {fwd_peak - base_memory:.2f} GB)")
+    print(f"\n>>> Memory Peak")
+    print(f"  Base memory:    {base_memory:.2f} GB")
+    print(f"  Forward peak:   {fwd_peak:.2f} GB (increment: {fwd_peak - base_memory:.2f} GB)")
     
-    # 计算 TFLOPS
+    # Compute TFLOPS
     flops_fwd = batch_size * chunk_size * head_dim * topk * 2 * num_heads
-    print(f"\n>>> 计算吞吐量")
-    print(f"  前向 TFLOPS: {flops_fwd / (fwd_time * 1e-3) / 1e12:.2f}")
+    print(f"\n>>> Compute Throughput")
+    print(f"  Forward TFLOPS: {flops_fwd / (fwd_time * 1e-3) / 1e12:.2f}")
     
     # IO bandwidth
     io_bytes = batch_size * chunk_size * head_dim * topk * 2  # bf16
-    print(f"  IO 带宽: {io_bytes / (fwd_time * 1e-3) / 1e12:.2f} TB/s")
+    print(f"  IO Bandwidth: {io_bytes / (fwd_time * 1e-3) / 1e12:.2f} TB/s")
     
     return {
         'fwd_time': fwd_time,
         'fwd_peak': fwd_peak,
     }
+
+
+# ============================================================================
+# Main Function
+# ============================================================================
+
+def main():
+    """
+    Main function for running accuracy and performance tests
+    """
+    parser = argparse.ArgumentParser(description='TileLang IndexerLoss Forward Kernel Tests')
+    parser.add_argument('--test_accuracy', action='store_true', help='Run forward accuracy tests')
+    parser.add_argument('--test_performance', action='store_true', help='Run forward performance tests')
+    parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
+    parser.add_argument('--num_heads', type=int, default=128, help='Number of attention heads')
+    parser.add_argument('--chunk_size', type=int, default=1024, help='Chunk size')
+    parser.add_argument('--seq_len', type=int, default=2048, help='Sequence length')
+    parser.add_argument('--head_dim', type=int, default=576, help='Head dimension')
+    parser.add_argument('--topk', type=int, default=512, help='Top-k value')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed')
+    parser.add_argument('--warmup', type=int, default=3, help='Number of warmup iterations')
+    parser.add_argument('--iters', type=int, default=10, help='Number of benchmark iterations')
+    
+    args = parser.parse_args()
+    
+    # Default test configurations (tilelang version uses fixed dim=576, topk must be multiple of 64)
+    accuracy_configs = [
+        TestConfig(name="Small", batch_size=1, num_heads=16, chunk_size=256, seq_len=512, head_dim=576, topk=128),
+        TestConfig(name="Medium", batch_size=1, num_heads=64, chunk_size=512, seq_len=1024, head_dim=576, topk=256),
+        TestConfig(name="Large", batch_size=1, num_heads=128, chunk_size=1024, seq_len=2048, head_dim=576, topk=512),
+        TestConfig(name="MultiBatch", batch_size=2, num_heads=128, chunk_size=2048, seq_len=4096, head_dim=576, topk=2048),
+        TestConfig(name="LargeTopK", batch_size=1, num_heads=128, chunk_size=512, seq_len=2048, head_dim=576, topk=1024),
+        TestConfig(name="Production", batch_size=1, num_heads=128, chunk_size=8192, seq_len=131072, head_dim=576, topk=2048),
+    ]
+    
+    # Performance test configurations for different scales
+    performance_configs = [
+        {"name": "Production", "batch_size": 1, "num_heads": 128, "chunk_size": 8192, "seq_len": 131072, "head_dim": 576, "topk": 2048},
+    ]
+    
+    if args.test_accuracy:
+        # Run forward accuracy tests
+        test_fwd_accuracy(accuracy_configs)
+        
+    elif args.test_performance:
+        # Run forward performance tests
+        print("\n" + "=" * 100)
+        print("Forward Performance Tests at Different Scales")
+        print("=" * 100)
+        
+        all_results = []
+        for config_dict in performance_configs:
+            try:
+                result = test_fwd_performance(
+                    batch_size=config_dict['batch_size'],
+                    num_heads=config_dict['num_heads'],
+                    chunk_size=config_dict['chunk_size'],
+                    seq_len=config_dict['seq_len'],
+                    head_dim=config_dict['head_dim'],
+                    topk=config_dict['topk'],
+                    seed=args.seed,
+                    num_warmup=args.warmup,
+                    num_benchmark=args.iters,
+                )
+                result['name'] = config_dict['name']
+                all_results.append(result)
+            except Exception as e:
+                print(f"Skip performance test {config_dict['name']}: {e}")
+                continue
+        
+        # Print summary
+        print("\n" + "=" * 100)
+        print("Performance Test Summary")
+        print("=" * 100)
+        print(f"\n{'Name':<15} {'Config':<55} {'Time(ms)':<12} {'Peak(GB)':<12}")
+        print("-" * 94)
+        for r in all_results:
+            config_str = (f"batch={r.get('batch_size', 1) if 'batch_size' in r else config_dict['batch_size']}, "
+                         f"heads={r.get('num_heads', 128) if 'num_heads' in r else config_dict['num_heads']}, "
+                         f"chunk={r.get('chunk_size', 1024) if 'chunk_size' in r else config_dict['chunk_size']}, "
+                         f"seq={r.get('seq_len', 2048) if 'seq_len' in r else config_dict['seq_len']}, "
+                         f"dim={r.get('head_dim', 576) if 'head_dim' in r else config_dict['head_dim']}, "
+                         f"topk={r.get('topk', 512) if 'topk' in r else config_dict['topk']}")
+            print(f"{r['name']:<15} {config_str:<55} {r['fwd_time']:<12.3f} {r['fwd_peak']:<12.2f}")
+        
+        print("-" * 94)
+        print(f"Total tests: {len(all_results)}")
+        
+    else:
+        # Default: Run both accuracy and performance tests
+        print("=" * 80)
+        print("Running Default Tests (Accuracy + Performance)")
+        print("=" * 80)
+        
+        # Accuracy tests
+        test_fwd_accuracy(accuracy_configs)
+        
+        # Performance tests
+        print("\n")
+        test_fwd_performance(
+            batch_size=args.batch_size,
+            num_heads=args.num_heads,
+            chunk_size=args.chunk_size,
+            seq_len=args.seq_len,
+            head_dim=args.head_dim,
+            topk=args.topk,
+            seed=args.seed,
+            num_warmup=args.warmup,
+            num_benchmark=args.iters,
+        )
+
+
+if __name__ == "__main__":
+    main()
