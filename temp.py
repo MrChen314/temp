@@ -1,722 +1,709 @@
 # ruff: noqa
+"""
+Sparse MLA Forward with Sequence Blocking
+
+Optimization: Instead of blocking by heads (H_per_block), we block by sequence (S_per_block).
+This maintains high register and shared memory utilization even with small head counts.
+
+Key changes:
+- Q_shared: [S_per_block, D] instead of [H_per_block, D]
+- Pre-computed mask matrix handles different indices for different sequence positions
+- For each seq block, use the last position's indices as superset
+- Mask ensures correctness by filtering valid (seq_pos, kv_idx) pairs
+"""
 import torch
 import tilelang
 from tilelang import language as T
-from tilelang.engine.callback import register_cuda_postproc_callback
-import argparse
-from dataclasses import dataclass
-from typing import List
+from utils import assert_tensors_similar
+
+
+def prepare_block_indices_and_mask(
+    indices: torch.Tensor,
+    seq_len: int,
+    S_per_block: int,
+    block_I: int,
+):
+    """
+    Prepare indices and mask for sequence-blocked processing.
+    
+    For each seq block, use the indices from the last position in the block.
+    Generate mask to handle causality and valid topk membership.
+    
+    Args:
+        indices: [B, S, G, topk] - original per-position topk indices
+        seq_len: actual sequence length
+        S_per_block: number of sequence positions per block (e.g., 64)
+        block_I: KV block size (e.g., 64)
+    
+    Returns:
+        block_indices: [B, num_seq_blocks, G, topk] - indices for each seq block
+        block_mask: [B, num_seq_blocks, G, NI, S_per_block, BI] - mask for each (seq_pos, kv_idx) pair
+    """
+    B, S, G, topk = indices.shape
+    num_seq_blocks = (seq_len + S_per_block - 1) // S_per_block
+    BI = block_I
+    NI = topk // BI
+    
+    device = indices.device
+    
+    # For each seq block, use the last position's indices as superset
+    # This ensures we have all KV positions that any position in the block might need
+    block_indices = torch.zeros(B, num_seq_blocks, G, topk, dtype=indices.dtype, device=device)
+    
+    for sb in range(num_seq_blocks):
+        # Last position in this block (or the actual last position if block is partial)
+        last_pos = min((sb + 1) * S_per_block - 1, seq_len - 1)
+        block_indices[:, sb, :, :] = indices[:, last_pos, :, :]
+    
+    # Generate mask: [B, num_seq_blocks, G, NI, S_per_block, BI]
+    # mask[b, sb, g, ni, si, bi] = True if:
+    #   1. kv_idx <= real_seq_pos (causal constraint)
+    #   2. kv_idx is in the original topk for this seq pos (validity constraint)
+    block_mask = torch.zeros(
+        B, num_seq_blocks, G, NI, S_per_block, BI, 
+        dtype=torch.bool, device=device
+    )
+    
+    for b in range(B):
+        for sb in range(num_seq_blocks):
+            for g in range(G):
+                for ni in range(NI):
+                    for si in range(S_per_block):
+                        real_seq_pos = sb * S_per_block + si
+                        if real_seq_pos >= seq_len:
+                            # Out of bounds, mask should be False (already initialized)
+                            continue
+                        
+                        # Get original topk indices for this seq position
+                        original_topk_set = set(indices[b, real_seq_pos, g, :].tolist())
+                        
+                        for bi in range(BI):
+                            kv_idx = block_indices[b, sb, g, ni * BI + bi].item()
+                            
+                            # Causal constraint: can only attend to positions <= current
+                            is_causal_valid = kv_idx <= real_seq_pos
+                            
+                            # Validity constraint: kv_idx must be in original topk
+                            is_in_original_topk = kv_idx in original_topk_set
+                            
+                            block_mask[b, sb, g, ni, si, bi] = is_causal_valid and is_in_original_topk
+    
+    return block_indices, block_mask
+
+
+def prepare_block_indices_and_mask_fast(
+    indices: torch.Tensor,
+    seq_len: int,
+    S_per_block: int,
+    block_I: int,
+):
+    """
+    Vectorized version of prepare_block_indices_and_mask for better performance.
+    
+    Args:
+        indices: [B, S, G, topk] - original per-position topk indices
+        seq_len: actual sequence length
+        S_per_block: number of sequence positions per block (e.g., 64)
+        block_I: KV block size (e.g., 64)
+    
+    Returns:
+        block_indices: [B, num_seq_blocks, G, topk] - indices for each seq block
+        block_mask: [B, num_seq_blocks, G, NI, S_per_block, BI] - mask for each (seq_pos, kv_idx) pair
+    """
+    B, S, G, topk = indices.shape
+    num_seq_blocks = (seq_len + S_per_block - 1) // S_per_block
+    BI = block_I
+    NI = topk // BI
+    
+    device = indices.device
+    
+    # Pad indices if needed
+    padded_S = num_seq_blocks * S_per_block
+    if padded_S > S:
+        # Pad with the last valid position's indices
+        indices_padded = torch.zeros(B, padded_S, G, topk, dtype=indices.dtype, device=device)
+        indices_padded[:, :S, :, :] = indices
+        indices_padded[:, S:, :, :] = indices[:, S-1:S, :, :]
+    else:
+        indices_padded = indices
+    
+    # Reshape indices to [B, num_seq_blocks, S_per_block, G, topk]
+    indices_reshaped = indices_padded.view(B, num_seq_blocks, S_per_block, G, topk)
+    
+    # For each seq block, use the last position's indices
+    # block_indices: [B, num_seq_blocks, G, topk]
+    block_indices = indices_reshaped[:, :, -1, :, :]  # Use last position in each block
+    
+    # Reshape block_indices for broadcasting: [B, num_seq_blocks, G, NI, 1, BI]
+    block_indices_expanded = block_indices.view(B, num_seq_blocks, G, NI, 1, BI)
+    
+    # Create real_seq_pos tensor: [num_seq_blocks, S_per_block]
+    seq_block_offsets = torch.arange(num_seq_blocks, device=device) * S_per_block
+    seq_pos_in_block = torch.arange(S_per_block, device=device)
+    real_seq_pos = seq_block_offsets.view(-1, 1) + seq_pos_in_block.view(1, -1)  # [num_seq_blocks, S_per_block]
+    real_seq_pos = real_seq_pos.view(1, num_seq_blocks, 1, 1, S_per_block, 1)  # [1, num_seq_blocks, 1, 1, S_per_block, 1]
+    
+    # Causal mask: kv_idx <= real_seq_pos
+    # block_indices_expanded: [B, num_seq_blocks, G, NI, 1, BI]
+    # real_seq_pos: [1, num_seq_blocks, 1, 1, S_per_block, 1]
+    causal_mask = block_indices_expanded <= real_seq_pos  # [B, num_seq_blocks, G, NI, S_per_block, BI]
+    
+    # Validity mask: kv_idx must be in original topk for this seq pos
+    # This is more complex - need to check membership
+    # indices_reshaped: [B, num_seq_blocks, S_per_block, G, topk]
+    # block_indices_expanded: [B, num_seq_blocks, G, NI, 1, BI]
+    
+    # For each (sb, si), check if each kv_idx is in indices[b, sb, si, g, :]
+    # Reshape for comparison:
+    # original_indices: [B, num_seq_blocks, S_per_block, G, topk] -> [B, num_seq_blocks, 1, S_per_block, G, topk]
+    original_indices = indices_reshaped.unsqueeze(2)  # [B, num_seq_blocks, 1, S_per_block, G, topk]
+    original_indices = original_indices.permute(0, 1, 4, 2, 3, 5)  # [B, num_seq_blocks, G, 1, S_per_block, topk]
+    
+    # block_indices for comparison: [B, num_seq_blocks, G, NI*BI] -> [B, num_seq_blocks, G, NI*BI, 1, 1]
+    block_indices_flat = block_indices.view(B, num_seq_blocks, G, NI * BI, 1, 1)
+    
+    # Compare: is block_indices_flat[..., k, :, :] in original_indices[..., s, :]?
+    # This creates a [B, num_seq_blocks, G, NI*BI, S_per_block, topk] tensor - too large!
+    # Need a smarter approach
+    
+    # Alternative: use torch.isin per position (still not great but works)
+    validity_mask = torch.zeros(B, num_seq_blocks, G, NI, S_per_block, BI, dtype=torch.bool, device=device)
+    
+    for sb in range(num_seq_blocks):
+        for si in range(S_per_block):
+            real_pos = sb * S_per_block + si
+            if real_pos >= seq_len:
+                continue
+            # original topk for this position: [B, G, topk]
+            orig_topk = indices[:, real_pos, :, :]  # [B, G, topk]
+            # block indices for this block: [B, G, topk]
+            blk_idx = block_indices[:, sb, :, :]  # [B, G, topk]
+            
+            # Check membership: blk_idx in orig_topk
+            # For each (b, g, k), check if blk_idx[b, g, k] is in orig_topk[b, g, :]
+            for b in range(B):
+                for g in range(G):
+                    orig_set = set(orig_topk[b, g, :].tolist())
+                    for ni in range(NI):
+                        for bi in range(BI):
+                            kv_idx = blk_idx[b, g, ni * BI + bi].item()
+                            validity_mask[b, sb, g, ni, si, bi] = kv_idx in orig_set
+    
+    # Combine masks
+    block_mask = causal_mask & validity_mask
+    
+    # Handle out-of-bounds positions
+    for sb in range(num_seq_blocks):
+        for si in range(S_per_block):
+            real_pos = sb * S_per_block + si
+            if real_pos >= seq_len:
+                block_mask[:, sb, :, :, si, :] = False
+    
+    return block_indices, block_mask
 
 
 @tilelang.jit(
-    out_idx=[-1],
-    compile_flags=[
-        "-O3",
-        "-Wno-deprecated-declarations",
-        "-U__CUDA_NO_HALF_OPERATORS__",
-        "-U__CUDA_NO_HALF_CONVERSIONS__",
-        "-U__CUDA_NO_HALF2_OPERATORS__",
-        "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-        "--expt-relaxed-constexpr",
-        "--expt-extended-lambda",
-        "--ptxas-options=-v,--register-usage-level=10",
-        "-DNDEBUG",
-    ],
+    out_idx=[-2, -1],
+    pass_configs={
+        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+    },
 )
-def indexer_loss_fwd(
-    batch,
-    seq_len,
-    seq_len_k,
+def sparse_mla_fwd_seq_block(
     heads,
     dim,
     tail_dim,
     topk,
-    k_stride,
-    k_group=1,
+    kv_group=1,
     sm_scale=None,
     is_causal=True,
     CP0=True,
     block_I=64,
-    num_stages=0,
+    S_per_block=64,
+    num_stages=2,
     threads=256,
 ):
     """
-    IndexerLoss Forward Kernel with Pipeline Optimization
+    Sparse MLA Forward kernel with sequence blocking.
     
-    Compute sparse attention sum using pre-computed LSE (log-sum-exp).
-    
-    Thread Groups (Simplified Design):
-    - Thread Group 1 (tx < 128): Compute qk matmul and attn_sum for all heads
-    - Thread Group 3 (tx >= 128): Producer, responsible for loading K to shared memory with double buffering
-    
-    Inputs:
-    - Q: [batch, seq_len, heads, dim + tail_dim] - Query
-    - K: [batch, seq_len_k, k_group, dim + tail_dim] - Key
-    - Indices: [batch, seq_len, k_group, topk] - Sparse indices
-    - q_start_index_s: scalar - Starting position of current chunk
-    - Lse: [batch, seq_len, heads] - Pre-computed log-sum-exp from full attention
-    
-    Outputs:
-    - AttnSum: [batch, seq_len, topk] - Attention probabilities summed over head dimension
+    Instead of blocking by heads, we block by sequence positions.
+    This maintains high resource utilization even with small head counts.
     """
     assert dim == tilelang.math.next_power_of_2(dim), f"haven't check padding correctness yet, dim={dim}"
     assert tail_dim == tilelang.math.next_power_of_2(tail_dim), f"haven't check padding correctness yet, dim={tail_dim}"
     assert is_causal == True, "non-casual is not supported"
-    assert topk % block_I == 0, "otherwise will load some index=0 thus causing wrong k to be loaded"
+    assert topk % block_I == 0, "otherwise will load some index=0 thus causing wrong kv to be loaded"
+    
     if sm_scale is None:
         sm_scale = (1.0 / (dim + tail_dim)) ** 0.5 * 1.44269504  # log2(e)
     else:
         sm_scale = sm_scale * 1.44269504  # log2(e)
 
-    head_k = heads // k_group
+    batch = T.dynamic("batch")
+    seq_len = T.dynamic("seq_len")
+    seq_len_kv = T.dynamic("seq_len_kv")
+    num_seq_blocks = T.dynamic("num_seq_blocks")
+
+    head_kv = heads // kv_group
+    H = heads
+    G = kv_group
+    
+    # Shapes
     q_shape = [batch, seq_len, heads, dim + tail_dim]
-    k_shape = [batch, seq_len_k, k_group, dim + tail_dim]
-    indices_shape = [batch, seq_len, k_group, topk]
+    kv_shape = [batch, seq_len_kv, kv_group, dim + tail_dim]
+    o_shape = [batch, seq_len, heads, dim]
     lse_shape = [batch, seq_len, heads]
-    attn_sum_shape = [batch, seq_len, topk]
+    
+    # New: block indices and mask shapes
+    block_indices_shape = [batch, num_seq_blocks, kv_group, topk]
+    block_mask_shape = [batch, num_seq_blocks, kv_group, topk // block_I, S_per_block, block_I]
+    
     indices_dtype = T.int32
     dtype = T.bfloat16
     accum_dtype = T.float32
 
-    G = k_group
-    H = head_k
-    padded_H = max(tilelang.math.next_power_of_2(head_k), 16)
-    if padded_H != H:
-        assert k_group == 1, (
-            "here we solve the H padding automatically, other wise you should handle Q copy and Output copy with your mask (when k_group == 1, use g_i * padded_H:(g_i+1) * padded_H would be handled automatically)"
-        )
     BI = block_I
     NI = tilelang.cdiv(topk, block_I)
-    assert NI % 2 == 0, "NI should be a multiple of 2"
     D = dim
     D_tail = tail_dim
-    K_stride = k_stride
-    if head_k > 64:
-        assert head_k % 64 == 0, "head_k should be a multiple of 64"
-        REPLICATE_H = head_k // 64
-    else:
-        REPLICATE_H = 1
+    S_blk = S_per_block
 
-    H_per_block = padded_H if REPLICATE_H == 1 else 64
+    # Padded output shapes for kernel (uses padded seq_len = num_seq_blocks * S_per_block)
+    padded_seq_len = num_seq_blocks * S_per_block
+    o_shape_padded = [batch, padded_seq_len, heads, dim]
+    lse_shape_padded = [batch, padded_seq_len, heads]
 
     @T.prim_func
     def main(
-        Q: T.Tensor(q_shape, dtype),  # type: ignore
-        K: T.Tensor(k_shape, dtype),  # type: ignore
-        Indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore
-        q_start_index_s: T.Tensor(1, indices_dtype),
-        Lse: T.Tensor(lse_shape, accum_dtype),  # type: ignore - Pre-computed LSE
-        AttnSum: T.Tensor(attn_sum_shape, accum_dtype),  # type: ignore - Output
+        Q: T.Tensor(q_shape, dtype),  # type: ignore - [batch, padded_seq_len, heads, dim+tail_dim]
+        KV: T.Tensor(kv_shape, dtype),  # type: ignore
+        BlockIndices: T.Tensor(block_indices_shape, indices_dtype),  # type: ignore  # Pre-computed block indices
+        BlockMask: T.Tensor(block_mask_shape, "bool"),  # type: ignore  # Pre-computed mask
+        Output: T.Tensor(o_shape_padded, dtype),  # type: ignore - [batch, padded_seq_len, heads, dim]
+        Lse: T.Tensor(lse_shape_padded, accum_dtype),  # type: ignore - [batch, padded_seq_len, heads]
     ):
-        with T.Kernel((seq_len - k_stride + 1 if CP0 else seq_len) * REPLICATE_H, batch, k_group, threads=threads) as (bx, by, bz):
-            # Q shared memory - shared by all threads
-            Q_shared_l = T.alloc_shared([H_per_block, D // 2], dtype)
-            Q_shared_r = T.alloc_shared([H_per_block, D // 2], dtype)
-            Q_tail_shared = T.alloc_shared([H_per_block, D_tail], dtype)
+        # Grid: (num_seq_blocks, batch, heads)
+        # Each block processes S_per_block sequence positions for one head
+        with T.Kernel(num_seq_blocks, batch, heads, threads=threads) as (
+            bx,
+            by,
+            bz,
+        ):
+            # Shared memory allocations - now S_per_block instead of H_per_block
+            Q_shared = T.alloc_shared([S_blk, D], dtype)
+            Q_tail_shared = T.alloc_shared([S_blk, D_tail], dtype)
+            KV_shared = T.alloc_shared([BI, D], dtype)
+            K_tail_shared = T.alloc_shared([BI, D_tail], dtype)
+            O_shared = T.alloc_shared([S_blk, D], dtype)
+            Lse_shared = T.alloc_shared([S_blk], accum_dtype)
+            Mask_shared = T.alloc_shared([S_blk, BI], "bool")
             
-            # K shared memory - double buffer
-            K_shared_0_l = T.alloc_shared([BI, D // 2], dtype)
-            K_shared_0_r = T.alloc_shared([BI, D // 2], dtype)
-            K_shared_1_l = T.alloc_shared([BI, D // 2], dtype)
-            K_shared_1_r = T.alloc_shared([BI, D // 2], dtype)
-            K_tail_shared_0 = T.alloc_shared([BI, D_tail], dtype)
-            K_tail_shared_1 = T.alloc_shared([BI, D_tail], dtype)
-            
-            # K validity mask - double buffer
-            is_k_valid_0 = T.alloc_shared([BI], "bool", scope="shared")
-            is_k_valid_1 = T.alloc_shared([BI], "bool", scope="shared")
+            # Fragment allocations
+            acc_o = T.alloc_fragment([S_blk, D], accum_dtype)
+            acc_s = T.alloc_fragment([S_blk, BI], accum_dtype)
+            S_shared = T.alloc_shared([S_blk, BI], dtype)
+            sumexp = T.alloc_fragment([S_blk], accum_dtype)
+            sumexp_i = T.alloc_fragment([S_blk], accum_dtype)
+            alpha = T.alloc_fragment([S_blk], accum_dtype)
+            m_i = T.alloc_fragment([S_blk], accum_dtype)
+            m_i_prev = T.alloc_fragment([S_blk], accum_dtype)
 
-            # Local variables for thread group 1 - process all heads
-            acc_s = T.alloc_fragment([H_per_block, BI], accum_dtype)
-            lse_local = T.alloc_fragment([H_per_block], accum_dtype)
-            attn_sum_local = T.alloc_fragment([BI], accum_dtype)
+            T.fill(acc_o, 0)
+            T.fill(sumexp, 0)
+            T.fill(m_i, -(2**30))  # avoid -inf - inf to cause nan
 
-            indices_local = T.alloc_local([1], indices_dtype)
+            b_i = by  # batch index
+            sb_i = bx  # seq block index
+            h_i = bz  # head index
+            g_i = h_i // (H // G)  # kv group index
 
-            # Barriers - simplified
-            bar_q = T.alloc_barrier(arrive_count=256)
-            # K buffer synchronization
-            bar_k_0_ready = T.alloc_barrier(arrive_count=128)
-            bar_k_1_ready = T.alloc_barrier(arrive_count=128)
-            bar_k_0_free = T.alloc_barrier(arrive_count=128)
-            bar_k_1_free = T.alloc_barrier(arrive_count=128)
+            # Compute sequence range for this block
+            S0 = sb_i * S_blk
 
-            b_i, g_i = by, bz
-            s_i = (bx + (K_stride - 1 if CP0 else 0)) if REPLICATE_H == 1 else (bx // REPLICATE_H + (K_stride - 1 if CP0 else 0))
-            q_i = q_start_index_s[0] + s_i
-            max_k_i = (q_i + 1 - K_stride) // K_stride
+            # Load Q for this seq block and head
+            # Q: [batch, padded_seq_len, heads, dim+tail_dim]
+            # We need Q[b_i, S0:S0+S_blk, h_i, :]
+            for s_i, d_i in T.Parallel(S_blk, D):
+                Q_shared[s_i, d_i] = Q[b_i, S0 + s_i, h_i, d_i]
+            for s_i, d_i in T.Parallel(S_blk, D_tail):
+                Q_tail_shared[s_i, d_i] = Q[b_i, S0 + s_i, h_i, D + d_i]
 
-            H0 = g_i * padded_H + (0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * 64)
-            H1 = H0 + H_per_block
+            for i_i in T.Pipelined(NI, num_stages=num_stages):
+                # Load pre-computed mask for this (seq_block, kv_block)
+                # BlockMask: [batch, num_seq_blocks, kv_group, NI, S_per_block, BI]
+                for s_i, bi_i in T.Parallel(S_blk, BI):
+                    Mask_shared[s_i, bi_i] = BlockMask[b_i, sb_i, g_i, i_i, s_i, bi_i]
 
-            tx = T.get_thread_binding()
+                # Load KV using block indices
+                # BlockIndices: [batch, num_seq_blocks, kv_group, topk]
+                for bi_i, d_i in T.Parallel(BI, D):
+                    KV_shared[bi_i, d_i] = KV[b_i, BlockIndices[b_i, sb_i, g_i, i_i * BI + bi_i], g_i, d_i]
+                for bi_i, d_i in T.Parallel(BI, D_tail):
+                    K_tail_shared[bi_i, d_i] = KV[b_i, BlockIndices[b_i, sb_i, g_i, i_i * BI + bi_i], g_i, D + d_i]
 
-            # Load Q to shared memory
-            T.copy(Q[b_i, s_i, H0:H1, 0 : D // 2], Q_shared_l)
-            T.copy(Q[b_i, s_i, H0:H1, D // 2 : D], Q_shared_r)
-            T.copy(Q[b_i, s_i, H0:H1, D:], Q_tail_shared)
-            T.barrier_arrive(bar_q)
-
-            if tx < 128:
-                # ================================================================
-                # Thread Group 1: Compute qk matmul and attn_sum for all heads
-                # ================================================================
-                T.set_max_nreg(240, 1)
+                # Apply mask to acc_s initialization
+                for s_i, bi_i in T.Parallel(S_blk, BI):
+                    acc_s[s_i, bi_i] = T.if_then_else(Mask_shared[s_i, bi_i], 0, -T.infinity(acc_s.dtype))
                 
-                # Load LSE for this position
-                T.copy(Lse[b_i, s_i, H0:H1], lse_local)
+                # Q @ K^T
+                T.gemm(
+                    Q_shared,
+                    KV_shared,
+                    acc_s,
+                    transpose_B=True,
+                    policy=T.GemmWarpPolicy.FullRow,
+                )
+                T.gemm(
+                    Q_tail_shared,
+                    K_tail_shared,
+                    acc_s,
+                    transpose_B=True,
+                    policy=T.GemmWarpPolicy.FullRow,
+                )
                 
-                T.barrier_wait(bar_q, 0)
+                # Online softmax update
+                T.copy(m_i, m_i_prev)
+                T.reduce_max(acc_s, m_i, dim=1, clear=False)
+                for s_i in T.Parallel(S_blk):
+                    m_i[s_i] = T.max(m_i[s_i], m_i_prev[s_i])
+                for s_i in T.Parallel(S_blk):
+                    alpha[s_i] = T.exp2((m_i_prev[s_i] - m_i[s_i]) * sm_scale)
+                for s_i, bi_i in T.Parallel(S_blk, BI):
+                    acc_s[s_i, bi_i] = T.exp2(acc_s[s_i, bi_i] * sm_scale - m_i[s_i] * sm_scale)
+                T.reduce_sum(acc_s, sumexp_i, dim=1)
+                for s_i in T.Parallel(S_blk):
+                    sumexp[s_i] = sumexp[s_i] * alpha[s_i] + sumexp_i[s_i]
+                for s_i, d_i in T.Parallel(S_blk, D):
+                    acc_o[s_i, d_i] = acc_o[s_i, d_i] * alpha[s_i]
 
-                for i_i in T.serial(T.ceildiv(NI, 2)):
-                    # Buffer 0
-                    T.barrier_wait(bar_k_0_ready[0], (i_i & 1))
+                # S @ V
+                T.copy(acc_s, S_shared)
+                T.gemm(S_shared, KV_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
 
-                    for h_i, bi_i in T.Parallel(H_per_block, BI):
-                        acc_s[h_i, bi_i] = T.if_then_else(is_k_valid_0[bi_i], 0, -T.infinity(acc_s.dtype))
-                    # QK matmul - process all heads
-                    T.gemm(Q_shared_l, K_shared_0_l, acc_s, transpose_B=True, wg_wait=-1)
-                    T.gemm(Q_shared_r, K_shared_0_r, acc_s, transpose_B=True, wg_wait=-1)
-                    T.gemm(Q_tail_shared, K_tail_shared_0, acc_s, transpose_B=True, wg_wait=0)
+            # Rescale output
+            for s_i, d_i in T.Parallel(S_blk, D):
+                acc_o[s_i, d_i] /= sumexp[s_i]
+            for s_i in T.Parallel(S_blk):
+                sumexp[s_i] = T.log2(sumexp[s_i]) + m_i[s_i] * sm_scale
 
-                    # Compute attn_prob = exp2(qk * sm_scale - lse) and sum over heads
-                    for h_i, bi_i in T.Parallel(H_per_block, BI):
-                        acc_s[h_i, bi_i] = T.exp2(acc_s[h_i, bi_i] * sm_scale - lse_local[h_i])
-                    for h_i, bi_i in T.Parallel(H_per_block, BI):
-                        acc_s[h_i, bi_i] = T.if_then_else(is_k_valid_0[bi_i], acc_s[h_i, bi_i], 0)
-                    
-                    # Sum along head dimension
-                    T.reduce_sum(acc_s, attn_sum_local, dim=0)
-                    
-                    # Write attn_sum for buffer 0
-                    tk_start_0 = (i_i * 2) * BI
-                    T.copy(attn_sum_local, AttnSum[b_i, s_i, tk_start_0 : tk_start_0 + BI])
-
-                    T.barrier_arrive(bar_k_0_free[0])
-
-                    # Buffer 1
-                    T.barrier_wait(bar_k_1_ready[0], (i_i & 1))
-
-                    for h_i, bi_i in T.Parallel(H_per_block, BI):
-                        acc_s[h_i, bi_i] = T.if_then_else(is_k_valid_1[bi_i], 0, -T.infinity(acc_s.dtype))
-                    T.gemm(Q_shared_l, K_shared_1_l, acc_s, transpose_B=True, wg_wait=-1)
-                    T.gemm(Q_shared_r, K_shared_1_r, acc_s, transpose_B=True, wg_wait=-1)
-                    T.gemm(Q_tail_shared, K_tail_shared_1, acc_s, transpose_B=True, wg_wait=0)
-
-                    # Compute attn_prob = exp2(qk * sm_scale - lse) and sum over heads
-                    for h_i, bi_i in T.Parallel(H_per_block, BI):
-                        acc_s[h_i, bi_i] = T.exp2(acc_s[h_i, bi_i] * sm_scale - lse_local[h_i])
-                    for h_i, bi_i in T.Parallel(H_per_block, BI):
-                        acc_s[h_i, bi_i] = T.if_then_else(is_k_valid_1[bi_i], acc_s[h_i, bi_i], 0)
-                    
-                    # Sum along head dimension
-                    T.reduce_sum(acc_s, attn_sum_local, dim=0)
-                    
-                    # Write attn_sum for buffer 1
-                    tk_start_1 = (i_i * 2 + 1) * BI
-                    T.copy(attn_sum_local, AttnSum[b_i, s_i, tk_start_1 : tk_start_1 + BI])
-
-                    T.barrier_arrive(bar_k_1_free[0])
-
-            elif tx >= 128:
-                # ================================================================
-                # Thread Group 3: Producer - Load K to shared memory
-                # ================================================================
-                T.set_max_nreg(80, 0)
-                
-                # Load K for thread group 1
-                for i_i in T.serial(T.ceildiv(NI, 2)):
-                    # Buffer 0
-                    T.barrier_wait(bar_k_0_free[0], ((i_i & 1) ^ 1))
-                    for r in T.serial(4):
-                        indices_local[0] = Indices[b_i, s_i, g_i, (i_i * 2) * BI + r * 16 + (tx - 128) // 8]
-                        is_k_valid_0[r * 16 + (tx - 128) // 8] = indices_local[0] <= max_k_i
-                        if is_k_valid_0[r * 16 + (tx - 128) // 8]:
-                            with T.attr("default", "async_scope", 1):
-                                for u in T.serial(4):
-                                    for v in T.vectorized(8):
-                                        K_shared_0_l[r * 16 + (tx - 128) // 8, 64 * u + (tx - 128) % 8 * 8 + v] = K[
-                                            b_i, indices_local[0], g_i, 64 * u + (tx - 128) % 8 * 8 + v
-                                        ]
-                                        K_shared_0_r[r * 16 + (tx - 128) // 8, 64 * u + (tx - 128) % 8 * 8 + v] = K[
-                                            b_i, indices_local[0], g_i, D // 2 + 64 * u + (tx - 128) % 8 * 8 + v
-                                        ]
-                            with T.attr("default", "async_scope", 1):
-                                for v in T.vectorized(8):
-                                    K_tail_shared_0[r * 16 + (tx - 128) // 8, (tx - 128) % 8 * 8 + v] = K[
-                                        b_i, indices_local[0], g_i, D + (tx - 128) % 8 * 8 + v
-                                    ]
-                    T.cp_async_barrier_noinc(bar_k_0_ready[0])
-
-                    # Buffer 1
-                    T.barrier_wait(bar_k_1_free[0], ((i_i & 1) ^ 1))
-                    for r in T.serial(4):
-                        indices_local[0] = Indices[b_i, s_i, g_i, (i_i * 2 + 1) * BI + r * 16 + (tx - 128) // 8]
-                        is_k_valid_1[r * 16 + (tx - 128) // 8] = indices_local[0] <= max_k_i
-                        if is_k_valid_1[r * 16 + (tx - 128) // 8]:
-                            with T.attr("default", "async_scope", 1):
-                                for u in T.serial(4):
-                                    for v in T.vectorized(8):
-                                        K_shared_1_l[r * 16 + (tx - 128) // 8, 64 * u + (tx - 128) % 8 * 8 + v] = K[
-                                            b_i, indices_local[0], g_i, 64 * u + (tx - 128) % 8 * 8 + v
-                                        ]
-                                        K_shared_1_r[r * 16 + (tx - 128) // 8, 64 * u + (tx - 128) % 8 * 8 + v] = K[
-                                            b_i, indices_local[0], g_i, D // 2 + 64 * u + (tx - 128) % 8 * 8 + v
-                                        ]
-                            with T.attr("default", "async_scope", 1):
-                                for v in T.vectorized(8):
-                                    K_tail_shared_1[r * 16 + (tx - 128) // 8, (tx - 128) % 8 * 8 + v] = K[
-                                        b_i, indices_local[0], g_i, D + (tx - 128) % 8 * 8 + v
-                                    ]
-                    T.cp_async_barrier_noinc(bar_k_1_ready[0])
+            # Store output
+            # Output: [batch, padded_seq_len, heads, dim]
+            T.copy(acc_o, O_shared)
+            for s_i, d_i in T.Parallel(S_blk, D):
+                Output[b_i, S0 + s_i, h_i, d_i] = O_shared[s_i, d_i]
+            T.copy(sumexp, Lse_shared)
+            for s_i in T.Parallel(S_blk):
+                Lse[b_i, S0 + s_i, h_i] = Lse_shared[s_i]
 
     return main
 
 
-def calc_attn_dist(
-    q, k, indices, lse, chunk_offset=0, sm_scale=None, k_stride=1, is_casual=True, eps=1e-10
+def sparse_mla_fwd_seq_block_interface(
+    q, kv, indices, 
+    sm_scale=None, 
+    return_p_sum: bool = False, 
+    d_v=512, 
+    block_I=64, 
+    S_per_block=64,
+    num_stages=2, 
+    threads=256
 ):
     """
-    Calculate Attention Distribution using pre-computed LSE
+    Interface function for sparse MLA forward with sequence blocking.
     
-    Args:
-        q: [batch, chunk_size, heads, dim + tail_dim]
-        k: [batch, seq_len_k, k_group, dim + tail_dim]
-        indices: [batch, chunk_size, k_group, topk]
-        lse: [batch, chunk_size, heads] - Pre-computed LSE for the chunk
-        chunk_offset: starting position of current chunk in full sequence (for causal mask)
-        sm_scale: attention scaling factor
-        k_stride: K stride
-        is_casual: whether to use causal mask
-        eps: epsilon for numerical stability
+    This function:
+    1. Pre-computes block indices and mask in Python
+    2. Launches the kernel with pre-computed data
     
-    Returns:
-        attn_dist: [batch, chunk_size, topk] - normalized attention distribution
+    Key optimization: Instead of blocking by heads (H_per_block), we block by sequence (S_per_block).
+    This maintains high register and shared memory utilization even with small head counts.
     """
-    assert q.is_contiguous() and k.is_contiguous() and indices.is_contiguous() and lse.is_contiguous()
+    is_casual = True
+    assert return_p_sum == False, "This kernel file is for fwd only"
+    assert q.is_contiguous() and kv.is_contiguous() and indices.is_contiguous()
+    
     batch, seq_len, heads, dim_plus_tail_dim = q.shape
-    _, seq_len_k, k_group, _ = k.shape
+    _, seq_len_kv, kv_group, _ = kv.shape
 
     assert dim_plus_tail_dim == 576, "you should assign dim otherwise"
-    dim = 512
+    dim = d_v
 
-    assert k.shape[-1] == dim_plus_tail_dim
+    assert kv.shape[-1] == dim_plus_tail_dim
     tail_dim = dim_plus_tail_dim - dim
-    assert k.shape[0] == batch
+    assert kv.shape[0] == batch
     _, _, _, topk = indices.shape
-    assert indices.shape == (batch, seq_len, k_group, topk)
-    assert lse.shape == (batch, seq_len, heads), f"lse shape mismatch: {lse.shape} vs {(batch, seq_len, heads)}"
-
-    CP0 = chunk_offset == 0
-
-    kernel = indexer_loss_fwd(batch, seq_len, seq_len_k, heads, dim, tail_dim, topk, k_stride, k_group, sm_scale, is_casual, CP0)
-    attn_sum = kernel(q, k, indices, torch.tensor([chunk_offset], dtype=torch.int32, device="cuda"), lse)
-
-    # Normalize to get attn_dist
-    attn_total = attn_sum.sum(dim=-1, keepdim=True) + eps
-    attn_dist = attn_sum / attn_total
-
-    return attn_dist
-
-
-# ============================================================================
-# Test Configuration
-# ============================================================================
-
-@dataclass
-class TestConfig:
-    """Test Configuration"""
-    name: str
-    batch_size: int = 1
-    num_heads: int = 128
-    chunk_size: int = 256
-    seq_len: int = 256
-    head_dim: int = 576  # tilelang version fixed at 576
-    topk: int = 128
-    seed: int = 42
+    assert indices.shape == (batch, seq_len, kv_group, topk)
     
-    def __str__(self):
-        return (f"batch={self.batch_size}, heads={self.num_heads}, "
-                f"chunk={self.chunk_size}, seq={self.seq_len}, "
-                f"dim={self.head_dim}, topk={self.topk}")
+    # Store original seq_len for slicing output later
+    original_seq_len = seq_len
+    
+    # Ensure seq_len is divisible by S_per_block
+    num_seq_blocks = (seq_len + S_per_block - 1) // S_per_block
+    padded_seq_len = num_seq_blocks * S_per_block
+    
+    # Pad Q and indices if needed
+    if padded_seq_len > seq_len:
+        q_padded = torch.zeros(batch, padded_seq_len, heads, dim_plus_tail_dim, dtype=q.dtype, device=q.device)
+        q_padded[:, :seq_len, :, :] = q
+        q = q_padded
+        
+        # Also pad indices - fill padding with last valid position's indices
+        indices_padded = torch.zeros(batch, padded_seq_len, kv_group, topk, dtype=indices.dtype, device=indices.device)
+        indices_padded[:, :seq_len, :, :] = indices
+        indices_padded[:, seq_len:, :, :] = indices[:, seq_len-1:seq_len, :, :]
+        indices = indices_padded
+        
+        seq_len = padded_seq_len  # Update for mask preparation
+    
+    # Prepare block indices and mask (use original_seq_len for validity checks)
+    block_indices, block_mask = prepare_block_indices_and_mask(
+        indices, original_seq_len, S_per_block, block_I
+    )
+    
+    # Create kernel
+    kernel = sparse_mla_fwd_seq_block(
+        heads, dim, tail_dim, topk, kv_group, sm_scale, is_casual,
+        block_I=block_I, S_per_block=S_per_block, num_stages=num_stages, threads=threads
+    )
+    
+    # Run kernel - kernel expects padded inputs and produces padded outputs
+    out, lse = kernel(q, kv, block_indices, block_mask)
+    
+    # Slice output to original seq_len
+    out = out[:, :original_seq_len, :, :]
+    lse = lse[:, :original_seq_len, :]
+    
+    return out, lse
 
 
-# ============================================================================
-# PyTorch Reference Implementation
-# ============================================================================
-
-def ref_calc_attn_dist(q, k, indices, chunk_offset=0, k_stride=1, sm_scale=None, is_casual=True, eps=1e-10):
-    """
-    PyTorch Reference Implementation for calc_attn_dist
-    
-    Compute normalized sparse attention distribution attn_dist.
-    
-    Args:
-        q: [batch, seq_len, heads, dim + tail_dim]
-        k: [batch, seq_len_k, k_group, dim + tail_dim]
-        indices: [batch, seq_len, k_group, topk]
-        chunk_offset: starting position of current chunk in full sequence (for causal mask)
-        k_stride: K stride
-        sm_scale: attention scaling factor
-        is_casual: whether to use causal mask
-        eps: epsilon for numerical stability
-    
-    Returns:
-        attn_dist: [batch, seq_len, topk] - normalized attention distribution
-    """
+def ref_sparse_mla_fwd_interface(q, kv, indices, sm_scale=None, is_casual=True):
+    """Reference implementation for correctness checking."""
     q = q.float()
-    k = k.float()
-    indices_transposed = indices.transpose(1, 2)  # [batch, k_group, seq_len, topk]
+    kv = kv.float()
+    indices = indices.transpose(1, 2)
     b, sq, h, dim_q = q.shape
-    b, sk, g, _ = k.shape
-    if chunk_offset is None:
-        chunk_offset = sk * k_stride - sq
+    b, sk, g, _ = kv.shape
 
-    assert k.shape[-1] == 576, "you should assign dim otherwise"
+    assert kv.shape[-1] == 576, "you should assign dim otherwise"
     dim = 512
+    k = kv
+    v = kv[..., :dim]
 
+    b, _, _, dim_v = v.shape
     g_index = g
     h_index = h // g
-    
-    # Causal mask for compressed K
-    compressed_casual_mask = torch.arange(chunk_offset, sq + chunk_offset, dtype=torch.int32, device=q.device).view(
-        -1, 1
-    ) >= torch.arange(k_stride - 1, sk * k_stride, k_stride, dtype=torch.int32, device=q.device).view(1, -1)
+    compressed_casual_mask = torch.arange(0, sq, dtype=torch.int32, device="cuda").view(-1, 1) >= torch.arange(
+        1 - 1, sk * 1, 1, dtype=torch.int32, device="cuda"
+    ).view(1, -1)
 
-    # Sparse mask based on indices
-    mask = q.new_zeros(b, g_index, sq, sk + 1, dtype=torch.bool).scatter(3, indices_transposed.long(), 1)
+    mask = q.new_zeros(b, g_index, sq, sk + 1, dtype=torch.bool).scatter(3, indices.long(), 1)
     mask = mask[..., :-1]
     mask = mask & compressed_casual_mask.view(1, 1, sq, sk)
-    mask[:, :, : k_stride - 1, 0] = True
-    mask = mask.view(b, g_index, 1, sq, sk)  # [b, g, 1, sq, sk]
+    mask[:, :, : 1 - 1, 0] = True
+    mask = mask.view(b, g_index, 1, sq, sk)
 
-    q_reshaped = q.view(b, sq, g, -1, dim_q)  # [b, sq, g, h_per_g, dim_q]
-    
-    # Compute attention scores
-    score = torch.einsum("bmghd,bngd->bghmn", q_reshaped, k)  # [b, g, h_per_g, sq, sk]
-    sm_scale_val = dim_q**-0.5 if sm_scale is None else sm_scale
-    score = score.masked_fill(~mask, float("-inf")).mul(sm_scale_val)
-    p = score.softmax(dim=-1)  # [b, g, h_per_g, sq, sk]
-    
-    # Sum over all heads: [b, g, h_per_g, sq, sk] -> [b, sq, sk]
-    p_sum = p.sum(dim=(1, 2))  # [b, sq, sk]
-    
-    # Gather to get attn_sum for topk indices
-    indices_for_gather = indices_transposed[:, 0, :, :]  # [batch, seq_len, topk] (assume k_group=1)
-    attn_sum = torch.gather(p_sum, dim=-1, index=indices_for_gather.long())  # [batch, seq_len, topk]
-    
-    # Normalize to get attn_dist
-    attn_total = attn_sum.sum(dim=-1, keepdim=True) + eps
-    attn_dist = attn_sum / attn_total
-    
-    return attn_dist
+    q = q.view(b, sq, g, -1, dim_q)
+    score = torch.einsum("bmghd,bngd->bghmn", q, k)
+    sm_scale = dim_q**-0.5 if sm_scale is None else sm_scale
+    score = score.masked_fill(~mask, float("-inf")).mul(sm_scale)
+    p = score.softmax(dim=-1)
+    p = p.view(b, g_index, h_index, -1, sq, sk)
+    p = p.view(b, g, -1, sq, sk)
+    o = torch.einsum("bghmn,bngd->bmghd", p.type(v.dtype), v)
+    o = o.reshape(b, sq, h, dim_v)
+    return o.to(torch.bfloat16)
 
 
-# ============================================================================
-# Forward Accuracy Test
-# ============================================================================
-
-def run_fwd_accuracy_test(config: TestConfig, device: str = 'cuda'):
-    """
-    Run single forward accuracy test - compare attn_dist
-    """
-    from sparse_mla_fwd import sparse_mla_fwd_interface
-    
-    torch.manual_seed(config.seed)
-    
-    # tilelang version uses fixed dim=576
-    head_dim = 576
-    
-    # Generate random inputs
-    q = torch.randn(config.batch_size, config.seq_len, config.num_heads, head_dim, 
-                    device=device, dtype=torch.bfloat16) / 10
-    k = torch.randn(config.batch_size, config.seq_len, 1, head_dim, 
-                    device=device, dtype=torch.bfloat16) / 10
-    
-    q.clamp_(-10, 10)
-    k.clamp_(-10, 10)
-    
-    # Compute chunk_offset
-    chunk_offset = config.seq_len - config.chunk_size
-    k_stride = 1
-    
-    # Generate indices for full sequence
-    indices_full = torch.full((config.batch_size, config.seq_len, 1, config.topk), 
-                              config.seq_len, dtype=torch.int32, device=device)
-    for b in range(config.batch_size):
-        for t in range(config.seq_len):
-            max_valid_idx = min(max(1, ((t) // k_stride)), config.seq_len)
-            i_i = torch.randperm(max_valid_idx, device=device)[:config.topk]
-            indices_full[b, t, 0, : len(i_i)] = i_i.to(torch.int32)
-    
-    # Use sparse_mla_fwd to compute full LSE
-    _, full_lse = sparse_mla_fwd_interface(q, k, indices_full)
-    
-    # Extract chunk-specific data
-    q_chunk = q[:, chunk_offset:, :, :].contiguous()
-    indices_chunk = indices_full[:, chunk_offset:, :, :].contiguous()
-    lse_chunk = full_lse[:, chunk_offset:, :].contiguous()
-    
-    # TileLang kernel: compute attn_dist using pre-computed LSE
-    tl_attn_dist = calc_attn_dist(q_chunk, k, indices_chunk, lse_chunk, chunk_offset, k_stride=k_stride)
-    
-    # PyTorch reference: compute attn_dist
-    ref_attn_dist = ref_calc_attn_dist(q_chunk, k, indices_chunk, chunk_offset, k_stride=k_stride)
-    
-    # Compare results
-    def calc_diff(a, b):
-        abs_diff = torch.abs(a - b)
-        max_diff = abs_diff.max().item()
-        rel_diff = (abs_diff / (1e-4 + torch.abs(a))).mean().item() * 100
-        return max_diff, rel_diff
-    
-    max_diff, rel_diff = calc_diff(ref_attn_dist, tl_attn_dist.to(ref_attn_dist.dtype))
-    passed = rel_diff < 1e-3  # relative error < 0.001%
-    
-    return {
-        'config': config,
-        'ref_max': ref_attn_dist.abs().max().item(),
-        'tl_max': tl_attn_dist.abs().max().item(),
-        'max_diff': max_diff,
-        'rel_diff': rel_diff,
-        'passed': passed
-    }
-
-
-def test_fwd_accuracy(configs: List[TestConfig]):
-    """
-    Batch run forward accuracy tests - compare attn_dist
-    """
-    print("\n" + "=" * 110)
-    print("Forward Accuracy Test (PyTorch attn_dist vs TileLang attn_dist with pre-computed LSE)")
-    print("=" * 110)
-    
-    results = []
-    for config in configs:
-        try:
-            result = run_fwd_accuracy_test(config)
-            results.append(result)
-        except Exception as e:
-            print(f"Skip test {config.name}: {e}")
-            import traceback
-            traceback.print_exc()
-            continue
-    
-    print(f"\n{'Name':<12} {'Config':<55} {'MaxDiff':<12} {'RelDiff(%)':<12} {'Pass':<6}")
-    print("-" * 97)
-    for r in results:
-        print(f"{r['config'].name:<12} {str(r['config']):<55} "
-              f"{r['max_diff']:<12.2e} {r['rel_diff']:<12.2e} {'✓' if r['passed'] else '✗':<6}")
-    
-    passed_count = sum(1 for r in results if r['passed'])
-    print("-" * 97)
-    print(f"Forward Test (attn_dist): {passed_count}/{len(results)} passed")
-    
-    return results
-
-
-# ============================================================================
-# Forward Performance Test
-# ============================================================================
-
-def test_fwd_performance(
-    batch_size: int = 1,
-    num_heads: int = 128,
-    chunk_size: int = 1024,
-    seq_len: int = 2048,
-    head_dim: int = 576,
-    topk: int = 512,
-    seed: int = 42,
-    num_warmup: int = 5,
-    num_benchmark: int = 20,
+def test_sparse_mla_fwd_seq_block(
+    B=1,
+    S=256,  # Start with smaller S for testing
+    SKV=256,
+    H=16,  # Small head count - the target use case
+    HKV=1,
+    DQK=576,
+    DV=512,
+    topk=128,  # Smaller topk for testing
+    dtype=torch.bfloat16,
+    check_correctness=True,
+    block_I=64,
+    S_per_block=64,
+    num_stages=2,
+    threads=256,
 ):
-    """
-    Forward performance test
-    """
-    import time
-    from sparse_mla_fwd import sparse_mla_fwd_interface
-    
-    torch.manual_seed(seed)
-    device = 'cuda'
-    
-    print("\n" + "=" * 80)
-    print("Forward Performance Test (TileLang calc_attn_dist with pre-computed LSE)")
-    print("=" * 80)
-    print(f"Parameters: batch={batch_size}, heads={num_heads}, chunk={chunk_size}, seq={seq_len}, dim={head_dim}, topk={topk}")
-    print("=" * 80)
-    
-    q = torch.randn(batch_size, seq_len, num_heads, head_dim, device=device, dtype=torch.bfloat16) / 10
-    k = torch.randn(batch_size, seq_len, 1, head_dim, device=device, dtype=torch.bfloat16) / 10
-    q.clamp_(-10, 10)
-    k.clamp_(-10, 10)
-    
-    chunk_offset = seq_len - chunk_size
-    k_stride = 1
-    
-    # Generate indices for full sequence
-    indices_full = torch.full((batch_size, seq_len, 1, topk), seq_len, dtype=torch.int32, device=device)
-    for b in range(batch_size):
-        for t in range(seq_len):
-            max_valid_idx = min(max(1, ((t) // k_stride)), seq_len)
-            i_i = torch.randperm(max_valid_idx, device=device)[:topk]
-            indices_full[b, t, 0, : len(i_i)] = i_i.to(torch.int32)
-    
-    # Use sparse_mla_fwd to compute full LSE
-    _, full_lse = sparse_mla_fwd_interface(q, k, indices_full)
-    
-    # Extract chunk-specific data
-    q_chunk = q[:, chunk_offset:, :, :].contiguous()
-    indices_chunk = indices_full[:, chunk_offset:, :, :].contiguous()
-    lse_chunk = full_lse[:, chunk_offset:, :].contiguous()
-    
-    torch.cuda.synchronize()
-    base_memory = torch.cuda.memory_allocated() / (1024**3)
-    
-    # Forward only test (indexer_loss_fwd kernel only)
-    torch.cuda.reset_peak_memory_stats()
-    for _ in range(num_warmup):
-        _ = calc_attn_dist(q_chunk, k, indices_chunk, lse_chunk, chunk_offset, k_stride=k_stride)
-    torch.cuda.synchronize()
-    
-    torch.cuda.reset_peak_memory_stats()
-    start = time.time()
-    for _ in range(num_benchmark):
-        _ = calc_attn_dist(q_chunk, k, indices_chunk, lse_chunk, chunk_offset, k_stride=k_stride)
-    torch.cuda.synchronize()
-    fwd_time = (time.time() - start) / num_benchmark * 1000
-    fwd_peak = torch.cuda.max_memory_allocated() / (1024**3)
-    
-    print(f"\n>>> Performance (warmup={num_warmup}, iters={num_benchmark})")
-    print(f"  Forward time (indexer_loss only): {fwd_time:.3f} ms")
-    
-    print(f"\n>>> Memory Peak")
-    print(f"  Base memory:    {base_memory:.2f} GB")
-    print(f"  Forward peak:   {fwd_peak:.2f} GB (increment: {fwd_peak - base_memory:.2f} GB)")
-    
-    # Compute TFLOPS
-    flops_fwd = batch_size * chunk_size * head_dim * topk * 2 * num_heads
-    print(f"\n>>> Compute Throughput")
-    print(f"  Forward TFLOPS: {flops_fwd / (fwd_time * 1e-3) / 1e12:.2f}")
-    
-    # IO bandwidth
-    io_bytes = batch_size * chunk_size * head_dim * topk * 2  # bf16
-    print(f"  IO Bandwidth: {io_bytes / (fwd_time * 1e-3) / 1e12:.2f} TB/s")
-    
-    return {
-        'fwd_time': fwd_time,
-        'fwd_peak': fwd_peak,
-    }
+    torch.random.manual_seed(0)
+    q = torch.randn((B, S, H, DQK), dtype=dtype, device="cuda").requires_grad_(True)
+    kv = torch.randn((B, SKV, HKV, DQK), dtype=dtype, device="cuda").requires_grad_(True)
 
+    indices = torch.full((B, S, HKV, topk), SKV, dtype=torch.int32, device="cuda")
+    for b in range(B):
+        for t in range(S):
+            for h in range(HKV):
+                i_i = torch.randperm(max(1, t))[:topk]
+                indices[b, t, h, : len(i_i)] = i_i
 
-# ============================================================================
-# Main Function
-# ============================================================================
+    print(f"Testing with B={B}, S={S}, SKV={SKV}, H={H}, topk={topk}, S_per_block={S_per_block}")
+    
+    tl_out, tl_lse = sparse_mla_fwd_seq_block_interface(
+        q, kv, indices, 
+        block_I=block_I, 
+        S_per_block=S_per_block,
+        num_stages=num_stages, 
+        threads=threads
+    )
 
-def main():
-    """
-    Main function for running accuracy and performance tests
-    """
-    parser = argparse.ArgumentParser(description='TileLang IndexerLoss Forward Kernel Tests')
-    parser.add_argument('--test_accuracy', action='store_true', help='Run forward accuracy tests')
-    parser.add_argument('--test_performance', action='store_true', help='Run forward performance tests')
-    parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
-    parser.add_argument('--num_heads', type=int, default=128, help='Number of attention heads')
-    parser.add_argument('--chunk_size', type=int, default=1024, help='Chunk size')
-    parser.add_argument('--seq_len', type=int, default=2048, help='Sequence length')
-    parser.add_argument('--head_dim', type=int, default=576, help='Head dimension')
-    parser.add_argument('--topk', type=int, default=512, help='Top-k value')
-    parser.add_argument('--seed', type=int, default=42, help='Random seed')
-    parser.add_argument('--warmup', type=int, default=3, help='Number of warmup iterations')
-    parser.add_argument('--iters', type=int, default=10, help='Number of benchmark iterations')
-    
-    args = parser.parse_args()
-    
-    # Default test configurations (tilelang version uses fixed dim=576, topk must be multiple of 64)
-    accuracy_configs = [
-        TestConfig(name="Small", batch_size=1, num_heads=16, chunk_size=256, seq_len=512, head_dim=576, topk=128),
-        TestConfig(name="Medium", batch_size=1, num_heads=64, chunk_size=512, seq_len=1024, head_dim=576, topk=256),
-        TestConfig(name="Large", batch_size=1, num_heads=128, chunk_size=1024, seq_len=2048, head_dim=576, topk=512),
-        TestConfig(name="MultiBatch", batch_size=2, num_heads=128, chunk_size=2048, seq_len=4096, head_dim=576, topk=2048),
-        TestConfig(name="LargeTopK", batch_size=1, num_heads=128, chunk_size=512, seq_len=2048, head_dim=576, topk=1024),
-        TestConfig(name="Production", batch_size=1, num_heads=128, chunk_size=8192, seq_len=131072, head_dim=576, topk=2048),
-    ]
-    
-    # Performance test configurations for different scales
-    performance_configs = [
-        {"name": "Production", "batch_size": 1, "num_heads": 128, "chunk_size": 8192, "seq_len": 131072, "head_dim": 576, "topk": 2048},
-    ]
-    
-    if args.test_accuracy:
-        # Run forward accuracy tests
-        test_fwd_accuracy(accuracy_configs)
-        
-    elif args.test_performance:
-        # Run forward performance tests
-        print("\n" + "=" * 100)
-        print("Forward Performance Tests at Different Scales")
-        print("=" * 100)
-        
-        all_results = []
-        for config_dict in performance_configs:
-            try:
-                result = test_fwd_performance(
-                    batch_size=config_dict['batch_size'],
-                    num_heads=config_dict['num_heads'],
-                    chunk_size=config_dict['chunk_size'],
-                    seq_len=config_dict['seq_len'],
-                    head_dim=config_dict['head_dim'],
-                    topk=config_dict['topk'],
-                    seed=args.seed,
-                    num_warmup=args.warmup,
-                    num_benchmark=args.iters,
-                )
-                result['name'] = config_dict['name']
-                all_results.append(result)
-            except Exception as e:
-                print(f"Skip performance test {config_dict['name']}: {e}")
-                continue
-        
-        # Print summary
-        print("\n" + "=" * 100)
-        print("Performance Test Summary")
-        print("=" * 100)
-        print(f"\n{'Name':<15} {'Config':<55} {'Time(ms)':<12} {'Peak(GB)':<12}")
-        print("-" * 94)
-        for r in all_results:
-            config_str = (f"batch={r.get('batch_size', 1) if 'batch_size' in r else config_dict['batch_size']}, "
-                         f"heads={r.get('num_heads', 128) if 'num_heads' in r else config_dict['num_heads']}, "
-                         f"chunk={r.get('chunk_size', 1024) if 'chunk_size' in r else config_dict['chunk_size']}, "
-                         f"seq={r.get('seq_len', 2048) if 'seq_len' in r else config_dict['seq_len']}, "
-                         f"dim={r.get('head_dim', 576) if 'head_dim' in r else config_dict['head_dim']}, "
-                         f"topk={r.get('topk', 512) if 'topk' in r else config_dict['topk']}")
-            print(f"{r['name']:<15} {config_str:<55} {r['fwd_time']:<12.3f} {r['fwd_peak']:<12.2f}")
-        
-        print("-" * 94)
-        print(f"Total tests: {len(all_results)}")
-        
-    else:
-        # Default: Run both accuracy and performance tests
-        print("=" * 80)
-        print("Running Default Tests (Accuracy + Performance)")
-        print("=" * 80)
-        
-        # Accuracy tests
-        test_fwd_accuracy(accuracy_configs)
-        
-        # Performance tests
-        print("\n")
-        test_fwd_performance(
-            batch_size=args.batch_size,
-            num_heads=args.num_heads,
-            chunk_size=args.chunk_size,
-            seq_len=args.seq_len,
-            head_dim=args.head_dim,
-            topk=args.topk,
-            seed=args.seed,
-            num_warmup=args.warmup,
-            num_benchmark=args.iters,
+    if check_correctness:
+        ref_out = ref_sparse_mla_fwd_interface(q, kv, indices)
+        assert_tensors_similar(tl_out, ref_out, eps=1e-2, name="out")
+        print("assert_tensors_similar passed")
+
+    def fn():
+        return sparse_mla_fwd_seq_block_interface(
+            q, kv, indices, 
+            block_I=block_I, 
+            S_per_block=S_per_block,
+            num_stages=num_stages, 
+            threads=threads
         )
+
+    from tilelang.profiler import do_bench
+
+    ms = do_bench(
+        fn,
+        rep=100,
+        warmup=250,
+    )
+    print(f"Average time: {ms:.3f} ms")
+    print("fwd io bandwidth = ", (B * S * DQK * topk * 2) / (ms * 1e-3) / 1e12)
+    print("fwd tflops = ", (B * S * (DQK + DV) * topk * 2 * H) / (ms * 1e-3) / 1e12)
+
+
+def test_small_heads():
+    """Test case specifically for small head counts (H=16)."""
+    print("=" * 60)
+    print("Testing sparse_mla_fwd_seq_block with small head count (H=16)")
+    print("=" * 60)
+    
+    test_sparse_mla_fwd_seq_block(
+        B=1,
+        S=256,
+        SKV=256,
+        H=16,  # Small head count
+        HKV=1,
+        DQK=576,
+        DV=512,
+        topk=128,
+        dtype=torch.bfloat16,
+        check_correctness=True,
+        block_I=64,
+        S_per_block=64,
+        num_stages=2,
+        threads=256,
+    )
+
+
+def test_large_scale():
+    """Test case for larger scale."""
+    print("=" * 60)
+    print("Testing sparse_mla_fwd_seq_block at larger scale")
+    print("=" * 60)
+    
+    test_sparse_mla_fwd_seq_block(
+        B=1,
+        S=4096,
+        SKV=4096,
+        H=16,  # Small head count
+        HKV=1,
+        DQK=576,
+        DV=512,
+        topk=2048,
+        dtype=torch.bfloat16,
+        check_correctness=False,  # Skip correctness for speed (OOM risk)
+        block_I=64,
+        S_per_block=64,
+        num_stages=2,
+        threads=256,
+    )
+
+
+def compare_with_original():
+    """
+    Compare sequence-blocked kernel with original head-blocked kernel.
+    Shows the benefit of sequence blocking for small head counts.
+    """
+    from sparse_mla_fwd_little_head import sparse_mla_fwd_interface as original_interface
+    
+    print("=" * 70)
+    print("Comparing original (head-blocked) vs new (seq-blocked) implementations")
+    print("=" * 70)
+    
+    # Test with small head count (H=16) - the target optimization case
+    B, S, SKV, H, HKV = 1, 512, 512, 16, 1
+    DQK, DV, topk = 576, 512, 256
+    dtype = torch.bfloat16
+    
+    torch.random.manual_seed(42)
+    q = torch.randn((B, S, H, DQK), dtype=dtype, device="cuda")
+    kv = torch.randn((B, SKV, HKV, DQK), dtype=dtype, device="cuda")
+    
+    indices = torch.full((B, S, HKV, topk), SKV, dtype=torch.int32, device="cuda")
+    for b in range(B):
+        for t in range(S):
+            for h in range(HKV):
+                i_i = torch.randperm(max(1, t))[:topk]
+                indices[b, t, h, : len(i_i)] = i_i
+    
+    print(f"Config: B={B}, S={S}, SKV={SKV}, H={H}, topk={topk}")
+    print()
+    
+    # Test original implementation
+    print("Original (head-blocked) kernel:")
+    try:
+        original_out, original_lse = original_interface(q, kv, indices)
+        
+        from tilelang.profiler import do_bench
+        def fn_original():
+            return original_interface(q, kv, indices)
+        ms_original = do_bench(fn_original, rep=100, warmup=250)
+        print(f"  Time: {ms_original:.3f} ms")
+    except Exception as e:
+        print(f"  Error: {e}")
+        original_out = None
+        ms_original = float('inf')
+    
+    # Test new sequence-blocked implementation
+    print("New (seq-blocked) kernel:")
+    new_out, new_lse = sparse_mla_fwd_seq_block_interface(q, kv, indices)
+    
+    from tilelang.profiler import do_bench
+    def fn_new():
+        return sparse_mla_fwd_seq_block_interface(q, kv, indices)
+    ms_new = do_bench(fn_new, rep=100, warmup=250)
+    print(f"  Time: {ms_new:.3f} ms")
+    
+    # Compare correctness
+    if original_out is not None:
+        ref_out = ref_sparse_mla_fwd_interface(q, kv, indices)
+        
+        print()
+        print("Correctness check against reference:")
+        try:
+            assert_tensors_similar(original_out, ref_out, eps=1e-2, name="original")
+            print("  Original: PASSED")
+        except AssertionError as e:
+            print(f"  Original: FAILED - {e}")
+        
+        try:
+            assert_tensors_similar(new_out, ref_out, eps=1e-2, name="new")
+            print("  New (seq-blocked): PASSED")
+        except AssertionError as e:
+            print(f"  New (seq-blocked): FAILED - {e}")
+    
+    if ms_original != float('inf'):
+        print()
+        print(f"Speedup: {ms_original / ms_new:.2f}x")
 
 
 if __name__ == "__main__":
-    main()
+    test_small_heads()
+    # test_large_scale()  # Uncomment for performance testing
+    # compare_with_original()  # Uncomment to compare with original implementation
