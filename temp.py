@@ -1,709 +1,468 @@
-# ruff: noqa
-"""
-Sparse MLA Forward with Sequence Blocking
+#include "fwd.h"
 
-Optimization: Instead of blocking by heads (H_per_block), we block by sequence (S_per_block).
-This maintains high register and shared memory utilization even with small head counts.
+#include <math_constants.h>
+#include <cute/tensor.hpp>
+#include <cutlass/cluster_launch.hpp>
+#include <cooperative_groups.h>
+#include <cutlass/arch/reg_reconfig.h>
+#include <cutlass/arch/arch.h>
 
-Key changes:
-- Q_shared: [S_per_block, D] instead of [H_per_block, D]
-- Pre-computed mask matrix handles different indices for different sequence positions
-- For each seq block, use the last position's indices as superset
-- Mask ensures correctness by filtering valid (seq_pos, kv_idx) pairs
-"""
-import torch
-import tilelang
-from tilelang import language as T
-from utils import assert_tensors_similar
+#include "utils.h"
+#include "helpers.h"
 
+namespace sm90 {
 
-def prepare_block_indices_and_mask(
-    indices: torch.Tensor,
-    seq_len: int,
-    S_per_block: int,
-    block_I: int,
-):
-    """
-    Prepare indices and mask for sequence-blocked processing.
+using namespace cute;
+
+constexpr int D_Q = 576;
+constexpr int D_K = 576;
+
+constexpr int B_H = 64;
+constexpr int B_TOPK = 64;    // TopK block size
+constexpr int NUM_THREADS = 128*3;
+
+template<int NUM_TILES>
+using SmemLayoutQTiles = decltype(coalesce(tile_to_shape(
+    GMMA::Layout_K_SW128_Atom<bf16>{},
+    Shape<Int<B_H>, Int<64*NUM_TILES>>{},
+    Step<_1, _2>{}
+), Shape<_1, _1>{}));
+
+template<int NUM_TILES>
+using SmemLayoutKTiles = decltype(coalesce(tile_to_shape(
+    GMMA::Layout_SW128_Atom<bf16, GMMA::Major::K>{},
+    Shape<Int<B_TOPK>, Int<64*NUM_TILES>>{},
+    Step<_1, _2>{}
+), Shape<_1, _1>{}));
+
+using SmemLayoutQ = SmemLayoutQTiles<9>;
+using SmemLayoutK = SmemLayoutKTiles<9>;
+
+// Simplified SharedMemoryPlan for attn_dist kernel
+struct AttnDistSharedMemoryPlan {
+    array_aligned<bf16, cosize_v<SmemLayoutQ>> q;
+    array_aligned<bf16, cosize_v<SmemLayoutK>> k[2];
+
+    bool is_kv_valid[2][B_TOPK];
     
-    For each seq block, use the indices from the last position in the block.
-    Generate mask to handle causality and valid topk membership.
+    // Head dimension reduction buffer
+    float attn_dist_reduce[2][B_TOPK];  // [warpgroup_idx][topk_position]
     
-    Args:
-        indices: [B, S, G, topk] - original per-position topk indices
-        seq_len: actual sequence length
-        S_per_block: number of sequence positions per block (e.g., 64)
-        block_I: KV block size (e.g., 64)
-    
-    Returns:
-        block_indices: [B, num_seq_blocks, G, topk] - indices for each seq block
-        block_mask: [B, num_seq_blocks, G, NI, S_per_block, BI] - mask for each (seq_pos, kv_idx) pair
-    """
-    B, S, G, topk = indices.shape
-    num_seq_blocks = (seq_len + S_per_block - 1) // S_per_block
-    BI = block_I
-    NI = topk // BI
-    
-    device = indices.device
-    
-    # For each seq block, use the last position's indices as superset
-    # This ensures we have all KV positions that any position in the block might need
-    block_indices = torch.zeros(B, num_seq_blocks, G, topk, dtype=indices.dtype, device=device)
-    
-    for sb in range(num_seq_blocks):
-        # Last position in this block (or the actual last position if block is partial)
-        last_pos = min((sb + 1) * S_per_block - 1, seq_len - 1)
-        block_indices[:, sb, :, :] = indices[:, last_pos, :, :]
-    
-    # Generate mask: [B, num_seq_blocks, G, NI, S_per_block, BI]
-    # mask[b, sb, g, ni, si, bi] = True if:
-    #   1. kv_idx <= real_seq_pos (causal constraint)
-    #   2. kv_idx is in the original topk for this seq pos (validity constraint)
-    block_mask = torch.zeros(
-        B, num_seq_blocks, G, NI, S_per_block, BI, 
-        dtype=torch.bool, device=device
-    )
-    
-    for b in range(B):
-        for sb in range(num_seq_blocks):
-            for g in range(G):
-                for ni in range(NI):
-                    for si in range(S_per_block):
-                        real_seq_pos = sb * S_per_block + si
-                        if real_seq_pos >= seq_len:
-                            # Out of bounds, mask should be False (already initialized)
-                            continue
-                        
-                        # Get original topk indices for this seq position
-                        original_topk_set = set(indices[b, real_seq_pos, g, :].tolist())
-                        
-                        for bi in range(BI):
-                            kv_idx = block_indices[b, sb, g, ni * BI + bi].item()
-                            
-                            # Causal constraint: can only attend to positions <= current
-                            is_causal_valid = kv_idx <= real_seq_pos
-                            
-                            # Validity constraint: kv_idx must be in original topk
-                            is_in_original_topk = kv_idx in original_topk_set
-                            
-                            block_mask[b, sb, g, ni, si, bi] = is_causal_valid and is_in_original_topk
-    
-    return block_indices, block_mask
+    // Barriers
+    transac_bar_t bar_q, bar_k0_free[2], bar_k0_ready[2], bar_k1_free[2], bar_k1_ready[2], bar_is_kv_valid_ready;
+};
+
+using TiledMMA_QK = decltype(make_tiled_mma(
+    GMMA::MMA_64x64x16_F32BF16BF16_SS<GMMA::Major::K, GMMA::Major::K>{},
+    Layout<Shape<_1, _1, _1>>{}
+));
+
+template<
+    typename Shape_Q, typename TMA_Q
+>
+struct AttnDistTmaParams {
+    Shape_Q shape_Q; TMA_Q tma_Q;
+};
+
+enum NamedBarriers : uint32_t {
+    warpgroup0_sync = 0,
+    warpgroup1_sync = 1
+};
 
 
-def prepare_block_indices_and_mask_fast(
-    indices: torch.Tensor,
-    seq_len: int,
-    S_per_block: int,
-    block_I: int,
-):
-    """
-    Vectorized version of prepare_block_indices_and_mask for better performance.
+template<typename TmaParams>
+__global__ void __launch_bounds__(NUM_THREADS, 1, 1)
+attn_dist_kernel(__grid_constant__ const AttnDistParams params, __grid_constant__ const TmaParams tma_params) {
+#if IS_SM90
+    const int q_h_idx = blockIdx.x % (params.h_q/B_H);
+    const int s_q_idx = blockIdx.x / (params.h_q/B_H);
+    const int warpgroup_idx = cutlass::canonical_warp_group_idx();
+    const int warp_idx = cutlass::canonical_warp_idx_sync();
+    const int idx_in_warpgroup = threadIdx.x % 128;
+
+    // Define shared tensors
+    extern __shared__ char wksp_buf[];
+    AttnDistSharedMemoryPlan &plan = *reinterpret_cast<AttnDistSharedMemoryPlan*>(wksp_buf);
+    Tensor sQ = make_tensor(make_smem_ptr(plan.q.data()), SmemLayoutQ{});
+
+    if (warp_idx == 0 && elect_one_sync()) {
+        // Prefetch TMA descriptors
+        cute::prefetch_tma_descriptor(tma_params.tma_Q.get_tma_descriptor());
+
+        // Initialize barriers
+        plan.bar_q.init(1);
+        CUTE_UNROLL
+        for (int i = 0; i < 2; ++i) {
+            plan.bar_k0_free[i].init(128);
+            plan.bar_k0_ready[i].init(128);
+            plan.bar_k1_free[i].init(128);
+            plan.bar_k1_ready[i].init(128);
+        }
+        plan.bar_is_kv_valid_ready.init(16);
+        
+        // Initialize reduction buffers to zero
+        CUTE_UNROLL
+        for (int wg = 0; wg < 2; ++wg) {
+            CUTE_UNROLL
+            for (int i = 0; i < B_TOPK; ++i) {
+                plan.attn_dist_reduce[wg][i] = 0.0f;
+            }
+        }
+        
+        fence_barrier_init();
+    }
+
+    __syncthreads();
     
-    Args:
-        indices: [B, S, G, topk] - original per-position topk indices
-        seq_len: actual sequence length
-        S_per_block: number of sequence positions per block (e.g., 64)
-        block_I: KV block size (e.g., 64)
-    
-    Returns:
-        block_indices: [B, num_seq_blocks, G, topk] - indices for each seq block
-        block_mask: [B, num_seq_blocks, G, NI, S_per_block, BI] - mask for each (seq_pos, kv_idx) pair
-    """
-    B, S, G, topk = indices.shape
-    num_seq_blocks = (seq_len + S_per_block - 1) // S_per_block
-    BI = block_I
-    NI = topk // BI
-    
-    device = indices.device
-    
-    # Pad indices if needed
-    padded_S = num_seq_blocks * S_per_block
-    if padded_S > S:
-        # Pad with the last valid position's indices
-        indices_padded = torch.zeros(B, padded_S, G, topk, dtype=indices.dtype, device=device)
-        indices_padded[:, :S, :, :] = indices
-        indices_padded[:, S:, :, :] = indices[:, S-1:S, :, :]
-    else:
-        indices_padded = indices
-    
-    # Reshape indices to [B, num_seq_blocks, S_per_block, G, topk]
-    indices_reshaped = indices_padded.view(B, num_seq_blocks, S_per_block, G, topk)
-    
-    # For each seq block, use the last position's indices
-    # block_indices: [B, num_seq_blocks, G, topk]
-    block_indices = indices_reshaped[:, :, -1, :, :]  # Use last position in each block
-    
-    # Reshape block_indices for broadcasting: [B, num_seq_blocks, G, NI, 1, BI]
-    block_indices_expanded = block_indices.view(B, num_seq_blocks, G, NI, 1, BI)
-    
-    # Create real_seq_pos tensor: [num_seq_blocks, S_per_block]
-    seq_block_offsets = torch.arange(num_seq_blocks, device=device) * S_per_block
-    seq_pos_in_block = torch.arange(S_per_block, device=device)
-    real_seq_pos = seq_block_offsets.view(-1, 1) + seq_pos_in_block.view(1, -1)  # [num_seq_blocks, S_per_block]
-    real_seq_pos = real_seq_pos.view(1, num_seq_blocks, 1, 1, S_per_block, 1)  # [1, num_seq_blocks, 1, 1, S_per_block, 1]
-    
-    # Causal mask: kv_idx <= real_seq_pos
-    # block_indices_expanded: [B, num_seq_blocks, G, NI, 1, BI]
-    # real_seq_pos: [1, num_seq_blocks, 1, 1, S_per_block, 1]
-    causal_mask = block_indices_expanded <= real_seq_pos  # [B, num_seq_blocks, G, NI, S_per_block, BI]
-    
-    # Validity mask: kv_idx must be in original topk for this seq pos
-    # This is more complex - need to check membership
-    # indices_reshaped: [B, num_seq_blocks, S_per_block, G, topk]
-    # block_indices_expanded: [B, num_seq_blocks, G, NI, 1, BI]
-    
-    # For each (sb, si), check if each kv_idx is in indices[b, sb, si, g, :]
-    # Reshape for comparison:
-    # original_indices: [B, num_seq_blocks, S_per_block, G, topk] -> [B, num_seq_blocks, 1, S_per_block, G, topk]
-    original_indices = indices_reshaped.unsqueeze(2)  # [B, num_seq_blocks, 1, S_per_block, G, topk]
-    original_indices = original_indices.permute(0, 1, 4, 2, 3, 5)  # [B, num_seq_blocks, G, 1, S_per_block, topk]
-    
-    # block_indices for comparison: [B, num_seq_blocks, G, NI*BI] -> [B, num_seq_blocks, G, NI*BI, 1, 1]
-    block_indices_flat = block_indices.view(B, num_seq_blocks, G, NI * BI, 1, 1)
-    
-    # Compare: is block_indices_flat[..., k, :, :] in original_indices[..., s, :]?
-    # This creates a [B, num_seq_blocks, G, NI*BI, S_per_block, topk] tensor - too large!
-    # Need a smarter approach
-    
-    # Alternative: use torch.isin per position (still not great but works)
-    validity_mask = torch.zeros(B, num_seq_blocks, G, NI, S_per_block, BI, dtype=torch.bool, device=device)
-    
-    for sb in range(num_seq_blocks):
-        for si in range(S_per_block):
-            real_pos = sb * S_per_block + si
-            if real_pos >= seq_len:
-                continue
-            # original topk for this position: [B, G, topk]
-            orig_topk = indices[:, real_pos, :, :]  # [B, G, topk]
-            # block indices for this block: [B, G, topk]
-            blk_idx = block_indices[:, sb, :, :]  # [B, G, topk]
+    const int num_topk_blocks = params.topk / B_TOPK;
+    if (warpgroup_idx == 0 || warpgroup_idx == 1) {
+        cutlass::arch::warpgroup_reg_alloc<216>();
+
+        if (warp_idx == 0 && elect_one_sync()) {
+            // Load Q
+            Tensor gQ = flat_divide(
+                tma_params.tma_Q.get_tma_tensor(tma_params.shape_Q)(_, _, s_q_idx),
+                Tile<Int<B_H>, Int<D_Q>>{}
+            )(_, _, q_h_idx, _0{});
+            launch_tma_copy(tma_params.tma_Q, gQ, sQ, plan.bar_q, TMA::CacheHintSm90::EVICT_FIRST);
+            plan.bar_q.arrive_and_expect_tx(B_H*D_Q*sizeof(bf16));
+        }
+
+        Tensor rP = partition_fragment_C(TiledMMA_QK{}, Shape<Int<B_H>, Int<B_TOPK>>{});
+        
+        // Load LSE values for this thread's rows
+        float lse_local[2];
+        CUTE_UNROLL
+        for (int row_idx = 0; row_idx < 2; ++row_idx) {
+            int real_row = get_AorC_row_idx(row_idx, idx_in_warpgroup);
+            int global_head = q_h_idx * B_H + real_row;
+            lse_local[row_idx] = params.lse[s_q_idx * params.h_q + global_head];
+        }
+        
+        // Wait for Q
+        plan.bar_q.wait(0);
+
+        bool cur_bar_wait_phase = 0;
+        
+        struct Warpgroup0 {};
+        struct Warpgroup1 {};
+
+        auto qkt_gemm_one_tile = [&](auto warpgroup_idx, int tile_idx, bool clear_accum) {
+            constexpr bool IS_WG1 = std::is_same_v<decltype(warpgroup_idx), Warpgroup1>;
+            TiledMMA tiled_mma_QK = TiledMMA_QK{};
+            Tensor sQ_tile = flat_divide(sQ, Tile<Int<B_H>, Int<64>>{})(_, _, _0{}, tile_idx);
+            Tensor sK_tile = make_tensor(make_smem_ptr(plan.k[(int)IS_WG1].data() + tile_idx*B_TOPK*64), SmemLayoutKTiles<1>{});
+            gemm_ss(clear_accum, tiled_mma_QK, sQ_tile, sK_tile, rP, idx_in_warpgroup);
+        };
+
+        // Compute normalized attention probability: attn_prob = exp2(rP * sm_scale - lse)
+        auto compute_normalized_attn_prob = [&](auto warpgroup_idx) {
+            constexpr bool IS_WG1 = std::is_same_v<decltype(warpgroup_idx), Warpgroup1>;
+            plan.bar_is_kv_valid_ready.wait(cur_bar_wait_phase);
+            const float scale = params.sm_scale_div_log2;
             
-            # Check membership: blk_idx in orig_topk
-            # For each (b, g, k), check if blk_idx[b, g, k] is in orig_topk[b, g, :]
-            for b in range(B):
-                for g in range(G):
-                    orig_set = set(orig_topk[b, g, :].tolist())
-                    for ni in range(NI):
-                        for bi in range(BI):
-                            kv_idx = blk_idx[b, g, ni * BI + bi].item()
-                            validity_mask[b, sb, g, ni, si, bi] = kv_idx in orig_set
-    
-    # Combine masks
-    block_mask = causal_mask & validity_mask
-    
-    # Handle out-of-bounds positions
-    for sb in range(num_seq_blocks):
-        for si in range(S_per_block):
-            real_pos = sb * S_per_block + si
-            if real_pos >= seq_len:
-                block_mask[:, sb, :, :, si, :] = False
-    
-    return block_indices, block_mask
+            CUTE_UNROLL
+            for (int row_idx = 0; row_idx < 2; ++row_idx) {
+                CUTE_UNROLL
+                for (int i = row_idx*2; i < size(rP); i += 4) {
+                    int col = 8*(i/4) + (idx_in_warpgroup%4)*2;
+                    // Apply mask and compute normalized attention probability
+                    float p0 = plan.is_kv_valid[IS_WG1][col] ? 
+                               exp2f(rP(i) * scale - lse_local[row_idx]) : 0.0f;
+                    float p1 = plan.is_kv_valid[IS_WG1][col+1] ? 
+                               exp2f(rP(i+1) * scale - lse_local[row_idx]) : 0.0f;
+                    rP(i) = p0;
+                    rP(i+1) = p1;
+                }
+            }
+        };
 
-
-@tilelang.jit(
-    out_idx=[-2, -1],
-    pass_configs={
-        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-    },
-)
-def sparse_mla_fwd_seq_block(
-    heads,
-    dim,
-    tail_dim,
-    topk,
-    kv_group=1,
-    sm_scale=None,
-    is_causal=True,
-    CP0=True,
-    block_I=64,
-    S_per_block=64,
-    num_stages=2,
-    threads=256,
-):
-    """
-    Sparse MLA Forward kernel with sequence blocking.
-    
-    Instead of blocking by heads, we block by sequence positions.
-    This maintains high resource utilization even with small head counts.
-    """
-    assert dim == tilelang.math.next_power_of_2(dim), f"haven't check padding correctness yet, dim={dim}"
-    assert tail_dim == tilelang.math.next_power_of_2(tail_dim), f"haven't check padding correctness yet, dim={tail_dim}"
-    assert is_causal == True, "non-casual is not supported"
-    assert topk % block_I == 0, "otherwise will load some index=0 thus causing wrong kv to be loaded"
-    
-    if sm_scale is None:
-        sm_scale = (1.0 / (dim + tail_dim)) ** 0.5 * 1.44269504  # log2(e)
-    else:
-        sm_scale = sm_scale * 1.44269504  # log2(e)
-
-    batch = T.dynamic("batch")
-    seq_len = T.dynamic("seq_len")
-    seq_len_kv = T.dynamic("seq_len_kv")
-    num_seq_blocks = T.dynamic("num_seq_blocks")
-
-    head_kv = heads // kv_group
-    H = heads
-    G = kv_group
-    
-    # Shapes
-    q_shape = [batch, seq_len, heads, dim + tail_dim]
-    kv_shape = [batch, seq_len_kv, kv_group, dim + tail_dim]
-    o_shape = [batch, seq_len, heads, dim]
-    lse_shape = [batch, seq_len, heads]
-    
-    # New: block indices and mask shapes
-    block_indices_shape = [batch, num_seq_blocks, kv_group, topk]
-    block_mask_shape = [batch, num_seq_blocks, kv_group, topk // block_I, S_per_block, block_I]
-    
-    indices_dtype = T.int32
-    dtype = T.bfloat16
-    accum_dtype = T.float32
-
-    BI = block_I
-    NI = tilelang.cdiv(topk, block_I)
-    D = dim
-    D_tail = tail_dim
-    S_blk = S_per_block
-
-    # Padded output shapes for kernel (uses padded seq_len = num_seq_blocks * S_per_block)
-    padded_seq_len = num_seq_blocks * S_per_block
-    o_shape_padded = [batch, padded_seq_len, heads, dim]
-    lse_shape_padded = [batch, padded_seq_len, heads]
-
-    @T.prim_func
-    def main(
-        Q: T.Tensor(q_shape, dtype),  # type: ignore - [batch, padded_seq_len, heads, dim+tail_dim]
-        KV: T.Tensor(kv_shape, dtype),  # type: ignore
-        BlockIndices: T.Tensor(block_indices_shape, indices_dtype),  # type: ignore  # Pre-computed block indices
-        BlockMask: T.Tensor(block_mask_shape, "bool"),  # type: ignore  # Pre-computed mask
-        Output: T.Tensor(o_shape_padded, dtype),  # type: ignore - [batch, padded_seq_len, heads, dim]
-        Lse: T.Tensor(lse_shape_padded, accum_dtype),  # type: ignore - [batch, padded_seq_len, heads]
-    ):
-        # Grid: (num_seq_blocks, batch, heads)
-        # Each block processes S_per_block sequence positions for one head
-        with T.Kernel(num_seq_blocks, batch, heads, threads=threads) as (
-            bx,
-            by,
-            bz,
-        ):
-            # Shared memory allocations - now S_per_block instead of H_per_block
-            Q_shared = T.alloc_shared([S_blk, D], dtype)
-            Q_tail_shared = T.alloc_shared([S_blk, D_tail], dtype)
-            KV_shared = T.alloc_shared([BI, D], dtype)
-            K_tail_shared = T.alloc_shared([BI, D_tail], dtype)
-            O_shared = T.alloc_shared([S_blk, D], dtype)
-            Lse_shared = T.alloc_shared([S_blk], accum_dtype)
-            Mask_shared = T.alloc_shared([S_blk, BI], "bool")
+        // Reduce over heads and store to global memory
+        auto reduce_heads_and_store = [&](int block_idx, int wg_idx) {
+            // Step 1: Each thread sums its 2 rows (8 rows apart) for each column
+            // rP layout: every 4 elements form a group, 0,1 belong to row0's two columns, 2,3 belong to row1's same two columns
+            float local_sum[16];  // 16 column positions partial sums
+            CUTE_UNROLL
+            for (int col_local = 0; col_local < 8; ++col_local) {
+                int i_row0 = col_local * 4;      // row 0's element start
+                int i_row1 = col_local * 4 + 2;  // row 1's element start
+                local_sum[col_local * 2] = rP(i_row0) + rP(i_row1);          // column 0
+                local_sum[col_local * 2 + 1] = rP(i_row0 + 1) + rP(i_row1 + 1);  // column 1
+            }
+            // Now: each thread holds 16 columns' partial sums (2 rows merged)
             
-            # Fragment allocations
-            acc_o = T.alloc_fragment([S_blk, D], accum_dtype)
-            acc_s = T.alloc_fragment([S_blk, BI], accum_dtype)
-            S_shared = T.alloc_shared([S_blk, BI], dtype)
-            sumexp = T.alloc_fragment([S_blk], accum_dtype)
-            sumexp_i = T.alloc_fragment([S_blk], accum_dtype)
-            alpha = T.alloc_fragment([S_blk], accum_dtype)
-            m_i = T.alloc_fragment([S_blk], accum_dtype)
-            m_i_prev = T.alloc_fragment([S_blk], accum_dtype)
+            // Step 2: Warp-level column reduction (different rows of the same column)
+            // Threads t and t^4, t^8, t^16 hold same column's different row data
+            // shfl_xor(4), shfl_xor(8), shfl_xor(16) merge 8 thread groups within warp
+            CUTE_UNROLL
+            for (int i = 0; i < 16; ++i) {
+                local_sum[i] += __shfl_xor_sync(0xffffffff, local_sum[i], 4);
+                local_sum[i] += __shfl_xor_sync(0xffffffff, local_sum[i], 8);
+                local_sum[i] += __shfl_xor_sync(0xffffffff, local_sum[i], 16);
+            }
+            // Now: all 32 threads in warp hold same 16 rows' sum (but hold different columns)
+            // Note: each thread still only knows its responsible 16 columns
+            
+            // Step 3: Cross-warp reduction - 4 warps each hold different 16 rows
+            // After shfl_xor(4,8,16), every 4 threads within warp hold same data
+            // So each warp only needs first 4 threads (idx_in_warpgroup % 32 < 4) to write
+            // 4 warps x 4 threads = 16 threads write, each thread writes 16 columns
+            //
+            // atomicAdd: 4 warps each contribute 16 rows' sum, finally accumulate to 64 rows' total sum
+            if (idx_in_warpgroup % 32 < 4) {
+                CUTE_UNROLL
+                for (int i = 0; i < 16; ++i) {
+                    int col_idx = 8 * (i / 2) + (idx_in_warpgroup % 4) * 2 + (i % 2);
+                    atomicAdd(&plan.attn_dist_reduce[wg_idx][col_idx], local_sum[i]);
+                }
+            }
+            
+            // Warpgroup sync - wait for all 4 warps to complete writing
+            fence_view_async_shared();
+            NamedBarrier::arrive_and_wait(128, wg_idx ? NamedBarriers::warpgroup1_sync : NamedBarriers::warpgroup0_sync);
+            
+            // Step 4: Write to global memory (each thread writes one element)
+            if (idx_in_warpgroup < B_TOPK) {
+                int out_idx = q_h_idx * (params.s_q * params.topk) + 
+                              s_q_idx * params.topk + 
+                              block_idx * B_TOPK + idx_in_warpgroup;
+                params.attn_sum[out_idx] = plan.attn_dist_reduce[wg_idx][idx_in_warpgroup];
+                // Clear for next round
+                plan.attn_dist_reduce[wg_idx][idx_in_warpgroup] = 0.0f;
+            }
+            
+            // Sync again to ensure clear is complete before next iteration
+            NamedBarrier::arrive_and_wait(128, wg_idx ? NamedBarriers::warpgroup1_sync : NamedBarriers::warpgroup0_sync);
+        };
 
-            T.fill(acc_o, 0)
-            T.fill(sumexp, 0)
-            T.fill(m_i, -(2**30))  # avoid -inf - inf to cause nan
 
-            b_i = by  # batch index
-            sb_i = bx  # seq block index
-            h_i = bz  # head index
-            g_i = h_i // (H // G)  # kv group index
+        if (warpgroup_idx == 0) {
+            // Warpgroup 0 - handles even topk blocks (block_idx = 0, 2, 4, ...)
 
-            # Compute sequence range for this block
-            S0 = sb_i * S_blk
+            auto pipelined_wait_and_qkt_gemm_l = [&]() __attribute__((always_inline)) {
+                plan.bar_k0_ready[0].wait(cur_bar_wait_phase);
+                qkt_gemm_one_tile(Warpgroup0{}, 0, true);
+                qkt_gemm_one_tile(Warpgroup0{}, 1, false);
+                qkt_gemm_one_tile(Warpgroup0{}, 2, false);
+                qkt_gemm_one_tile(Warpgroup0{}, 3, false);
+                warpgroup_commit_batch();
+            };
 
-            # Load Q for this seq block and head
-            # Q: [batch, padded_seq_len, heads, dim+tail_dim]
-            # We need Q[b_i, S0:S0+S_blk, h_i, :]
-            for s_i, d_i in T.Parallel(S_blk, D):
-                Q_shared[s_i, d_i] = Q[b_i, S0 + s_i, h_i, d_i]
-            for s_i, d_i in T.Parallel(S_blk, D_tail):
-                Q_tail_shared[s_i, d_i] = Q[b_i, S0 + s_i, h_i, D + d_i]
-
-            for i_i in T.Pipelined(NI, num_stages=num_stages):
-                # Load pre-computed mask for this (seq_block, kv_block)
-                # BlockMask: [batch, num_seq_blocks, kv_group, NI, S_per_block, BI]
-                for s_i, bi_i in T.Parallel(S_blk, BI):
-                    Mask_shared[s_i, bi_i] = BlockMask[b_i, sb_i, g_i, i_i, s_i, bi_i]
-
-                # Load KV using block indices
-                # BlockIndices: [batch, num_seq_blocks, kv_group, topk]
-                for bi_i, d_i in T.Parallel(BI, D):
-                    KV_shared[bi_i, d_i] = KV[b_i, BlockIndices[b_i, sb_i, g_i, i_i * BI + bi_i], g_i, d_i]
-                for bi_i, d_i in T.Parallel(BI, D_tail):
-                    K_tail_shared[bi_i, d_i] = KV[b_i, BlockIndices[b_i, sb_i, g_i, i_i * BI + bi_i], g_i, D + d_i]
-
-                # Apply mask to acc_s initialization
-                for s_i, bi_i in T.Parallel(S_blk, BI):
-                    acc_s[s_i, bi_i] = T.if_then_else(Mask_shared[s_i, bi_i], 0, -T.infinity(acc_s.dtype))
+            auto pipelined_wait_and_qkt_gemm_r = [&]() __attribute__((always_inline)) {
+                plan.bar_k0_ready[1].wait(cur_bar_wait_phase);
+                qkt_gemm_one_tile(Warpgroup0{}, 4, false);
+                qkt_gemm_one_tile(Warpgroup0{}, 5, false);
+                qkt_gemm_one_tile(Warpgroup0{}, 6, false);
+                qkt_gemm_one_tile(Warpgroup0{}, 7, false);
+                qkt_gemm_one_tile(Warpgroup0{}, 8, false);
+                warpgroup_commit_batch();
+            };
+            
+            CUTE_NO_UNROLL
+            for (int block_idx = 0; block_idx < num_topk_blocks; block_idx += 2) {
+                if (block_idx == 0) {
+                    // First iteration: wait and compute QK GEMM
+                    pipelined_wait_and_qkt_gemm_l();
+                    pipelined_wait_and_qkt_gemm_r();
+                    warpgroup_wait<0>();
+                }
                 
-                # Q @ K^T
-                T.gemm(
-                    Q_shared,
-                    KV_shared,
-                    acc_s,
-                    transpose_B=True,
-                    policy=T.GemmWarpPolicy.FullRow,
-                )
-                T.gemm(
-                    Q_tail_shared,
-                    K_tail_shared,
-                    acc_s,
-                    transpose_B=True,
-                    policy=T.GemmWarpPolicy.FullRow,
-                )
+                // Compute normalized attention probability
+                compute_normalized_attn_prob(Warpgroup0{});
                 
-                # Online softmax update
-                T.copy(m_i, m_i_prev)
-                T.reduce_max(acc_s, m_i, dim=1, clear=False)
-                for s_i in T.Parallel(S_blk):
-                    m_i[s_i] = T.max(m_i[s_i], m_i_prev[s_i])
-                for s_i in T.Parallel(S_blk):
-                    alpha[s_i] = T.exp2((m_i_prev[s_i] - m_i[s_i]) * sm_scale)
-                for s_i, bi_i in T.Parallel(S_blk, BI):
-                    acc_s[s_i, bi_i] = T.exp2(acc_s[s_i, bi_i] * sm_scale - m_i[s_i] * sm_scale)
-                T.reduce_sum(acc_s, sumexp_i, dim=1)
-                for s_i in T.Parallel(S_blk):
-                    sumexp[s_i] = sumexp[s_i] * alpha[s_i] + sumexp_i[s_i]
-                for s_i, d_i in T.Parallel(S_blk, D):
-                    acc_o[s_i, d_i] = acc_o[s_i, d_i] * alpha[s_i]
+                // Reduce over heads and store
+                reduce_heads_and_store(block_idx, 0);
 
-                # S @ V
-                T.copy(acc_s, S_shared)
-                T.gemm(S_shared, KV_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
+                // Release K buffer
+                plan.bar_k0_free[0].arrive();
+                plan.bar_k0_free[1].arrive();
 
-            # Rescale output
-            for s_i, d_i in T.Parallel(S_blk, D):
-                acc_o[s_i, d_i] /= sumexp[s_i]
-            for s_i in T.Parallel(S_blk):
-                sumexp[s_i] = T.log2(sumexp[s_i]) + m_i[s_i] * sm_scale
+                cur_bar_wait_phase ^= 1;
 
-            # Store output
-            # Output: [batch, padded_seq_len, heads, dim]
-            T.copy(acc_o, O_shared)
-            for s_i, d_i in T.Parallel(S_blk, D):
-                Output[b_i, S0 + s_i, h_i, d_i] = O_shared[s_i, d_i]
-            T.copy(sumexp, Lse_shared)
-            for s_i in T.Parallel(S_blk):
-                Lse[b_i, S0 + s_i, h_i] = Lse_shared[s_i]
+                if (block_idx+2 < num_topk_blocks) {
+                    // Prefetch next QK GEMM
+                    pipelined_wait_and_qkt_gemm_l();
+                    pipelined_wait_and_qkt_gemm_r();
+                    warpgroup_wait<0>();
+                }
+            }
+        } else {
+            // Warpgroup 1 - handles odd topk blocks (block_idx = 1, 3, 5, ...)
 
-    return main
+            auto pipelined_wait_and_qkt_gemm = [&]() __attribute__((always_inline)) {
+                plan.bar_k1_ready[1].wait(cur_bar_wait_phase);
+                qkt_gemm_one_tile(Warpgroup1{}, 4, true);
+                qkt_gemm_one_tile(Warpgroup1{}, 5, false);
+                qkt_gemm_one_tile(Warpgroup1{}, 6, false);
+                qkt_gemm_one_tile(Warpgroup1{}, 7, false);
+                qkt_gemm_one_tile(Warpgroup1{}, 8, false);
+                plan.bar_k1_ready[0].wait(cur_bar_wait_phase);
+                qkt_gemm_one_tile(Warpgroup1{}, 0, false);
+                qkt_gemm_one_tile(Warpgroup1{}, 1, false);
+                qkt_gemm_one_tile(Warpgroup1{}, 2, false);
+                qkt_gemm_one_tile(Warpgroup1{}, 3, false);
+                warpgroup_commit_batch();
+            };
+            
+            CUTE_NO_UNROLL
+            for (int block_idx = 0; block_idx < num_topk_blocks; block_idx += 2) {
+                // Issue rP = sQ @ sK1, and wait
+                pipelined_wait_and_qkt_gemm();
+                warpgroup_wait<0>();
 
+                // Compute normalized attention probability
+                compute_normalized_attn_prob(Warpgroup1{});
+                
+                // Reduce over heads and store (odd block)
+                reduce_heads_and_store(block_idx + 1, 1);
 
-def sparse_mla_fwd_seq_block_interface(
-    q, kv, indices, 
-    sm_scale=None, 
-    return_p_sum: bool = False, 
-    d_v=512, 
-    block_I=64, 
-    S_per_block=64,
-    num_stages=2, 
-    threads=256
-):
-    """
-    Interface function for sparse MLA forward with sequence blocking.
-    
-    This function:
-    1. Pre-computes block indices and mask in Python
-    2. Launches the kernel with pre-computed data
-    
-    Key optimization: Instead of blocking by heads (H_per_block), we block by sequence (S_per_block).
-    This maintains high register and shared memory utilization even with small head counts.
-    """
-    is_casual = True
-    assert return_p_sum == False, "This kernel file is for fwd only"
-    assert q.is_contiguous() and kv.is_contiguous() and indices.is_contiguous()
-    
-    batch, seq_len, heads, dim_plus_tail_dim = q.shape
-    _, seq_len_kv, kv_group, _ = kv.shape
+                // Release K buffer
+                plan.bar_k1_free[0].arrive();
+                plan.bar_k1_free[1].arrive();
 
-    assert dim_plus_tail_dim == 576, "you should assign dim otherwise"
-    dim = d_v
+                cur_bar_wait_phase ^= 1;
+            }
+        }
+    } else {
+        // Producer warpgroup
+        cutlass::arch::warpgroup_reg_dealloc<72>();
 
-    assert kv.shape[-1] == dim_plus_tail_dim
-    tail_dim = dim_plus_tail_dim - dim
-    assert kv.shape[0] == batch
-    _, _, _, topk = indices.shape
-    assert indices.shape == (batch, seq_len, kv_group, topk)
-    
-    # Store original seq_len for slicing output later
-    original_seq_len = seq_len
-    
-    # Ensure seq_len is divisible by S_per_block
-    num_seq_blocks = (seq_len + S_per_block - 1) // S_per_block
-    padded_seq_len = num_seq_blocks * S_per_block
-    
-    # Pad Q and indices if needed
-    if padded_seq_len > seq_len:
-        q_padded = torch.zeros(batch, padded_seq_len, heads, dim_plus_tail_dim, dtype=q.dtype, device=q.device)
-        q_padded[:, :seq_len, :, :] = q
-        q = q_padded
+        constexpr int GROUP_SIZE = 8, NUM_GROUPS = 128/GROUP_SIZE;
+        constexpr int NUM_ROWS_PER_GROUP = B_TOPK / NUM_GROUPS;
+        int idx_in_group = idx_in_warpgroup % GROUP_SIZE;
+        int group_idx = idx_in_warpgroup / GROUP_SIZE;
+        int* gIndices = params.indices + s_q_idx*params.topk;   // [topk]
+
+        bf16* my_sKV_base = &(make_tensor(make_smem_ptr(plan.k[0].data()), SmemLayoutKTiles<1>{})(group_idx, idx_in_group*8));
+        bf16* my_gKV_base = params.k + idx_in_group*8;
         
-        # Also pad indices - fill padding with last valid position's indices
-        indices_padded = torch.zeros(batch, padded_seq_len, kv_group, topk, dtype=indices.dtype, device=indices.device)
-        indices_padded[:, :seq_len, :, :] = indices
-        indices_padded[:, seq_len:, :, :] = indices[:, seq_len-1:seq_len, :, :]
-        indices = indices_padded
+        int64_t token_indices[2][NUM_ROWS_PER_GROUP];
+        bool is_token_valid[2][NUM_ROWS_PER_GROUP];
+        auto load_token_indices = [&](int block_idx) {
+            CUTE_UNROLL
+            for (int buf_idx = 0; buf_idx < 2; ++buf_idx) {
+                CUTE_UNROLL
+                for (int local_row = 0; local_row < NUM_ROWS_PER_GROUP; ++local_row) {
+                    int offs = (block_idx+buf_idx)*B_TOPK + local_row*NUM_GROUPS + group_idx;
+                    int t = __ldg(gIndices + offs);
+                    token_indices[buf_idx][local_row] = t*(int64_t)params.stride_k_s_kv;   // We mult it with params.stride_k_s_kv here since it's faster
+                    is_token_valid[buf_idx][local_row] = t >= 0 && t < params.s_kv;
+                }
+            }
+        };
         
-        seq_len = padded_seq_len  # Update for mask preparation
-    
-    # Prepare block indices and mask (use original_seq_len for validity checks)
-    block_indices, block_mask = prepare_block_indices_and_mask(
-        indices, original_seq_len, S_per_block, block_I
-    )
-    
-    # Create kernel
-    kernel = sparse_mla_fwd_seq_block(
-        heads, dim, tail_dim, topk, kv_group, sm_scale, is_casual,
-        block_I=block_I, S_per_block=S_per_block, num_stages=num_stages, threads=threads
-    )
-    
-    # Run kernel - kernel expects padded inputs and produces padded outputs
-    out, lse = kernel(q, kv, block_indices, block_mask)
-    
-    # Slice output to original seq_len
-    out = out[:, :original_seq_len, :, :]
-    lse = lse[:, :original_seq_len, :]
-    
-    return out, lse
+        int64_t cache_policy = createpolicy_evict_last();
+        auto copy_tiles = [&](int block_idx, int buf_idx, int tile_start, int tile_end) {
+            // Copy some K tiles from global memory to shared memory
+            // A tile has a shape of 64 (B_TOPK) x 64
+            // `buf_idx` is the index of the shared memory buffer, 0 or 1
+            // `tile_idx` is the index of the tile to load, from 0 to D_K/64-1 = 8
+            CUTE_UNROLL
+            for (int local_row = 0; local_row < NUM_ROWS_PER_GROUP; ++local_row) {
+                int64_t token_index = token_indices[buf_idx][local_row];
+                CUTE_UNROLL
+                for (int tile_idx = tile_start; tile_idx < tile_end; ++tile_idx) {
+                    cp_async_cacheglobal_l2_prefetch_256B(
+                        my_gKV_base + token_index + tile_idx*64,
+                        my_sKV_base + (buf_idx*B_TOPK*D_K + tile_idx*(B_TOPK*64) + local_row*NUM_GROUPS*64),
+                        is_token_valid[buf_idx][local_row],
+                        cache_policy
+                    );
+                }
+            }
+        };
+
+        auto commit_to_mbar = [&](transac_bar_t &bar) {
+            cutlass::arch::cpasync_barrier_arrive_noinc((uint64_t*)(&bar));
+        };
+
+        int cur_bar_wait_phase = 1;
+
+        CUTE_NO_UNROLL
+        for (int block_idx = 0; block_idx < num_topk_blocks; block_idx += 2) {
+            load_token_indices(block_idx);
+
+            // K0L (left half for WG0's even block)
+            plan.bar_k0_free[0].wait(cur_bar_wait_phase);
+            copy_tiles(block_idx+0, 0, 0, 4);
+            commit_to_mbar(plan.bar_k0_ready[0]);
+
+            // K1R (right half for WG1's odd block)
+            plan.bar_k1_free[1].wait(cur_bar_wait_phase);
+            copy_tiles(block_idx+1, 1, 4, 9);
+            commit_to_mbar(plan.bar_k1_ready[1]);
+            
+            // K0R (right half for WG0's even block)
+            plan.bar_k0_free[1].wait(cur_bar_wait_phase);
+            copy_tiles(block_idx+0, 0, 4, 9);
+            commit_to_mbar(plan.bar_k0_ready[1]);
+
+            // K1L (left half for WG1's odd block)
+            plan.bar_k1_free[0].wait(cur_bar_wait_phase);
+            copy_tiles(block_idx+1, 1, 0, 4);
+            commit_to_mbar(plan.bar_k1_ready[0]);
+
+            // Valid mask
+            if (idx_in_group == 0) {
+                CUTE_UNROLL
+                for (int buf_idx = 0; buf_idx < 2; ++buf_idx)
+                    CUTE_UNROLL
+                    for (int local_row = 0; local_row < NUM_ROWS_PER_GROUP; ++local_row)
+                        plan.is_kv_valid[buf_idx][local_row*NUM_GROUPS+group_idx] = is_token_valid[buf_idx][local_row];
+                plan.bar_is_kv_valid_ready.arrive();
+            }
+
+            cur_bar_wait_phase ^= 1;
+        }
+    }
+#else
+    if (cute::thread0()) {
+        CUTE_INVALID_CONTROL_PATH("This kernel only supports sm90");
+    }
+#endif
+}
 
 
-def ref_sparse_mla_fwd_interface(q, kv, indices, sm_scale=None, is_casual=True):
-    """Reference implementation for correctness checking."""
-    q = q.float()
-    kv = kv.float()
-    indices = indices.transpose(1, 2)
-    b, sq, h, dim_q = q.shape
-    b, sk, g, _ = kv.shape
+void run_attn_dist_kernel(const AttnDistParams& params) {
+    FLASH_ASSERT(params.h_kv == 1);
+    FLASH_ASSERT(params.topk % (2*B_TOPK) == 0);   // To save some boundary checkings
+    FLASH_ASSERT(params.topk > 0);
+    FLASH_ASSERT(params.h_q % B_H == 0);
 
-    assert kv.shape[-1] == 576, "you should assign dim otherwise"
-    dim = 512
-    k = kv
-    v = kv[..., :dim]
+    auto shape_Q = make_shape(params.h_q, params.d_qk, params.s_q);
+    auto tma_Q = cute::make_tma_copy(
+        SM90_TMA_LOAD{},
+        make_tensor(
+            make_gmem_ptr((bf16*)params.q),
+            make_layout(
+                shape_Q,
+                make_stride(params.stride_q_h_q, _1{}, params.stride_q_s_q)
+            )
+        ),
+        SmemLayoutQ{}
+    );
 
-    b, _, _, dim_v = v.shape
-    g_index = g
-    h_index = h // g
-    compressed_casual_mask = torch.arange(0, sq, dtype=torch.int32, device="cuda").view(-1, 1) >= torch.arange(
-        1 - 1, sk * 1, 1, dtype=torch.int32, device="cuda"
-    ).view(1, -1)
+    AttnDistTmaParams<
+        decltype(shape_Q), decltype(tma_Q)
+    > tma_params = {
+        shape_Q, tma_Q
+    };
+    auto kernel = &attn_dist_kernel<decltype(tma_params)>;
 
-    mask = q.new_zeros(b, g_index, sq, sk + 1, dtype=torch.bool).scatter(3, indices.long(), 1)
-    mask = mask[..., :-1]
-    mask = mask & compressed_casual_mask.view(1, 1, sq, sk)
-    mask[:, :, : 1 - 1, 0] = True
-    mask = mask.view(b, g_index, 1, sq, sk)
+    constexpr size_t smem_size = sizeof(AttnDistSharedMemoryPlan);
+    CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
-    q = q.view(b, sq, g, -1, dim_q)
-    score = torch.einsum("bmghd,bngd->bghmn", q, k)
-    sm_scale = dim_q**-0.5 if sm_scale is None else sm_scale
-    score = score.masked_fill(~mask, float("-inf")).mul(sm_scale)
-    p = score.softmax(dim=-1)
-    p = p.view(b, g_index, h_index, -1, sq, sk)
-    p = p.view(b, g, -1, sq, sk)
-    o = torch.einsum("bghmn,bngd->bmghd", p.type(v.dtype), v)
-    o = o.reshape(b, sq, h, dim_v)
-    return o.to(torch.bfloat16)
+    cutlass::ClusterLaunchParams launch_params = {
+        dim3((params.h_q/B_H)*params.s_q, 1, 1),    // NOTE We put s_q on the first dim since it can be larger than 65536 (the maximum size of griddim.y and griddim.z)
+        dim3(NUM_THREADS, 1, 1),
+        dim3(1, 1, 1),
+        smem_size,
+        params.stream
+    }; 
+    cutlass::launch_kernel_on_cluster(
+        launch_params, (void*)kernel, params, tma_params
+    );
+    CHECK_CUDA_KERNEL_LAUNCH();
+}
 
-
-def test_sparse_mla_fwd_seq_block(
-    B=1,
-    S=256,  # Start with smaller S for testing
-    SKV=256,
-    H=16,  # Small head count - the target use case
-    HKV=1,
-    DQK=576,
-    DV=512,
-    topk=128,  # Smaller topk for testing
-    dtype=torch.bfloat16,
-    check_correctness=True,
-    block_I=64,
-    S_per_block=64,
-    num_stages=2,
-    threads=256,
-):
-    torch.random.manual_seed(0)
-    q = torch.randn((B, S, H, DQK), dtype=dtype, device="cuda").requires_grad_(True)
-    kv = torch.randn((B, SKV, HKV, DQK), dtype=dtype, device="cuda").requires_grad_(True)
-
-    indices = torch.full((B, S, HKV, topk), SKV, dtype=torch.int32, device="cuda")
-    for b in range(B):
-        for t in range(S):
-            for h in range(HKV):
-                i_i = torch.randperm(max(1, t))[:topk]
-                indices[b, t, h, : len(i_i)] = i_i
-
-    print(f"Testing with B={B}, S={S}, SKV={SKV}, H={H}, topk={topk}, S_per_block={S_per_block}")
-    
-    tl_out, tl_lse = sparse_mla_fwd_seq_block_interface(
-        q, kv, indices, 
-        block_I=block_I, 
-        S_per_block=S_per_block,
-        num_stages=num_stages, 
-        threads=threads
-    )
-
-    if check_correctness:
-        ref_out = ref_sparse_mla_fwd_interface(q, kv, indices)
-        assert_tensors_similar(tl_out, ref_out, eps=1e-2, name="out")
-        print("assert_tensors_similar passed")
-
-    def fn():
-        return sparse_mla_fwd_seq_block_interface(
-            q, kv, indices, 
-            block_I=block_I, 
-            S_per_block=S_per_block,
-            num_stages=num_stages, 
-            threads=threads
-        )
-
-    from tilelang.profiler import do_bench
-
-    ms = do_bench(
-        fn,
-        rep=100,
-        warmup=250,
-    )
-    print(f"Average time: {ms:.3f} ms")
-    print("fwd io bandwidth = ", (B * S * DQK * topk * 2) / (ms * 1e-3) / 1e12)
-    print("fwd tflops = ", (B * S * (DQK + DV) * topk * 2 * H) / (ms * 1e-3) / 1e12)
-
-
-def test_small_heads():
-    """Test case specifically for small head counts (H=16)."""
-    print("=" * 60)
-    print("Testing sparse_mla_fwd_seq_block with small head count (H=16)")
-    print("=" * 60)
-    
-    test_sparse_mla_fwd_seq_block(
-        B=1,
-        S=256,
-        SKV=256,
-        H=16,  # Small head count
-        HKV=1,
-        DQK=576,
-        DV=512,
-        topk=128,
-        dtype=torch.bfloat16,
-        check_correctness=True,
-        block_I=64,
-        S_per_block=64,
-        num_stages=2,
-        threads=256,
-    )
-
-
-def test_large_scale():
-    """Test case for larger scale."""
-    print("=" * 60)
-    print("Testing sparse_mla_fwd_seq_block at larger scale")
-    print("=" * 60)
-    
-    test_sparse_mla_fwd_seq_block(
-        B=1,
-        S=4096,
-        SKV=4096,
-        H=16,  # Small head count
-        HKV=1,
-        DQK=576,
-        DV=512,
-        topk=2048,
-        dtype=torch.bfloat16,
-        check_correctness=False,  # Skip correctness for speed (OOM risk)
-        block_I=64,
-        S_per_block=64,
-        num_stages=2,
-        threads=256,
-    )
-
-
-def compare_with_original():
-    """
-    Compare sequence-blocked kernel with original head-blocked kernel.
-    Shows the benefit of sequence blocking for small head counts.
-    """
-    from sparse_mla_fwd_little_head import sparse_mla_fwd_interface as original_interface
-    
-    print("=" * 70)
-    print("Comparing original (head-blocked) vs new (seq-blocked) implementations")
-    print("=" * 70)
-    
-    # Test with small head count (H=16) - the target optimization case
-    B, S, SKV, H, HKV = 1, 512, 512, 16, 1
-    DQK, DV, topk = 576, 512, 256
-    dtype = torch.bfloat16
-    
-    torch.random.manual_seed(42)
-    q = torch.randn((B, S, H, DQK), dtype=dtype, device="cuda")
-    kv = torch.randn((B, SKV, HKV, DQK), dtype=dtype, device="cuda")
-    
-    indices = torch.full((B, S, HKV, topk), SKV, dtype=torch.int32, device="cuda")
-    for b in range(B):
-        for t in range(S):
-            for h in range(HKV):
-                i_i = torch.randperm(max(1, t))[:topk]
-                indices[b, t, h, : len(i_i)] = i_i
-    
-    print(f"Config: B={B}, S={S}, SKV={SKV}, H={H}, topk={topk}")
-    print()
-    
-    # Test original implementation
-    print("Original (head-blocked) kernel:")
-    try:
-        original_out, original_lse = original_interface(q, kv, indices)
-        
-        from tilelang.profiler import do_bench
-        def fn_original():
-            return original_interface(q, kv, indices)
-        ms_original = do_bench(fn_original, rep=100, warmup=250)
-        print(f"  Time: {ms_original:.3f} ms")
-    except Exception as e:
-        print(f"  Error: {e}")
-        original_out = None
-        ms_original = float('inf')
-    
-    # Test new sequence-blocked implementation
-    print("New (seq-blocked) kernel:")
-    new_out, new_lse = sparse_mla_fwd_seq_block_interface(q, kv, indices)
-    
-    from tilelang.profiler import do_bench
-    def fn_new():
-        return sparse_mla_fwd_seq_block_interface(q, kv, indices)
-    ms_new = do_bench(fn_new, rep=100, warmup=250)
-    print(f"  Time: {ms_new:.3f} ms")
-    
-    # Compare correctness
-    if original_out is not None:
-        ref_out = ref_sparse_mla_fwd_interface(q, kv, indices)
-        
-        print()
-        print("Correctness check against reference:")
-        try:
-            assert_tensors_similar(original_out, ref_out, eps=1e-2, name="original")
-            print("  Original: PASSED")
-        except AssertionError as e:
-            print(f"  Original: FAILED - {e}")
-        
-        try:
-            assert_tensors_similar(new_out, ref_out, eps=1e-2, name="new")
-            print("  New (seq-blocked): PASSED")
-        except AssertionError as e:
-            print(f"  New (seq-blocked): FAILED - {e}")
-    
-    if ms_original != float('inf'):
-        print()
-        print(f"Speedup: {ms_original / ms_new:.2f}x")
-
-
-if __name__ == "__main__":
-    test_small_heads()
-    # test_large_scale()  # Uncomment for performance testing
-    # compare_with_original()  # Uncomment to compare with original implementation
+}
