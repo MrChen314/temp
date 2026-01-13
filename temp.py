@@ -1,560 +1,520 @@
-// Adapted from https://github.com/Dao-AILab/flash-attention/blob/main/csrc/flash_attn/flash_api.cpp
-/******************************************************************************
- * Copyright (c) 2024, Tri Dao.
- ******************************************************************************/
+#include "fwd.h"
 
-#include <torch/python.h>
-#include <torch/nn/functional.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <math_constants.h>
+#include <cute/tensor.hpp>
+#include <cutlass/cluster_launch.hpp>
+#include <cooperative_groups.h>
+#include <cutlass/arch/reg_reconfig.h>
+#include <cutlass/arch/arch.h>
 
-#include <cutlass/fast_math.h>
+#include "utils.h"
+#include "helpers.h"
 
-#include "params.h"
-#include "smxx/get_mla_metadata.h"
-#include "smxx/mla_combine.h"
-#include "sm90/decode/dense/splitkv_mla.h"
-#include "sm90/decode/sparse_fp8/splitkv_mla.h"
-#include "sm90/prefill/sparse/fwd.h"
-#include "sm100/decode/sparse_fp8/splitkv_mla.h"
-#include "sm100/prefill/dense/interface.h"
-#include "sm100/prefill/sparse/fwd.h"
+namespace sm90 {
 
-#define CHECK_DEVICE(x) TORCH_CHECK(x.is_cuda(), #x " must be on CUDA")
-#define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
-#define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
+using namespace cute;
 
-struct Arch {
-    int major;
-    int minor;
+constexpr int D_Q = 576;
+constexpr int D_K = 576;
 
-    bool is_sm90() const {
-        return major == 9 && minor == 0;
-    }
+constexpr int B_H = 64;
+constexpr int B_TOPK = 64;    // TopK block size
+constexpr int NUM_THREADS = 128*3;
 
-    bool is_sm100() const {
-        return major == 10;
-    }
+template<int NUM_TILES>
+using SmemLayoutQTiles = decltype(coalesce(tile_to_shape(
+    GMMA::Layout_K_SW128_Atom<bf16>{},
+    Shape<Int<B_H>, Int<64*NUM_TILES>>{},
+    Step<_1, _2>{}
+), Shape<_1, _1>{}));
 
-    void assert_is_supported() const {
-        TORCH_CHECK(is_sm90() || is_sm100(), "Only SM90 and SM100 are supported");
-    }
+template<int NUM_TILES>
+using SmemLayoutKTiles = decltype(coalesce(tile_to_shape(
+    GMMA::Layout_SW128_Atom<bf16, GMMA::Major::K>{},
+    Shape<Int<B_TOPK>, Int<64*NUM_TILES>>{},
+    Step<_1, _2>{}
+), Shape<_1, _1>{}));
+
+using SmemLayoutQ = SmemLayoutQTiles<9>;
+using SmemLayoutK = SmemLayoutKTiles<9>;
+
+// Simplified SharedMemoryPlan for attn_dist kernel
+struct AttnDistSharedMemoryPlan {
+    array_aligned<bf16, cosize_v<SmemLayoutQ>> q;
+    array_aligned<bf16, cosize_v<SmemLayoutK>> k[2];
+
+    bool is_kv_valid[2][B_TOPK];
+    
+    // Head dimension reduction buffer
+    float attn_dist_reduce[2][B_TOPK];  // [warpgroup_idx][topk_position]
+    
+    // Barriers
+    transac_bar_t bar_q, bar_k0_free[2], bar_k0_ready[2], bar_k1_free[2], bar_k1_ready[2], bar_is_kv_valid_ready;
 };
 
-// DecodingAttnImplMeta - A struct to hold metadata for Decoding Attention Implementation (i.e. SM90 Dense BF16, SM90 Sparse FP8, etc.)
-struct DecodingAttnImplMeta {
-    int num_sm_parts;
-    int fixed_overhead_num_blocks;
-    int k_block_size;
+using TiledMMA_QK = decltype(make_tiled_mma(
+    GMMA::MMA_64x64x16_F32BF16BF16_SS<GMMA::Major::K, GMMA::Major::K>{},
+    Layout<Shape<_1, _1, _1>>{}
+));
+
+template<
+    typename Shape_Q, typename TMA_Q
+>
+struct AttnDistTmaParams {
+    Shape_Q shape_Q; TMA_Q tma_Q;
+    CUtensorMap tensor_map_attn_dist;  // TMA descriptor for output
 };
 
-DecodingAttnImplMeta get_attn_impl_meta(
-    Arch arch,
-    int sm_count,
-    int num_q_tokens_per_head_k,
-    int h_k,
-    std::optional<int> h_q_,
-    bool is_fp8_kvcache,
-    bool is_sparse_attn
-) {
-    if (arch.is_sm90()) {
-        if (is_sparse_attn) {
-            if (is_fp8_kvcache) {
-                TORCH_CHECK(h_q_.has_value());
-                int h_q = h_q_.value();
-                TORCH_CHECK(h_q % h_k == 0);
-                int s_q = num_q_tokens_per_head_k * h_k / h_q;
-                // FP8 + Sparse MLA
-                return {
-                    std::max((sm_count/2) / h_k / (cutlass::ceil_div(h_q/h_k, 2*64) * s_q), 1),
-                    5,
-                    64
-                };
-            } else {
-                // Sparse BF16 MLA
-                TORCH_CHECK(false, "Sparse BF16 MLA is not supported on SM90");
-            }
-        } else {
-            if (is_fp8_kvcache) {
-                // Dense FP8 MLA
-                TORCH_CHECK(false, "Dense FP8 MLA is not supported on SM90");
-            } else {
-                // Dense BF16 MLA
-                return {
-                    std::max(sm_count / h_k / cutlass::ceil_div(num_q_tokens_per_head_k, 64), 1),
-                    5,
-                    64
-                };
+enum NamedBarriers : uint32_t {
+    warpgroup0_sync = 0,
+    warpgroup1_sync = 1
+};
+
+
+template<typename TmaParams>
+__global__ void __launch_bounds__(NUM_THREADS, 1, 1)
+attn_dist_kernel(__grid_constant__ const AttnDistParams params, __grid_constant__ const TmaParams tma_params) {
+#if IS_SM90
+    const int q_h_idx = blockIdx.x % (params.h_q/B_H);
+    const int s_q_idx = blockIdx.x / (params.h_q/B_H);
+    const int warpgroup_idx = cutlass::canonical_warp_group_idx();
+    const int warp_idx = cutlass::canonical_warp_idx_sync();
+    const int idx_in_warpgroup = threadIdx.x % 128;
+
+    // Define shared tensors
+    extern __shared__ char wksp_buf[];
+    AttnDistSharedMemoryPlan &plan = *reinterpret_cast<AttnDistSharedMemoryPlan*>(wksp_buf);
+    Tensor sQ = make_tensor(make_smem_ptr(plan.q.data()), SmemLayoutQ{});
+
+    if (warp_idx == 0 && elect_one_sync()) {
+        // Prefetch TMA descriptors
+        cute::prefetch_tma_descriptor(tma_params.tma_Q.get_tma_descriptor());
+        cute::prefetch_tma_descriptor(&tma_params.tensor_map_attn_dist);
+
+        // Initialize barriers
+        plan.bar_q.init(1);
+        CUTE_UNROLL
+        for (int i = 0; i < 2; ++i) {
+            plan.bar_k0_free[i].init(128);
+            plan.bar_k0_ready[i].init(128);
+            plan.bar_k1_free[i].init(128);
+            plan.bar_k1_ready[i].init(128);
+        }
+        plan.bar_is_kv_valid_ready.init(16);
+        
+        // Initialize reduction buffers to zero
+        CUTE_UNROLL
+        for (int wg = 0; wg < 2; ++wg) {
+            CUTE_UNROLL
+            for (int i = 0; i < B_TOPK; ++i) {
+                plan.attn_dist_reduce[wg][i] = 0.0f;
             }
         }
-    } else if (arch.is_sm100()) {
-        if (is_sparse_attn) {
-            if (is_fp8_kvcache) {
-                TORCH_CHECK(h_q_.has_value());
-                int h_q = h_q_.value();
-                TORCH_CHECK(h_q % h_k == 0);
-                int s_q = num_q_tokens_per_head_k * h_k / h_q;
-                // FP8 + Sparse MLA
-                return {
-                    std::max(sm_count / h_k / (cutlass::ceil_div(h_q/h_k, 64) * s_q), 1),
-                    5,
-                    64
-                };
-            } else {
-                // Sparse BF16 MLA
-                TORCH_CHECK(false, "Sparse BF16 MLA is not supported on SM100");
-            }
-        } else {
-            if (is_fp8_kvcache) {
-                // FP8 MLA
-                TORCH_CHECK(false, "FP8 Dence MLA is not supported on SM100");
-            } else {
-                // Normal BF16 MLA
-                TORCH_CHECK(false, "BF16 Dence MLA is not supported on SM100");
-            }
+        
+        fence_barrier_init();
+    }
+
+    __syncthreads();
+    
+    const int num_topk_blocks = params.topk / B_TOPK;
+    if (warpgroup_idx == 0 || warpgroup_idx == 1) {
+        cutlass::arch::warpgroup_reg_alloc<216>();
+
+        if (warp_idx == 0 && elect_one_sync()) {
+            // Load Q
+            Tensor gQ = flat_divide(
+                tma_params.tma_Q.get_tma_tensor(tma_params.shape_Q)(_, _, s_q_idx),
+                Tile<Int<B_H>, Int<D_Q>>{}
+            )(_, _, q_h_idx, _0{});
+            launch_tma_copy(tma_params.tma_Q, gQ, sQ, plan.bar_q, TMA::CacheHintSm90::EVICT_FIRST);
+            plan.bar_q.arrive_and_expect_tx(B_H*D_Q*sizeof(bf16));
         }
-    } else {
-        TORCH_CHECK(false, "Unsupported GPU architecture");
-    }
-}
 
+        Tensor rP = partition_fragment_C(TiledMMA_QK{}, Shape<Int<B_H>, Int<B_TOPK>>{});
+        
+        // Load LSE values for this thread's rows
+        float lse_local[2];
+        CUTE_UNROLL
+        for (int row_idx = 0; row_idx < 2; ++row_idx) {
+            int real_row = get_AorC_row_idx(row_idx, idx_in_warpgroup);
+            int global_head = q_h_idx * B_H + real_row;
+            lse_local[row_idx] = params.lse[s_q_idx * params.h_q + global_head];
+        }
+        
+        // Wait for Q
+        plan.bar_q.wait(0);
 
-std::vector<at::Tensor>
-get_mla_decoding_metadata(
-    at::Tensor &seqlens_k,
-    const int num_q_tokens_per_head_k,
-    const int h_k,
-    const std::optional<int> h_q,
-    const bool is_fp8_kvcache,
-    const std::optional<int> topk
-) {
-    bool is_sparse_attn = topk.has_value();
-    CHECK_DEVICE(seqlens_k);
-    TORCH_CHECK(seqlens_k.is_contiguous());
-    TORCH_CHECK(seqlens_k.dtype() == torch::kInt32);
-    if (is_sparse_attn)
-        TORCH_CHECK(h_q.has_value(), "num_heads_q must be provided when topk is provided");
+        bool cur_bar_wait_phase = 0;
+        
+        struct Warpgroup0 {};
+        struct Warpgroup1 {};
 
-    int batch_size = seqlens_k.size(0);
-    int *seqlens_k_ptr = seqlens_k.data_ptr<int>();
-    auto options = seqlens_k.options();
+        auto qkt_gemm_one_tile = [&](auto warpgroup_idx, int tile_idx, bool clear_accum) {
+            constexpr bool IS_WG1 = std::is_same_v<decltype(warpgroup_idx), Warpgroup1>;
+            TiledMMA tiled_mma_QK = TiledMMA_QK{};
+            Tensor sQ_tile = flat_divide(sQ, Tile<Int<B_H>, Int<64>>{})(_, _, _0{}, tile_idx);
+            Tensor sK_tile = make_tensor(make_smem_ptr(plan.k[(int)IS_WG1].data() + tile_idx*B_TOPK*64), SmemLayoutKTiles<1>{});
+            gemm_ss(clear_accum, tiled_mma_QK, sQ_tile, sK_tile, rP, idx_in_warpgroup);
+        };
 
-    auto dprops = at::cuda::getCurrentDeviceProperties();
-    int sm_count = dprops->multiProcessorCount;
-    Arch arch = {dprops->major, dprops->minor};
-    arch.assert_is_supported();
-    DecodingAttnImplMeta attn_impl_meta = get_attn_impl_meta(arch, sm_count, num_q_tokens_per_head_k, h_k, h_q, is_fp8_kvcache, is_sparse_attn);
-
-    auto tile_scheduler_metadata = torch::empty({attn_impl_meta.num_sm_parts, TileSchedulerMetaDataSize}, options);
-    auto num_splits = torch::empty({batch_size + 1}, options);
-    int *tile_scheduler_metadata_ptr = tile_scheduler_metadata.data_ptr<int>();
-    int *num_splits_ptr = num_splits.data_ptr<int>();
-
-    at::cuda::CUDAGuard device_guard{(char)seqlens_k.get_device()};
-    auto stream = at::cuda::getCurrentCUDAStream().stream();
-    GetDecodingMetadataParams params = {};
-    params.seqlens_k_ptr = seqlens_k_ptr;
-    params.tile_scheduler_metadata_ptr = tile_scheduler_metadata_ptr;
-    params.num_splits_ptr = num_splits_ptr;
-    params.batch_size = batch_size;
-    params.block_size_n = attn_impl_meta.k_block_size;
-    params.fixed_overhead_num_blocks = attn_impl_meta.fixed_overhead_num_blocks;
-    params.num_sm_parts = attn_impl_meta.num_sm_parts;
-    params.topk = is_sparse_attn ? topk.value() : -1;
-    run_get_mla_metadata_kernel(params, stream);
-
-    return {tile_scheduler_metadata, num_splits};
-}
-
-std::vector<at::Tensor>
-fwd_kvcache_mla(
-    at::Tensor &q,                               // batch_size x seqlen_q x num_heads x head_size
-    const at::Tensor &kcache,                    // num_blocks x page_block_size x num_heads_k x head_size (when is_fp8 is False) or num_blocks x num_heads_k x (page_block_size*656) (when is_fp8 is True)
-    const int head_size_v,
-    const at::Tensor &seqlens_k,                 // batch_size
-    const at::Tensor &block_table,               // batch_size x max_num_blocks_per_seq
-    const float softmax_scale,
-    bool is_causal,
-    const at::Tensor &tile_scheduler_metadata,   // num_sm_parts x TileSchedulerMetaDataSize
-    const at::Tensor &num_splits,                // batch_size + 1
-    const bool &is_fp8,
-    const std::optional<at::Tensor> &indices     // None, or batch_size x seqlen_q x topk
-) {
-    bool is_sparse_attn = indices.has_value();
-    int topk = is_sparse_attn ? indices->size(-1) : -1;
-
-    // Check the architecture
-    auto dprops = at::cuda::getCurrentDeviceProperties();
-    Arch arch = {dprops->major, dprops->minor};
-    arch.assert_is_supported();
-
-    // Check data types
-    auto q_dtype = q.dtype();
-    TORCH_CHECK(q_dtype == torch::kBFloat16 || q_dtype == torch::kHalf);
-    
-    if (!is_fp8) {
-        TORCH_CHECK(kcache.dtype() == q_dtype, "query and key must have the same dtype");
-    } else {
-        TORCH_CHECK(kcache.dtype() == torch::kFloat8_e4m3fn || kcache.dtype() == torch::kInt8 || kcache.dtype() == torch::kUInt8, "key must have dtype fp8_e4m3fn or int8 or uint8");
-    }
-    TORCH_CHECK(seqlens_k.dtype() == torch::kInt32, "seqlens_k must have dtype int32");
-    TORCH_CHECK(block_table.dtype() == torch::kInt32, "block_table must have dtype torch.int32");
-    TORCH_CHECK(tile_scheduler_metadata.dtype() == torch::kInt32, "tile_scheduler_metadata must have dtype int32");
-    TORCH_CHECK(num_splits.dtype() == torch::kInt32, "num_splits must have dtype int32");
-    TORCH_CHECK(!is_sparse_attn || indices->dtype() == torch::kInt32, "indices must have dtype int32");
-
-    // Check device
-    CHECK_DEVICE(q);
-    CHECK_DEVICE(kcache);
-    CHECK_DEVICE(seqlens_k);
-    CHECK_DEVICE(block_table);
-    CHECK_DEVICE(tile_scheduler_metadata);
-    CHECK_DEVICE(num_splits);
-    if (is_sparse_attn) CHECK_DEVICE(indices.value());
-
-    // Check layout
-    TORCH_CHECK(q.stride(-1) == 1, "q must have contiguous last dimension");
-    TORCH_CHECK(kcache.stride(-1) == 1, "kcache must have contiguous last dimension");
-    CHECK_CONTIGUOUS(seqlens_k);
-    TORCH_CHECK(block_table.stride(-1) == 1, "block_table must have contiguous last dimension");
-    CHECK_CONTIGUOUS(tile_scheduler_metadata);
-    CHECK_CONTIGUOUS(num_splits);
-    TORCH_CHECK(!is_sparse_attn || indices->stride(-1) == 1, "indices must have contiguous last dimension");
-
-    const auto sizes = q.sizes();
-    const int batch_size = sizes[0];
-    const int seqlen_q_ori = sizes[1];
-    const int num_heads_q = sizes[2];
-    const int head_size_k = sizes[3];
-    TORCH_CHECK(head_size_k == 576, "Only head_size_k == 576 is supported");
-    TORCH_CHECK(head_size_v == 512, "Only head_size_v == 576 is supported");
-
-    const int max_num_blocks_per_seq = block_table.size(1);
-    const int num_blocks = kcache.size(0);
-    const int page_block_size = kcache.size(1);
-    const int num_heads_k = kcache.size(2);
-    TORCH_CHECK(page_block_size == 64, "Currently page_block_size must be 64");
-    TORCH_CHECK(batch_size > 0, "batch size must be positive");
-    TORCH_CHECK(num_heads_q % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
-
-    if (seqlen_q_ori == 1) { is_causal = false; }
-
-    const int num_q_heads_per_hk = num_heads_q / num_heads_k;
-    const int q_seq_per_hk = seqlen_q_ori * num_q_heads_per_hk;
-    const int num_heads = num_heads_k;
-    q = q.view({batch_size, seqlen_q_ori, num_heads_k, num_q_heads_per_hk, head_size_k}).transpose(2, 3)
-            .reshape({batch_size, q_seq_per_hk, num_heads, head_size_k});
-
-    CHECK_SHAPE(q, batch_size, q_seq_per_hk, num_heads, head_size_k);
-    if (!is_fp8) {
-        CHECK_SHAPE(kcache, num_blocks, page_block_size, num_heads_k, head_size_k);
-    } else {
-        int bytes_per_token = 512 + 64*2 + (512/128)*4;
-        CHECK_SHAPE(kcache, num_blocks, page_block_size, num_heads_k, bytes_per_token);
-        TORCH_CHECK(num_heads_k == 1, "Currently the number of k heads must be 1 when is_fp8_kvcache is True");
-        TORCH_CHECK(kcache.stride(1) == bytes_per_token, "The whole block must be contiguous when is_fp8_cache is True");
-    }
-    CHECK_SHAPE(seqlens_k, batch_size);
-    CHECK_SHAPE(block_table, batch_size, max_num_blocks_per_seq);
-    TORCH_CHECK(tile_scheduler_metadata.size(1) == TileSchedulerMetaDataSize);
-    CHECK_SHAPE(num_splits, batch_size+1);
-    if (is_sparse_attn) CHECK_SHAPE(indices.value(), batch_size, seqlen_q_ori, topk);
-
-    at::cuda::CUDAGuard device_guard{(char)q.get_device()};
-
-    auto opts = q.options();
-    at::Tensor out = torch::empty({batch_size, q_seq_per_hk, num_heads, head_size_v}, opts);
-    at::Tensor softmax_lse = torch::empty({batch_size, num_heads, q_seq_per_hk}, opts.dtype(at::kFloat));
-    CHECK_CONTIGUOUS(softmax_lse);
-
-    DecodingParams params = {};
-    // Set the sizes.
-    params.b = batch_size;
-    params.s_q = seqlen_q_ori;
-    params.q_seq_per_hk = q_seq_per_hk;
-    params.seqlens_k_ptr = seqlens_k.data_ptr<int>();
-    params.h_q = num_heads_q;
-    params.h_k = num_heads_k;
-    params.num_blocks = num_blocks;
-    params.q_head_per_hk = num_q_heads_per_hk;
-    params.is_causal = is_causal;
-    params.d = head_size_k;
-    params.d_v = head_size_v;
-    params.scale_softmax = softmax_scale;
-    params.scale_softmax_log2 = float(softmax_scale * M_LOG2E);
-    params.topk = topk;
-    // Set the pointers and strides.
-    params.q_ptr = q.data_ptr();
-    params.k_ptr = kcache.data_ptr();
-    params.o_ptr = out.data_ptr();
-    params.indices_ptr = is_sparse_attn ? indices->data_ptr<int>() : nullptr;
-    params.softmax_lse_ptr = softmax_lse.data_ptr();
-    // All stride are in elements, not bytes.
-    params.q_batch_stride = q.stride(0);
-    params.k_batch_stride = kcache.stride(0);
-    params.o_batch_stride = out.stride(0);
-    params.q_row_stride = q.stride(-3);
-    params.k_row_stride = kcache.stride(1);
-    params.o_row_stride = out.stride(-3);
-    params.q_head_stride = q.stride(-2);
-    params.k_head_stride = kcache.stride(2);
-    params.o_head_stride = out.stride(-2);
-    params.indices_batch_stride = is_sparse_attn ? indices->stride(0) : 0;
-    params.indices_row_stride = is_sparse_attn ? indices->stride(1) : 0;
-
-    params.block_table = block_table.data_ptr<int>();
-    params.block_table_batch_stride = block_table.stride(0);
-    params.page_block_size = page_block_size;
-    
-    params.tile_scheduler_metadata_ptr = tile_scheduler_metadata.data_ptr<int>();
-    params.num_sm_parts = tile_scheduler_metadata.size(0);
-    params.num_splits_ptr = num_splits.data_ptr<int>();
-
-    const int total_num_splits = batch_size + params.num_sm_parts;
-    at::Tensor softmax_lse_accum = torch::empty({total_num_splits, num_heads, q_seq_per_hk}, opts.dtype(at::kFloat));
-    at::Tensor out_accum = torch::empty({total_num_splits, num_heads, q_seq_per_hk, head_size_v}, opts.dtype(at::kFloat));
-    CHECK_CONTIGUOUS(softmax_lse_accum);
-    CHECK_CONTIGUOUS(out_accum);
-    params.total_num_splits = total_num_splits;
-    params.softmax_lseaccum_ptr = softmax_lse_accum.data_ptr();
-    params.oaccum_ptr = out_accum.data_ptr();
-
-    auto stream = at::cuda::getCurrentCUDAStream().stream();
-    TORCH_CHECK(head_size_k == 576);
-
-    if (q_dtype == torch::kHalf) {
-#ifdef FLASH_MLA_DISABLE_FP16
-        TORCH_CHECK(false, "FlashMLA is compiled with -DFLASH_MLA_DISABLE_FP16. Please remove this flag from your environment and re-compile FlashMLA.");
-#endif
-    }
-
-    if (arch.is_sm90()) {
-        if (is_sparse_attn) {
-            if (is_fp8) {
-                TORCH_CHECK(q_dtype == torch::kBFloat16, "Sparse FP8 MLA only supports BFloat16 on SM90");
-                sm90::run_flash_splitkv_mla_fp8_sparse_kernel(params, stream);
-            } else {
-                TORCH_CHECK(false, "Only FP8 kvcahe is supported for sparse MLA on SM90");
-            }
-        } else {
-            if (is_fp8) {
-                TORCH_CHECK(false, "Dense FP8 MLA is not supported on SM90");
-            } else {
-                if (q_dtype == torch::kBFloat16) {
-                    sm90::run_flash_splitkv_mla_kernel<cutlass::bfloat16_t>(params, stream);
-                } else if (q_dtype == torch::kHalf) {
-#ifndef FLASH_MLA_DISABLE_FP16
-                    sm90::run_flash_splitkv_mla_kernel<cutlass::half_t>(params, stream);
-#endif
-                } else {
-                    TORCH_CHECK(false, "Unsupported dtype for dense MLA on SM90");
+        // Compute normalized attention probability: attn_prob = exp2(rP * sm_scale - lse)
+        auto compute_normalized_attn_prob = [&](auto warpgroup_idx) {
+            constexpr bool IS_WG1 = std::is_same_v<decltype(warpgroup_idx), Warpgroup1>;
+            plan.bar_is_kv_valid_ready.wait(cur_bar_wait_phase);
+            const float scale = params.sm_scale_div_log2;
+            
+            CUTE_UNROLL
+            for (int row_idx = 0; row_idx < 2; ++row_idx) {
+                CUTE_UNROLL
+                for (int i = row_idx*2; i < size(rP); i += 4) {
+                    int col = 8*(i/4) + (idx_in_warpgroup%4)*2;
+                    // Apply mask and compute normalized attention probability
+                    float p0 = plan.is_kv_valid[IS_WG1][col] ? 
+                               exp2f(rP(i) * scale - lse_local[row_idx]) : 0.0f;
+                    float p1 = plan.is_kv_valid[IS_WG1][col+1] ? 
+                               exp2f(rP(i+1) * scale - lse_local[row_idx]) : 0.0f;
+                    rP(i) = p0;
+                    rP(i+1) = p1;
                 }
             }
+        };
+
+        // Reduce over heads and store to global memory using TMA
+        auto reduce_heads_and_store = [&](int block_idx, int wg_idx) {
+            // Step 1: Each thread sums its 2 rows (8 rows apart) for each column
+            // rP layout: every 4 elements form a group, 0,1 belong to row0's two columns, 2,3 belong to row1's same two columns
+            float local_sum[16];  // 16 column positions partial sums
+            CUTE_UNROLL
+            for (int col_local = 0; col_local < 8; ++col_local) {
+                int i_row0 = col_local * 4;      // row 0's element start
+                int i_row1 = col_local * 4 + 2;  // row 1's element start
+                local_sum[col_local * 2] = rP(i_row0) + rP(i_row1);          // column 0
+                local_sum[col_local * 2 + 1] = rP(i_row0 + 1) + rP(i_row1 + 1);  // column 1
+            }
+            // Now: each thread holds 16 columns' partial sums (2 rows merged)
+            
+            // Step 2: Warp-level column reduction (different rows of the same column)
+            // Threads t and t^4, t^8, t^16 hold same column's different row data
+            // shfl_xor(4), shfl_xor(8), shfl_xor(16) merge 8 thread groups within warp
+            CUTE_UNROLL
+            for (int i = 0; i < 16; ++i) {
+                local_sum[i] += __shfl_xor_sync(0xffffffff, local_sum[i], 4);
+                local_sum[i] += __shfl_xor_sync(0xffffffff, local_sum[i], 8);
+                local_sum[i] += __shfl_xor_sync(0xffffffff, local_sum[i], 16);
+            }
+            // Now: all 32 threads in warp hold same 16 rows' sum (but hold different columns)
+            // Note: each thread still only knows its responsible 16 columns
+            
+            // Step 3: Cross-warp reduction - 4 warps each hold different 16 rows
+            // After shfl_xor(4,8,16), every 4 threads within warp hold same data
+            // So each warp only needs first 4 threads (idx_in_warpgroup % 32 < 4) to write
+            // 4 warps x 4 threads = 16 threads write, each thread writes 16 columns
+            //
+            // atomicAdd: 4 warps each contribute 16 rows' sum, finally accumulate to 64 rows' total sum
+            if (idx_in_warpgroup % 32 < 4) {
+                CUTE_UNROLL
+                for (int i = 0; i < 16; ++i) {
+                    int col_idx = 8 * (i / 2) + (idx_in_warpgroup % 4) * 2 + (i % 2);
+                    atomicAdd(&plan.attn_dist_reduce[wg_idx][col_idx], local_sum[i]);
+                }
+            }
+            
+            // Warpgroup sync - wait for all 4 warps to complete writing to shared memory
+            fence_view_async_shared();
+            NamedBarrier::arrive_and_wait(128, wg_idx ? NamedBarriers::warpgroup1_sync : NamedBarriers::warpgroup0_sync);
+            
+            // Step 4: Write to global memory using TMA store
+            // Only one thread per warpgroup executes the TMA store
+            bool s2g_pred = (warp_idx % 4 == wg_idx) && elect_one_sync();
+            if (s2g_pred) {
+                // TMA store: shared memory -> global memory
+                // Output tensor shape: [num_head_groups, s_q, topk]
+                // TMA coordinates: (topk_offset, s_q_idx, head_group_idx)
+                SM90_TMA_STORE_3D::copy(
+                    &tma_params.tensor_map_attn_dist,
+                    plan.attn_dist_reduce[wg_idx],     // source: shared memory
+                    block_idx * B_TOPK,                 // x: topk dimension offset
+                    s_q_idx,                            // y: s_q dimension
+                    q_h_idx                             // z: head_group dimension
+                );
+            }
+            cute::tma_store_arrive();
+            
+            // Clear shared memory for next round (all threads participate for speed)
+            if (idx_in_warpgroup < B_TOPK) {
+                plan.attn_dist_reduce[wg_idx][idx_in_warpgroup] = 0.0f;
+            }
+            
+            // Sync again to ensure clear is complete before next iteration
+            NamedBarrier::arrive_and_wait(128, wg_idx ? NamedBarriers::warpgroup1_sync : NamedBarriers::warpgroup0_sync);
+        };
+
+
+        if (warpgroup_idx == 0) {
+            // Warpgroup 0 - handles even topk blocks (block_idx = 0, 2, 4, ...)
+
+            auto pipelined_wait_and_qkt_gemm_l = [&]() __attribute__((always_inline)) {
+                plan.bar_k0_ready[0].wait(cur_bar_wait_phase);
+                qkt_gemm_one_tile(Warpgroup0{}, 0, true);
+                qkt_gemm_one_tile(Warpgroup0{}, 1, false);
+                qkt_gemm_one_tile(Warpgroup0{}, 2, false);
+                qkt_gemm_one_tile(Warpgroup0{}, 3, false);
+                warpgroup_commit_batch();
+            };
+
+            auto pipelined_wait_and_qkt_gemm_r = [&]() __attribute__((always_inline)) {
+                plan.bar_k0_ready[1].wait(cur_bar_wait_phase);
+                qkt_gemm_one_tile(Warpgroup0{}, 4, false);
+                qkt_gemm_one_tile(Warpgroup0{}, 5, false);
+                qkt_gemm_one_tile(Warpgroup0{}, 6, false);
+                qkt_gemm_one_tile(Warpgroup0{}, 7, false);
+                qkt_gemm_one_tile(Warpgroup0{}, 8, false);
+                warpgroup_commit_batch();
+            };
+            
+            CUTE_NO_UNROLL
+            for (int block_idx = 0; block_idx < num_topk_blocks; block_idx += 2) {
+                if (block_idx == 0) {
+                    // First iteration: wait and compute QK GEMM
+                    pipelined_wait_and_qkt_gemm_l();
+                    pipelined_wait_and_qkt_gemm_r();
+                    warpgroup_wait<0>();
+                }
+                
+                // Compute normalized attention probability
+                compute_normalized_attn_prob(Warpgroup0{});
+                
+                // Reduce over heads and store
+                reduce_heads_and_store(block_idx, 0);
+
+                // Release K buffer
+                plan.bar_k0_free[0].arrive();
+                plan.bar_k0_free[1].arrive();
+
+                cur_bar_wait_phase ^= 1;
+
+                if (block_idx+2 < num_topk_blocks) {
+                    // Prefetch next QK GEMM
+                    pipelined_wait_and_qkt_gemm_l();
+                    pipelined_wait_and_qkt_gemm_r();
+                    warpgroup_wait<0>();
+                }
+            }
+        } else {
+            // Warpgroup 1 - handles odd topk blocks (block_idx = 1, 3, 5, ...)
+
+            auto pipelined_wait_and_qkt_gemm = [&]() __attribute__((always_inline)) {
+                plan.bar_k1_ready[1].wait(cur_bar_wait_phase);
+                qkt_gemm_one_tile(Warpgroup1{}, 4, true);
+                qkt_gemm_one_tile(Warpgroup1{}, 5, false);
+                qkt_gemm_one_tile(Warpgroup1{}, 6, false);
+                qkt_gemm_one_tile(Warpgroup1{}, 7, false);
+                qkt_gemm_one_tile(Warpgroup1{}, 8, false);
+                plan.bar_k1_ready[0].wait(cur_bar_wait_phase);
+                qkt_gemm_one_tile(Warpgroup1{}, 0, false);
+                qkt_gemm_one_tile(Warpgroup1{}, 1, false);
+                qkt_gemm_one_tile(Warpgroup1{}, 2, false);
+                qkt_gemm_one_tile(Warpgroup1{}, 3, false);
+                warpgroup_commit_batch();
+            };
+            
+            CUTE_NO_UNROLL
+            for (int block_idx = 0; block_idx < num_topk_blocks; block_idx += 2) {
+                // Issue rP = sQ @ sK1, and wait
+                pipelined_wait_and_qkt_gemm();
+                warpgroup_wait<0>();
+
+                // Compute normalized attention probability
+                compute_normalized_attn_prob(Warpgroup1{});
+                
+                // Reduce over heads and store (odd block)
+                reduce_heads_and_store(block_idx + 1, 1);
+
+                // Release K buffer
+                plan.bar_k1_free[0].arrive();
+                plan.bar_k1_free[1].arrive();
+
+                cur_bar_wait_phase ^= 1;
+            }
         }
-    } else if (arch.is_sm100()) {
-        TORCH_CHECK(is_fp8 && is_sparse_attn, "Only FP8 + Sparse attention is supported on SM100");
-        sm100::run_flash_splitkv_mla_fp8_sparse_kernel(params, stream);
     } else {
-        TORCH_CHECK(false, "Unsupported GPU architecture");
-    }
+        // Producer warpgroup
+        cutlass::arch::warpgroup_reg_dealloc<72>();
 
-    if (q_dtype == torch::kBFloat16) {
-        run_flash_mla_combine_kernel<cutlass::bfloat16_t>(params, stream);
-    } else if (q_dtype == torch::kHalf) {
-#ifndef FLASH_MLA_DISABLE_FP16
-        run_flash_mla_combine_kernel<cutlass::half_t>(params, stream);
+        constexpr int GROUP_SIZE = 8, NUM_GROUPS = 128/GROUP_SIZE;
+        constexpr int NUM_ROWS_PER_GROUP = B_TOPK / NUM_GROUPS;
+        int idx_in_group = idx_in_warpgroup % GROUP_SIZE;
+        int group_idx = idx_in_warpgroup / GROUP_SIZE;
+        int* gIndices = params.indices + s_q_idx*params.topk;   // [topk]
+
+        bf16* my_sKV_base = &(make_tensor(make_smem_ptr(plan.k[0].data()), SmemLayoutKTiles<1>{})(group_idx, idx_in_group*8));
+        bf16* my_gKV_base = params.k + idx_in_group*8;
+        
+        int64_t token_indices[2][NUM_ROWS_PER_GROUP];
+        bool is_token_valid[2][NUM_ROWS_PER_GROUP];
+        auto load_token_indices = [&](int block_idx) {
+            CUTE_UNROLL
+            for (int buf_idx = 0; buf_idx < 2; ++buf_idx) {
+                CUTE_UNROLL
+                for (int local_row = 0; local_row < NUM_ROWS_PER_GROUP; ++local_row) {
+                    int offs = (block_idx+buf_idx)*B_TOPK + local_row*NUM_GROUPS + group_idx;
+                    int t = __ldg(gIndices + offs);
+                    token_indices[buf_idx][local_row] = t*(int64_t)params.stride_k_s_kv;   // We mult it with params.stride_k_s_kv here since it's faster
+                    is_token_valid[buf_idx][local_row] = t >= 0 && t < params.s_kv;
+                }
+            }
+        };
+        
+        int64_t cache_policy = createpolicy_evict_last();
+        auto copy_tiles = [&](int block_idx, int buf_idx, int tile_start, int tile_end) {
+            // Copy some K tiles from global memory to shared memory
+            // A tile has a shape of 64 (B_TOPK) x 64
+            // `buf_idx` is the index of the shared memory buffer, 0 or 1
+            // `tile_idx` is the index of the tile to load, from 0 to D_K/64-1 = 8
+            CUTE_UNROLL
+            for (int local_row = 0; local_row < NUM_ROWS_PER_GROUP; ++local_row) {
+                int64_t token_index = token_indices[buf_idx][local_row];
+                CUTE_UNROLL
+                for (int tile_idx = tile_start; tile_idx < tile_end; ++tile_idx) {
+                    cp_async_cacheglobal_l2_prefetch_256B(
+                        my_gKV_base + token_index + tile_idx*64,
+                        my_sKV_base + (buf_idx*B_TOPK*D_K + tile_idx*(B_TOPK*64) + local_row*NUM_GROUPS*64),
+                        is_token_valid[buf_idx][local_row],
+                        cache_policy
+                    );
+                }
+            }
+        };
+
+        auto commit_to_mbar = [&](transac_bar_t &bar) {
+            cutlass::arch::cpasync_barrier_arrive_noinc((uint64_t*)(&bar));
+        };
+
+        int cur_bar_wait_phase = 1;
+
+        CUTE_NO_UNROLL
+        for (int block_idx = 0; block_idx < num_topk_blocks; block_idx += 2) {
+            load_token_indices(block_idx);
+
+            // K0L (left half for WG0's even block)
+            plan.bar_k0_free[0].wait(cur_bar_wait_phase);
+            copy_tiles(block_idx+0, 0, 0, 4);
+            commit_to_mbar(plan.bar_k0_ready[0]);
+
+            // K1R (right half for WG1's odd block)
+            plan.bar_k1_free[1].wait(cur_bar_wait_phase);
+            copy_tiles(block_idx+1, 1, 4, 9);
+            commit_to_mbar(plan.bar_k1_ready[1]);
+            
+            // K0R (right half for WG0's even block)
+            plan.bar_k0_free[1].wait(cur_bar_wait_phase);
+            copy_tiles(block_idx+0, 0, 4, 9);
+            commit_to_mbar(plan.bar_k0_ready[1]);
+
+            // K1L (left half for WG1's odd block)
+            plan.bar_k1_free[0].wait(cur_bar_wait_phase);
+            copy_tiles(block_idx+1, 1, 0, 4);
+            commit_to_mbar(plan.bar_k1_ready[0]);
+
+            // Valid mask
+            if (idx_in_group == 0) {
+                CUTE_UNROLL
+                for (int buf_idx = 0; buf_idx < 2; ++buf_idx)
+                    CUTE_UNROLL
+                    for (int local_row = 0; local_row < NUM_ROWS_PER_GROUP; ++local_row)
+                        plan.is_kv_valid[buf_idx][local_row*NUM_GROUPS+group_idx] = is_token_valid[buf_idx][local_row];
+                plan.bar_is_kv_valid_ready.arrive();
+            }
+
+            cur_bar_wait_phase ^= 1;
+        }
+    }
+#else
+    if (cute::thread0()) {
+        CUTE_INVALID_CONTROL_PATH("This kernel only supports sm90");
+    }
 #endif
-    } else {
-        TORCH_CHECK(false, "Unsupported tensor dtype for query");
-    }
-
-    out = out.view({batch_size, seqlen_q_ori, num_q_heads_per_hk, num_heads_k, head_size_v}).transpose(2, 3)
-            .reshape({batch_size, seqlen_q_ori, num_heads_q, head_size_v});
-    softmax_lse = softmax_lse.view({batch_size, num_heads_k, seqlen_q_ori, num_q_heads_per_hk}).transpose(2, 3)
-            .reshape({batch_size, num_heads_q, seqlen_q_ori});
-
-    return {out, softmax_lse};
 }
 
 
-inline int int64_stride_to_int(int64_t orig_stride) {
-    if (orig_stride > std::numeric_limits<int>::max()) {
-        TORCH_CHECK(false, "[Sparse TopK Attention] Stride exceeds int32 limit: ", orig_stride);
+void run_attn_dist_kernel(const AttnDistParams& params) {
+    FLASH_ASSERT(params.h_kv == 1);
+    FLASH_ASSERT(params.topk % (2*B_TOPK) == 0);   // To save some boundary checkings
+    FLASH_ASSERT(params.topk > 0);
+    FLASH_ASSERT(params.h_q % B_H == 0);
+
+    auto shape_Q = make_shape(params.h_q, params.d_qk, params.s_q);
+    auto tma_Q = cute::make_tma_copy(
+        SM90_TMA_LOAD{},
+        make_tensor(
+            make_gmem_ptr((bf16*)params.q),
+            make_layout(
+                shape_Q,
+                make_stride(params.stride_q_h_q, _1{}, params.stride_q_s_q)
+            )
+        ),
+        SmemLayoutQ{}
+    );
+
+    // Configure TMA tensor_map for attn_dist output
+    // Output shape: [num_head_groups, s_q, topk] where num_head_groups = h_q / 64
+    CUtensorMap tensor_map_attn_dist;
+    {
+        int num_head_groups = params.h_q / B_H;
+        // 3D tensor in column-major (memory layout): [topk, s_q, num_head_groups]
+        uint64_t size[3] = {
+            (uint64_t)params.topk,           // dim 0: topk (innermost)
+            (uint64_t)params.s_q,            // dim 1: s_q
+            (uint64_t)num_head_groups        // dim 2: head_groups (outermost)
+        };
+        // Strides in bytes, starting from dim 1
+        uint64_t stride[2] = {
+            (uint64_t)params.topk * sizeof(float),                      // stride for dim 1: s_q
+            (uint64_t)params.topk * params.s_q * sizeof(float)          // stride for dim 2: head_groups
+        };
+        // Box size: each TMA transfer moves B_TOPK (64) float32 elements
+        uint32_t box_size[3] = {B_TOPK, 1, 1};
+        uint32_t elem_stride[3] = {1, 1, 1};
+        
+        CUresult res = CUTLASS_CUDA_DRIVER_WRAPPER_CALL(cuTensorMapEncodeTiled)(
+            &tensor_map_attn_dist,
+            CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_FLOAT32,  // float32 output
+            3,                                                     // 3D tensor
+            params.attn_sum,                                       // global memory address
+            size,
+            stride,
+            box_size,
+            elem_stride,
+            CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
+            CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE,        // No swizzle for float32
+            CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_NONE,
+            CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+        );
+        FLASH_ASSERT(res == CUresult::CUDA_SUCCESS);
     }
-    return static_cast<int>(orig_stride);
-}
 
-std::vector<at::Tensor> sparse_prefill_fwd(
-    const at::Tensor &q,
-    const at::Tensor &kv,
-    const at::Tensor &indices,
-    float sm_scale,
-    int d_v
-) {
-    auto dprops = at::cuda::getCurrentDeviceProperties();
-    bool is_sm90 = dprops->major == 9;
-    bool is_sm100 = dprops->major == 10;
-    TORCH_CHECK(is_sm90 || is_sm100, "Sparse Attention Forward Kernel (sparse_prefill_fwd) is only supported on SM90 or SM100 architectures");
-
-    CHECK_DEVICE(q);
-    CHECK_DEVICE(kv);
-    CHECK_DEVICE(indices);
-
-    TORCH_CHECK(q.dtype() == torch::kBFloat16);
-    TORCH_CHECK(kv.dtype() == torch::kBFloat16);
-    TORCH_CHECK(indices.dtype() == torch::kInt32);
-
-    int s_q = q.size(0);
-    int s_kv = kv.size(0);
-    int h_q = q.size(1);
-    int h_kv = kv.size(1);
-    int d_qk = q.size(2);
-    int topk = indices.size(2);
-
-    CHECK_SHAPE(q, s_q, h_q, d_qk);
-    CHECK_SHAPE(kv, s_kv, h_kv, d_qk);
-    CHECK_SHAPE(indices, s_q, h_kv, topk);
-
-    TORCH_CHECK(q.stride(-1) == 1);
-    TORCH_CHECK(kv.stride(-1) == 1);
-    TORCH_CHECK(indices.stride(-1) == 1);
-
-    at::cuda::CUDAGuard device_guard{(char)q.get_device()};
-    auto opts = q.options();
-    at::Tensor out = torch::empty({s_q, h_q, d_v}, opts);
-    CHECK_CONTIGUOUS(out);
-    
-    at::Tensor buf_attn_score, max_logits, lse, p_sum;
-    max_logits = torch::empty({s_q, h_q}, opts.dtype(torch::kFloat));
-    lse = torch::empty({s_q, h_q}, opts.dtype(torch::kFloat));
-    CHECK_CONTIGUOUS(max_logits);
-    CHECK_CONTIGUOUS(lse);
-
-    SparsePrefillParams params = {
-        s_q, s_kv, h_q, h_kv, d_qk, d_v, topk,
-        sm_scale, sm_scale * 1.44269504f,
-
-        (cutlass::bfloat16_t*)q.data_ptr(),
-        (cutlass::bfloat16_t*)kv.data_ptr(),
-        (int*)indices.data_ptr(),
-
-        int64_stride_to_int(q.stride(0)), int64_stride_to_int(q.stride(1)),
-        int64_stride_to_int(kv.stride(0)), int64_stride_to_int(kv.stride(1)),
-        int64_stride_to_int(indices.stride(0)), int64_stride_to_int(indices.stride(1)),
-
-        (cutlass::bfloat16_t*)out.data_ptr(),
-        (float*)max_logits.data_ptr(),
-        (float*)lse.data_ptr(),
-
-        at::cuda::getCurrentCUDAStream().stream()
+    AttnDistTmaParams<
+        decltype(shape_Q), decltype(tma_Q)
+    > tma_params = {
+        shape_Q, tma_Q,
+        tensor_map_attn_dist
     };
+    auto kernel = &attn_dist_kernel<decltype(tma_params)>;
 
-    if (is_sm90) {
-        sm90::run_fwd_kernel(params);
-    } else if (is_sm100) {
-        sm100::run_fwd_kernel(params);
-    } else {
-        TORCH_CHECK(false, "Unknown architecture");
-    }
+    constexpr size_t smem_size = sizeof(AttnDistSharedMemoryPlan);
+    CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
-    return {out, max_logits, lse};
+    cutlass::ClusterLaunchParams launch_params = {
+        dim3((params.h_q/B_H)*params.s_q, 1, 1),    // NOTE We put s_q on the first dim since it can be larger than 65536 (the maximum size of griddim.y and griddim.z)
+        dim3(NUM_THREADS, 1, 1),
+        dim3(1, 1, 1),
+        smem_size,
+        params.stream
+    }; 
+    cutlass::launch_kernel_on_cluster(
+        launch_params, (void*)kernel, params, tma_params
+    );
+    CHECK_CUDA_KERNEL_LAUNCH();
 }
 
-
-at::Tensor calc_attn_dist(
-    const at::Tensor &q,           // [s_q, h_q, d_qk]
-    const at::Tensor &k,           // [s_kv, h_kv, d_qk]
-    const at::Tensor &indices,     // [s_q, h_kv, topk]
-    const at::Tensor &lse,         // [s_q, h_q] - Pre-computed LSE (log2-based)
-    int q_start_index_s,
-    int k_stride,
-    float sm_scale
-) {
-    // Check architecture
-    auto dprops = at::cuda::getCurrentDeviceProperties();
-    bool is_sm90 = dprops->major == 9;
-    TORCH_CHECK(is_sm90, "calc_attn_dist is only supported on SM90 architecture");
-
-    // Check devices
-    CHECK_DEVICE(q);
-    CHECK_DEVICE(k);
-    CHECK_DEVICE(indices);
-    CHECK_DEVICE(lse);
-
-    // Check data types
-    TORCH_CHECK(q.dtype() == torch::kBFloat16, "q must be bfloat16");
-    TORCH_CHECK(k.dtype() == torch::kBFloat16, "k must be bfloat16");
-    TORCH_CHECK(indices.dtype() == torch::kInt32, "indices must be int32");
-    TORCH_CHECK(lse.dtype() == torch::kFloat32, "lse must be float32");
-
-    // Get dimensions
-    int s_q = q.size(0);
-    int s_kv = k.size(0);
-    int h_q = q.size(1);
-    int h_kv = k.size(1);
-    int d_qk = q.size(2);
-    int topk = indices.size(2);
-
-    // Check shapes
-    CHECK_SHAPE(q, s_q, h_q, d_qk);
-    CHECK_SHAPE(k, s_kv, h_kv, d_qk);
-    CHECK_SHAPE(indices, s_q, h_kv, topk);
-    CHECK_SHAPE(lse, s_q, h_q);
-
-    // Check strides
-    TORCH_CHECK(q.stride(-1) == 1, "q must have contiguous last dimension");
-    TORCH_CHECK(k.stride(-1) == 1, "k must have contiguous last dimension");
-    TORCH_CHECK(indices.stride(-1) == 1, "indices must have contiguous last dimension");
-    CHECK_CONTIGUOUS(lse);
-
-    // Check constraints
-    TORCH_CHECK(h_kv == 1, "h_kv must be 1");
-    TORCH_CHECK(d_qk == 576, "d_qk must be 576");
-    TORCH_CHECK(topk % 64 == 0, "topk must be a multiple of 64");
-    TORCH_CHECK(h_q % 64 == 0, "h_q must be a multiple of 64");
-
-    at::cuda::CUDAGuard device_guard{(char)q.get_device()};
-
-    // Allocate output tensor
-    // Output shape: [h_q/64, s_q, topk] - each head group outputs separately
-    auto opts = q.options();
-    int num_head_groups = h_q / 64;
-    at::Tensor attn_sum = torch::empty({num_head_groups, s_q, topk}, opts.dtype(torch::kFloat32));
-    CHECK_CONTIGUOUS(attn_sum);
-
-    // Fill parameters
-    AttnDistParams params = {
-        s_q, s_kv, h_q, h_kv, d_qk, topk,
-        q_start_index_s,
-        k_stride,
-        sm_scale, sm_scale * 1.44269504f,  // log2(e)
-
-        (cutlass::bfloat16_t*)q.data_ptr(),
-        (cutlass::bfloat16_t*)k.data_ptr(),
-        (int*)indices.data_ptr(),
-        (float*)lse.data_ptr(),
-
-        int64_stride_to_int(q.stride(0)), int64_stride_to_int(q.stride(1)),
-        int64_stride_to_int(k.stride(0)), int64_stride_to_int(k.stride(1)),
-        int64_stride_to_int(indices.stride(0)), int64_stride_to_int(indices.stride(1)),
-
-        (float*)attn_sum.data_ptr(),
-
-        at::cuda::getCurrentCUDAStream().stream()
-    };
-
-    sm90::run_attn_dist_kernel(params);
-
-    return attn_sum;
-}
-
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.doc() = "FlashMLA";
-    m.def("get_mla_decoding_metadata", &get_mla_decoding_metadata);
-    m.def("fwd_kvcache_mla", &fwd_kvcache_mla);
-    m.def("dense_prefill_fwd", &FMHACutlassSM100FwdRun);
-    m.def("dense_prefill_bwd", &FMHACutlassSM100BwdRun);
-    m.def("sparse_prefill_fwd", &sparse_prefill_fwd);
-    m.def("calc_attn_dist", &calc_attn_dist);
 }
