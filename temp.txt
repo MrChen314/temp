@@ -1,405 +1,407 @@
-from typing import Optional, Tuple
+# AttnDist Kernel 修改需求文档
 
-import torch
+## 需求场景
 
-import flash_mla.cuda as flash_mla_cuda
+修改 `workspace/flash-mla/csrc/sm90/prefill/sparse/attn_dist.cu`，实现类似 `workspace/indexer_loss/indexer_loss_kernel.py` 中计算 attn_dist 的功能。该功能用于计算稀疏注意力分布，将归一化的注意力概率在头维度上求和。
 
-def get_mla_metadata(
-    cache_seqlens: torch.Tensor,
-    num_q_tokens_per_head_k: int,
-    num_heads_k: int,
-    num_heads_q: Optional[int] = None,
-    is_fp8_kvcache: bool = False,
-    topk: Optional[int] = None
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Arguments:
-        cache_seqlens: (batch_size), dtype torch.int32.
-        num_q_tokens_per_head_k: Equals to num_q_tokens_per_q_seq * num_heads_q // num_heads_k.
-        num_heads_k: The number of k heads.
-        num_heads_q: The number of q heads. This argument is optional when sparse attention is not enabled
-        is_fp8_kvcache: Whether the k_cache and v_cache are in fp8 format.
-        topk: If not None, sparse attention will be enabled, and only tokens in the `indices` array passed to `flash_mla_with_kvcache_sm90` will be attended to.
+## 核心计算逻辑
 
-    Returns:
-        tile_scheduler_metadata: (num_sm_parts, TileSchedulerMetaDataSize), dtype torch.int32.
-        num_splits: (batch_size + 1), dtype torch.int32.
-    """
-    return flash_mla_cuda.get_mla_decoding_metadata(cache_seqlens, num_q_tokens_per_head_k, num_heads_k, num_heads_q, is_fp8_kvcache, topk)
+参考 `indexer_loss_kernel.py` 中的 `attn_sum_fwd` kernel：
+```python
+# 已有 lse = log2(sumexp) + m * sm_scale (来自 sparse_mla_fwd)
+# 计算 attn_prob = exp2(qk * sm_scale - lse)
+# attn_dist = sum(attn_prob, dim=heads)  # 对64个头求和
+```
 
+## 输入输出规格
 
-def flash_mla_with_kvcache(
-    q: torch.Tensor,
-    k_cache: torch.Tensor,
-    block_table: torch.Tensor,
-    cache_seqlens: torch.Tensor,
-    head_dim_v: int,
-    tile_scheduler_metadata: torch.Tensor,
-    num_splits: torch.Tensor,
-    softmax_scale: Optional[float] = None,
-    causal: bool = False,
-    is_fp8_kvcache: bool = False,
-    indices: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Arguments:
-        q: (batch_size, seq_len_q, num_heads_q, head_dim).
-        k_cache: (num_blocks, page_block_size, num_heads_k, head_dim).
-        block_table: (batch_size, max_num_blocks_per_seq), torch.int32.
-        cache_seqlens: (batch_size), torch.int32.
-        head_dim_v: Head dimension of v.
-        tile_scheduler_metadata: (num_sm_parts, TileSchedulerMetaDataSize), torch.int32, returned by get_mla_metadata.
-        num_splits: (batch_size + 1), torch.int32, returned by get_mla_metadata.
-        softmax_scale: float. The scale of QK^T before applying softmax. Default to 1 / sqrt(head_dim).
-        causal: bool. Whether to apply causal attention mask.
-        is_fp8_kvcache: bool. Whether the k_cache and v_cache are in fp8 format. For the format of FP8 KV cache, please refer to README.md
-        indices: (batch_size, seq_len_q, topk), torch.int32. If not None, sparse attention will be enabled, and only tokens in the `indices` array will be attended to. Invalid indices should be set to -1 or numbers >= total_seq_len_kv. For details about how to set up `indices`, please refer to README.md.
+### 输入张量
+- `Q`: `[s_q, h_q, d_qk]` - Query张量，bf16格式
+- `K`: `[s_kv, h_kv, d_qk]` - Key张量，bf16格式  
+- `indices`: `[s_q, h_kv, topk]` - 稀疏索引，int32格式
+- `lse`: `[s_q, h_q]` - 预计算的 log-sum-exp 值（log2-based），float32格式
 
-    Returns:
-        out: (batch_size, seq_len_q, num_heads_q, head_dim_v).
-        softmax_lse: (batch_size, num_heads_q, seq_len_q), torch.float32.
-    """
-    if softmax_scale is None:
-        softmax_scale = q.shape[-1] ** (-0.5)
-    if indices is not None:
-        assert causal == False, "causal must be `false` if sparse attention is enabled."
-    out, softmax_lse = flash_mla_cuda.fwd_kvcache_mla(
-        q,
-        k_cache,
-        head_dim_v,
-        cache_seqlens,
-        block_table,
-        softmax_scale,
-        causal,
-        tile_scheduler_metadata,
-        num_splits,
-        is_fp8_kvcache,
-        indices
-    )
-    return out, softmax_lse
+### 输出张量
+- `attn_dist`: `[h_q/B_H, s_q, topk]` - 注意力分布，float32格式
+  - 对于 128 heads，第一维为 2（每64个头为一组）
+  - 维度0 通过不同 thread blocks（由 `q_h_idx` 索引）分别写入
+  - 每个位置是该组 64 个头的注意力概率之和
 
+### 参数结构 (已定义在 params.h)
+```cpp
+struct AttnDistParams {
+    int s_q, s_kv, h_q, h_kv, d_qk, topk;
+    int q_start_index_s;  // Chunk offset for causal mask
+    int k_stride;         // K stride for causal mask
+    float sm_scale, sm_scale_div_log2;
 
-def flash_mla_sparse_fwd(
-    q: torch.Tensor,
-    kv: torch.Tensor,
-    indices: torch.Tensor,
-    sm_scale: float,
-    d_v: int = 512,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Sparse attention prefill kernel
+    cutlass::bfloat16_t* __restrict__ q;
+    cutlass::bfloat16_t* __restrict__ k;
+    int* __restrict__ indices;
+    float* __restrict__ lse;  // Pre-computed LSE (log2-based)
 
-    Args:
-        q: [s_q, h_q, d_qk], bfloat16
-        kv: [s_kv, h_kv, d_qk], bfloat16
-        indices: [s_q, h_kv, topk], int32. Invalid indices should be set to -1 or numbers >= s_kv
-        sm_scale: float
-        d_v: The dimension of value vectors. Can only be 512
+    int stride_q_s_q; int stride_q_h_q;
+    int stride_k_s_kv; int stride_k_h_kv;
+    int stride_indices_s_q; int stride_indices_h_kv;
 
-    Returns:
-        (output, max_logits, lse)
-        About the definition of output, max_logits and lse, please refer to README.md
-        - output: [s_q, h_q, d_v], bfloat16
-        - max_logits:  [s_q, h_q], float
-        - lse: [s_q, h_q], float, 2-based log-sum-exp
-    """
-    results = flash_mla_cuda.sparse_prefill_fwd(
-        q, kv, indices, sm_scale, d_v
-    )
-    return results
+    float* __restrict__ attn_sum;  // Output [2, s_q, topk]
+    cudaStream_t stream;
+};
+```
 
+## 架构技术方案
 
-def calc_attn_dist(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    indices: torch.Tensor,
-    lse: torch.Tensor,
-    q_start_index_s: int = 0,
-    k_stride: int = 1,
-    sm_scale: Optional[float] = None,
-    eps: float = 1e-10,
-) -> torch.Tensor:
-    """
-    Calculate attention distribution using pre-computed LSE.
+### 保留的原有机制
+1. **双buffer机制**：`plan.k[0]` 和 `plan.k[1]` 两个共享内存缓冲区
+2. **三warpgroup架构**（单个 thread block 内）：
+   - Warpgroup 0: 消费者，处理**偶数 topk blocks**（block_idx = 0, 2, 4, ...）
+   - Warpgroup 1: 消费者，处理**奇数 topk blocks**（block_idx = 1, 3, 5, ...）
+   - Warpgroup 2: 生产者，负责异步加载 K 到共享内存
+   - **两个 warpgroups 处理相同的 64 个 heads，但交替处理不同的 topk blocks**
+3. **Grid 划分**：
+   - `grid = ((h_q/B_H) * s_q, 1, 1)`
+   - `q_h_idx = blockIdx.x % (h_q/B_H)` 决定处理哪 64 个 heads
+   - 对于 128 heads，有 2 个 thread blocks 分别处理 heads 0-63 和 heads 64-127
+4. **QK GEMM函数**：
+   - `qkt_gemm_one_tile`: 计算单个tile的 Q @ K^T
+   - `pipelined_wait_and_qkt_gemm_l`: 等待并计算左半tiles (0-3)
+   - `pipelined_wait_and_qkt_gemm_r`: 等待并计算右半tiles (4-8)
+   - `pipelined_wait_and_qkt_gemm`: Warpgroup1的完整QK gemm
+
+### 删除的原有逻辑
+1. PV GEMM 相关代码（不需要计算 attention @ V）
+2. O 输出缓冲区和 store_O 函数
+3. online softmax 中的 O 缩放逻辑和 rO 累加
+4. **跨 warpgroup 共享注意力分数**（sS0, sS1, wg0_s0_ready, wg1_s1_ready 等同步机制）
+5. **跨 warpgroup L 归约**（reduce_L、sL 等）- 原本用于合并两个 warpgroup 的 softmax 分母
+
+### 简化设计说明
+由于不需要计算 P @ V，且每个 topk block 的结果可以独立输出：
+- **每个 warpgroup 独立处理各自负责的 topk blocks**
+- Warpgroup 0 处理偶数 topk blocks：计算 64 个头的 attn_prob 并求和，直接累加到 `attn_dist[q_h_idx, s_q_idx, block_idx*B_TOPK:(block_idx+1)*B_TOPK]`
+- Warpgroup 1 处理奇数 topk blocks：同上
+- 不需要 warpgroup 间的数据交换（不需要共享 sS0/sS1）
+- 仍需保留 K buffer 的生产者-消费者同步
+
+### 新增的计算逻辑
+1. **加载 lse**：每个线程加载对应head的 lse 值
+2. **计算归一化注意力概率**：
+   ```cpp
+   // rP 是 QK gemm 的结果 [B_H, B_TOPK] = [64, 64]
+   // lse 是预计算的值 [64] (每个head一个)
+   // attn_prob = exp2(rP * sm_scale - lse)
+   ```
+3. **头维度归约**：
+   ```cpp
+   // 对64个头的 attn_prob 求和
+   // attn_dist[topk_idx] = sum(attn_prob[:, topk_idx], dim=0)
+   ```
+4. **输出 attn_dist**：
+   ```cpp
+   // 写入 attn_dist[head_group_idx, s_q_idx, topk_idx]
+   ```
+
+## 影响文件
+
+| 修改类型 | 文件路径 | 影响的函数/结构 |
+|---------|---------|---------------|
+| 修改 | `workspace/flash-mla/csrc/sm90/prefill/sparse/attn_dist.cu` | 新增 `attn_dist_kernel` 及 `run_attn_dist_kernel` |
+
+## 详细实现
+
+### 1. SharedMemoryPlan 修改
+```cpp
+struct AttnDistSharedMemoryPlan {
+    // Q 共享内存 (复用原有)
+    array_aligned<bf16, cosize_v<SmemLayoutQ>> q;
+    // K 双buffer (复用原有)
+    array_aligned<bf16, cosize_v<SmemLayoutK>> k[2];
     
-    This kernel computes the sparse attention probabilities and sums them across
-    all heads, then normalizes to get the attention distribution.
+    // KV有效性掩码 (复用原有)
+    bool is_kv_valid[2][B_TOPK];
     
-    Computation:
-        1. Compute QK^T for selected K positions (via indices)
-        2. Apply softmax using pre-computed LSE: attn_prob = exp2(qk * sm_scale - lse)
-        3. Apply causal mask based on q_start_index_s and k_stride
-        4. Sum attention probabilities across all heads: attn_sum = sum(attn_prob, dim=heads)
-        5. Normalize: attn_dist = attn_sum / sum(attn_sum)
+    // Barriers (简化版，不需要 sS 相关的跨warpgroup同步)
+    transac_bar_t bar_q, bar_k0_free[2], bar_k0_ready[2], 
+                  bar_k1_free[2], bar_k1_ready[2], bar_is_kv_valid_ready;
     
-    Args:
-        q: [s_q, h_q, d_qk], bfloat16. Query tensor.
-        k: [s_kv, h_kv, d_qk], bfloat16. Key tensor.
-        indices: [s_q, h_kv, topk], int32. Sparse indices for K positions.
-            Invalid indices should be set to -1 or numbers >= s_kv.
-        lse: [s_q, h_q], float32. Pre-computed log-sum-exp (log2-based) from full attention.
-        q_start_index_s: int. Starting position of current chunk in full sequence (for causal mask).
-        k_stride: int. K stride for causal mask computation.
-        sm_scale: float. Softmax scale factor. Default to 1 / sqrt(d_qk).
-        eps: float. Epsilon for numerical stability in normalization.
+    // Warpgroup内头维度归约用共享内存
+    // 每个 warpgroup 独立使用各自的 buffer
+    float attn_dist_reduce[2][B_TOPK];  // [warpgroup_idx][topk_position]
+};
+```
+
+### 2. 核心kernel函数签名
+```cpp
+template<typename TmaParams>
+__global__ void __launch_bounds__(NUM_THREADS, 1, 1)
+attn_dist_kernel(
+    __grid_constant__ const AttnDistParams params, 
+    __grid_constant__ const TmaParams tma_params
+);
+```
+
+### 3. Warpgroup 0 计算流程
+```cpp
+// 1. 加载 Q (复用原有)
+// 2. 加载 lse 到寄存器
+float lse_local[2];  // 每个线程负责2行
+
+// 3. 双buffer流水线处理每个topk block
+for (int block_idx = 0; block_idx < num_topk_blocks; block_idx += 2) {
+    // 等待 K 就绪
+    pipelined_wait_and_qkt_gemm_l();
+    pipelined_wait_and_qkt_gemm_r();
+    warpgroup_wait<0>();
     
-    Constraints:
-        - h_kv must be 1
-        - d_qk must be 576
-        - topk must be a multiple of 64
-        - h_q must be a multiple of 64
-        - Only SM90 architecture is supported
+    // 应用掩码
+    mask_rP(Warpgroup0{});
     
-    Returns:
-        attn_dist: [s_q, topk], float32. Normalized attention distribution.
-    """
-    assert q.is_contiguous() and k.is_contiguous() and indices.is_contiguous() and lse.is_contiguous()
+    // 计算归一化注意力概率
+    // attn_prob = exp2(rP * sm_scale - lse)
+    for (int row_idx = 0; row_idx < 2; ++row_idx) {
+        for (int i = row_idx*2; i < size(rP); i += 4) {
+            rP(i) = exp2f(rP(i) * scale - lse_local[row_idx]);
+            rP(i+1) = exp2f(rP(i+1) * scale - lse_local[row_idx]);
+        }
+    }
     
-    s_q, h_q, d_qk = q.shape
-    s_kv, h_kv, _ = k.shape
-    _, _, topk = indices.shape
+    // 对64个头求和归约
+    // 使用 warp shuffle 进行归约
+    ...
+}
+```
+
+### 4. 头维度归约策略（Warpgroup 内独立归约）
+
+每个 warpgroup 独立处理其负责的 topk block，对 64 个头（行）求和：
+
+**WGMMA 64x64 数据布局分析：**
+```cpp
+// 128 线程（1 warpgroup = 4 warps × 32 threads），64×64 = 4096 个元素
+// 每个线程持有 32 个元素（2 行 × 16 列）
+
+// 行索引计算（get_AorC_row_idx）：
+// row_idx = (idx_in_warpgroup/32)*16 + local_row_idx*8 + (idx_in_warpgroup%32/4)
+// - (idx_in_warpgroup/32)*16: warp 索引 × 16（每 warp 负责 16 行）
+// - local_row_idx*8: 线程内 2 行相隔 8 行
+// - (idx_in_warpgroup%32/4): warp 内组索引（0-7），确定具体行
+
+// 列索引计算：
+// col_idx = 8*(i/4) + (idx_in_warpgroup%4)*2 + (i%2)
+// - 同一 warp 内 4 个连续线程 (t%4 = 0,1,2,3) 持有同一**行**的不同**列**
+// - 持有同一**列**的线程索引相差 4：线程 0,4,8,12,16,20,24,28 持有相同的列集合
+```
+
+**归约策略关键点：**
+- `shfl_xor(1)`, `shfl_xor(2)`: 行内归约（同一行的不同列）— 原代码用于求 max
+- `shfl_xor(4)`, `shfl_xor(8)`, `shfl_xor(16)`: **列归约（同一列的不同行）— 头维度求和需要这个**
+
+```cpp
+auto reduce_heads_and_store = [&](int block_idx) {
+    // Step 1: 每个线程先对自己持有的 2 行（相隔 8 行）在相同列上求和
+    // rP layout: 每 4 个元素一组，0,1 属于 row0 的两列，2,3 属于 row1 的相同两列
+    float local_sum[16];  // 16 个列位置的部分和
+    CUTE_UNROLL
+    for (int col_local = 0; col_local < 8; ++col_local) {
+        int i_row0 = col_local * 4;      // row 0 的元素起始
+        int i_row1 = col_local * 4 + 2;  // row 1 的元素起始
+        local_sum[col_local * 2] = rP(i_row0) + rP(i_row1);          // 列 0
+        local_sum[col_local * 2 + 1] = rP(i_row0 + 1) + rP(i_row1 + 1);  // 列 1
+    }
+    // 此时：每个线程持有 16 列的部分和（2 行已合并）
     
-    assert h_kv == 1, "h_kv must be 1"
-    assert d_qk == 576, "d_qk must be 576"
-    assert topk % 64 == 0, "topk must be a multiple of 64"
-    assert h_q % 64 == 0, "h_q must be a multiple of 64"
-    assert lse.shape == (s_q, h_q), f"lse shape mismatch: {lse.shape} vs {(s_q, h_q)}"
+    // Step 2: Warp 内列归约（同一列的不同行）
+    // 线程 t 和 t^4, t^8, t^16 持有同一列的不同行数据
+    // shfl_xor(4), shfl_xor(8), shfl_xor(16) 合并 warp 内 8 组线程
+    CUTE_UNROLL
+    for (int i = 0; i < 16; ++i) {
+        local_sum[i] += __shfl_xor_sync(0xffffffff, local_sum[i], 4);
+        local_sum[i] += __shfl_xor_sync(0xffffffff, local_sum[i], 8);
+        local_sum[i] += __shfl_xor_sync(0xffffffff, local_sum[i], 16);
+    }
+    // 此时：warp 内 32 个线程都持有相同的 16 行之和（但持有不同的列）
+    // 注意：每个线程仍然只知道自己负责的 16 列
     
-    if sm_scale is None:
-        sm_scale = d_qk ** (-0.5)
+    // Step 3: 跨 warp 归约 - 4 个 warp 各持有不同的 16 行
+    // 经过 shfl_xor(4,8,16) 后，warp 内每隔 4 的线程持有相同数据
+    // 所以每个 warp 只需要前 4 个线程（idx_in_warpgroup % 32 < 4）写入
+    // 4 个 warp × 4 个线程 = 16 个线程写入，每线程写 16 列
+    //
+    // ---- atomicAdd 工作原理说明 ----
+    // 
+    // 背景：4 个 warp 各自完成了对各自 16 行的归约：
+    //   - Warp 0 (idx_in_warpgroup 0-31): 持有行 0-15 的和
+    //   - Warp 1 (idx_in_warpgroup 32-63): 持有行 16-31 的和
+    //   - Warp 2 (idx_in_warpgroup 64-95): 持有行 32-47 的和
+    //   - Warp 3 (idx_in_warpgroup 96-127): 持有行 48-63 的和
+    //
+    // 列分布：同一 warp 内，线程 0,1,2,3 各负责不同的列集合：
+    //   - 线程 t%4=0: 负责列 0,1, 8,9, 16,17, 24,25, 32,33, 40,41, 48,49, 56,57
+    //   - 线程 t%4=1: 负责列 2,3, 10,11, 18,19, 26,27, 34,35, 42,43, 50,51, 58,59
+    //   - 线程 t%4=2: 负责列 4,5, 12,13, 20,21, 28,29, 36,37, 44,45, 52,53, 60,61
+    //   - 线程 t%4=3: 负责列 6,7, 14,15, 22,23, 30,31, 38,39, 46,47, 54,55, 62,63
+    //
+    // 写入冲突：
+    //   - Warp 0 的线程 0 要写入列 0,1,8,9,...
+    //   - Warp 1 的线程 0 也要写入列 0,1,8,9,...
+    //   - 同样，Warp 2 和 Warp 3 的线程 0 也写相同列
+    //   - 这 4 个线程的数据代表不同 16 行的部分和，必须累加才能得到 64 行的总和
+    //
+    // atomicAdd 作用：
+    //   - atomicAdd(&addr, val) 原子地执行 *addr += val
+    //   - 保证多线程并发写入同一地址时结果正确（不会丢失更新）
+    //   - 此处 4 个 warp 各贡献 16 行的和，最终累加为 64 行的总和
+    //
+    // 写入模式示意：
+    //   attn_dist_reduce[col_0] = warp0_sum[col_0] + warp1_sum[col_0] + warp2_sum[col_0] + warp3_sum[col_0]
+    //   （4 次 atomicAdd 操作累加完成）
+    //
+    if (idx_in_warpgroup % 32 < 4) {
+        CUTE_UNROLL
+        for (int i = 0; i < 16; ++i) {
+            int col_idx = 8 * (i / 2) + (idx_in_warpgroup % 4) * 2 + (i % 2);
+            atomicAdd(&plan.attn_dist_reduce[warpgroup_idx][col_idx], local_sum[i]);
+        }
+    }
     
-    # Call CUDA kernel to compute attn_sum
-    attn_sum = flash_mla_cuda.calc_attn_dist(
-        q, k, indices, lse,
-        q_start_index_s, k_stride, sm_scale
-    )
+    // Warpgroup 同步 - 等待所有 4 个 warp 完成写入
+    fence_view_async_shared();
+    NamedBarrier::arrive_and_wait(128, warpgroup_idx ? NamedBarriers::warpgroup1_sync : NamedBarriers::warpgroup0_sync);
     
-    # Normalize to get attn_dist
-    attn_total = attn_sum.sum(dim=-1, keepdim=True) + eps
-    attn_dist = attn_sum / attn_total
+    // Step 4: 使用 TMA store 写入全局内存（高效异步写入）
+    // 参考 fwd.cu 中 store_O 的实现模式：R→S→G (TMA)
+    bool s2g_pred = warp_idx % 4 == 0 && elect_one_sync();  // 每个 warpgroup 选一个线程执行 TMA
+    if (s2g_pred) {
+        SM90_TMA_STORE_3D::copy(
+            &tma_params.tensor_map_attn_dist,
+            plan.attn_dist_reduce[warpgroup_idx],  // 共享内存源地址
+            block_idx * B_TOPK,                     // topk 维度偏移
+            s_q_idx,                                // s_q 维度偏移
+            q_h_idx                                 // head_group 维度偏移
+        );
+    }
     
-    return attn_dist
+    // 清零供下一轮使用（所有线程参与，更快）
+    if (idx_in_warpgroup < B_TOPK) {
+        plan.attn_dist_reduce[warpgroup_idx][idx_in_warpgroup] = 0.0f;
+    }
+};
 
+// 在所有 topk blocks 处理完毕后，调用 tma_store_arrive 确保写入完成
+cute::tma_store_arrive();
+```
 
-def _flash_attn_varlen_forward(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    cu_seqlens_qo: torch.Tensor,
-    cu_seqlens_kv: torch.Tensor,
-    max_seqlen_qo: int,
-    max_seqlen_kv: int,
-    out: Optional[torch.Tensor] = None,
-    lse: Optional[torch.Tensor] = None,
-    causal: bool = False,
-    softmax_scale: Optional[float] = None,
-    is_varlen: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    qo_total_len, num_qo_heads, head_dim_qk = q.shape
-    kv_total_len, num_kv_heads, head_dim_vo = v.shape
+### 5. run_attn_dist_kernel 函数
+```cpp
+void run_attn_dist_kernel(const AttnDistParams& params) {
+    FLASH_ASSERT(params.h_kv == 1);
+    FLASH_ASSERT(params.topk % (2*B_TOPK) == 0);
+    FLASH_ASSERT(params.h_q % B_H == 0);
 
-    mask_mode_code = 1 if causal else 0
-    if softmax_scale is None:
-        softmax_scale = head_dim_qk ** (-0.5)
+    // 创建 TMA descriptors for Q (load)
+    auto shape_Q = make_shape(params.h_q, params.d_qk, params.s_q);
+    auto tma_Q = cute::make_tma_copy(
+        SM90_TMA_LOAD{},
+        make_tensor(
+            make_gmem_ptr((bf16*)params.q),
+            make_layout(
+                shape_Q,
+                make_stride(params.stride_q_h_q, _1{}, params.stride_q_s_q)
+            )
+        ),
+        SmemLayoutQ{}
+    );
 
-    if out is None:
-        out = torch.empty(qo_total_len, num_qo_heads, head_dim_vo, device=q.device, dtype=q.dtype)
-    if lse is None:
-        # Make lse contiguous on seqlen dim
-        lse = torch.empty(num_qo_heads, qo_total_len, device=q.device, dtype=torch.float32).T
+    // 创建 TMA tensor map for attn_dist output (store)
+    // attn_dist 形状: [h_q/B_H, s_q, topk]，数据类型: float32
+    CUtensorMap tensor_map_attn_dist;
+    {
+        // 3D tensor: [topk, s_q, h_q/B_H]（列优先）
+        uint64_t size[3] = {
+            (uint64_t)params.topk,           // dim 0: topk
+            (uint64_t)params.s_q,            // dim 1: s_q  
+            (uint64_t)(params.h_q / B_H)     // dim 2: head_groups (2 for 128 heads)
+        };
+        // stride 以字节为单位，从 dim 1 开始
+        uint64_t stride[2] = {
+            (uint64_t)params.topk * sizeof(float),                      // stride for dim 1
+            (uint64_t)params.topk * params.s_q * sizeof(float)          // stride for dim 2
+        };
+        // box_size: 每次 TMA 操作传输的大小
+        uint32_t box_size[3] = {B_TOPK, 1, 1};  // 每次传输 64 个 topk 位置
+        uint32_t elem_stride[3] = {1, 1, 1};
+        
+        CUresult res = CUTLASS_CUDA_DRIVER_WRAPPER_CALL(cuTensorMapEncodeTiled)(
+            &tensor_map_attn_dist,
+            CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_FLOAT32,  // float32 而非 bf16
+            3,
+            params.attn_sum,  // 全局内存地址
+            size,
+            stride,
+            box_size,
+            elem_stride,
+            CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
+            CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE,        // float32 不需要 swizzle
+            CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_NONE,
+            CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+        );
+        FLASH_ASSERT(res == CUresult::CUDA_SUCCESS);
+    }
 
-    workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.uint8, device=q.device)
-    flash_mla_cuda.dense_prefill_fwd(
-        workspace_buffer,
-        q,
-        k,
-        v,
-        cu_seqlens_qo,
-        cu_seqlens_kv,
-        out,
-        lse,
-        mask_mode_code,
-        softmax_scale,
-        max_seqlen_qo,
-        max_seqlen_kv,
-        is_varlen,
-    )
+    // 打包 TMA 参数
+    AttnDistTmaParams<decltype(shape_Q), decltype(tma_Q)> tma_params = {
+        shape_Q, tma_Q,
+        tensor_map_attn_dist
+    };
+    
+    auto kernel = &attn_dist_kernel<decltype(tma_params)>;
+    
+    // 配置 kernel launch
+    constexpr size_t smem_size = sizeof(AttnDistSharedMemoryPlan);
+    CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    
+    cutlass::ClusterLaunchParams launch_params = {
+        dim3((params.h_q/B_H)*params.s_q, 1, 1),
+        dim3(NUM_THREADS, 1, 1),
+        dim3(1, 1, 1),
+        smem_size,
+        params.stream
+    };
+    
+    cutlass::launch_kernel_on_cluster(launch_params, (void*)kernel, params, tma_params);
+    CHECK_CUDA_KERNEL_LAUNCH();
+}
+```
 
-    return out, lse
+## 边界条件与异常处理
 
+1. **索引有效性检查**：通过 `is_kv_valid` 掩码处理无效索引
+2. **因果掩码**：通过 `q_start_index_s` 和 `k_stride` 计算有效 K 范围
+3. **数值稳定性**：lse 已经是 log2-based，直接用于 exp2f 计算
+4. **边界对齐**：要求 `topk % (2*B_TOPK) == 0` 和 `h_q % B_H == 0`
 
-def _flash_attn_varlen_backward(
-    do: torch.Tensor,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    out: torch.Tensor,
-    lse: torch.Tensor,
-    cu_seqlens_qo: torch.Tensor,
-    cu_seqlens_kv: torch.Tensor,
-    max_seqlen_qo: int,
-    max_seqlen_kv: int,
-    dq: Optional[torch.Tensor] = None,
-    dk: Optional[torch.Tensor] = None,
-    dv: Optional[torch.Tensor] = None,
-    causal: bool = False,
-    softmax_scale: Optional[float] = None,
-    is_varlen: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    qo_total_len, num_qo_heads, head_dim_qk = q.shape
-    kv_total_len, num_kv_heads, head_dim_vo = v.shape
+## 数据流动路径
 
-    # TODO: fix bwd GQA
-    if num_qo_heads != num_kv_heads:
-        raise ValueError(f"SM100 bwd doesn't support GQA now. num_qo_heads: {num_qo_heads}, num_kv_heads: {num_kv_heads}.")
+```
+输入:
+Q[s_q, h_q, d_qk] → TMA → sQ[B_H, D_Q]
+K[s_kv, h_kv, d_qk] → cp.async → sK[B_TOPK, D_K] (双buffer)
+lse[s_q, h_q] → load → lse_local[2]
+indices[s_q, h_kv, topk] → load → token_indices
 
-    mask_mode_code = 1 if causal else 0
-    if softmax_scale is None:
-        softmax_scale = head_dim_qk ** (-0.5)
+计算:
+sQ × sK^T → rP[B_H, B_TOPK]  (QK gemm)
+attn_prob = exp2(rP * sm_scale - lse)
+attn_dist = reduce_sum(attn_prob, dim=heads)
 
-    if dq is None:
-        dq = torch.empty(qo_total_len, num_qo_heads, head_dim_qk, device=q.device, dtype=q.dtype)
-    if dk is None:
-        dk = torch.empty(kv_total_len, num_kv_heads, head_dim_qk, device=q.device, dtype=q.dtype)
-    if dv is None:
-        dv = torch.empty(kv_total_len, num_kv_heads, head_dim_vo, device=q.device, dtype=q.dtype)
+输出:
+attn_dist → store → attn_dist[h_q/B_H, s_q, topk]
+（不同 thread blocks 通过 q_h_idx 写入不同的 head group 输出）
+```
 
-    max_seqlen_qo_aligned = (max_seqlen_qo + 7) // 8 * 8
-    bs = cu_seqlens_qo.shape[0] - 1
-    workspace_bytes = 0
-    workspace_bytes += 4 * bs * max_seqlen_qo_aligned * num_qo_heads * head_dim_qk  # dQ_acc
-    workspace_bytes += 4 * max_seqlen_qo_aligned * bs * num_qo_heads * 2  # sum_OdO and scaled_lse
-    if num_qo_heads != num_kv_heads:
-        workspace_bytes += 2 * kv_total_len * num_qo_heads * (head_dim_qk + head_dim_vo)  # dKV_acc
-    workspace_buffer = torch.empty(workspace_bytes, dtype=torch.uint8, device=q.device)
-    flash_mla_cuda.dense_prefill_bwd(
-        workspace_buffer,
-        do,
-        q,
-        k,
-        v,
-        out,
-        lse,
-        cu_seqlens_qo,
-        cu_seqlens_kv,
-        dq,
-        dk,
-        dv,
-        mask_mode_code,
-        softmax_scale,
-        max_seqlen_qo,
-        max_seqlen_kv,
-        is_varlen,
-    )
+## 预期成果
 
-    return dq, dk, dv
-
-
-class FlashAttnVarlenFunc(torch.autograd.Function):
-    def forward(
-        ctx,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        cu_seqlens_qo: torch.Tensor,
-        cu_seqlens_kv: torch.Tensor,
-        max_seqlen_qo: int,
-        max_seqlen_kv: int,
-        causal: bool = False,
-        softmax_scale: Optional[float] = None,
-        is_varlen: bool = True,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        out, lse = _flash_attn_varlen_forward(
-            q, k, v,
-            cu_seqlens_qo, cu_seqlens_kv, max_seqlen_qo, max_seqlen_kv,
-            causal=causal, softmax_scale=softmax_scale,
-            is_varlen=is_varlen,
-        )
-        ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_qo, cu_seqlens_kv)
-        ctx.max_seqlen_qo = max_seqlen_qo
-        ctx.max_seqlen_kv = max_seqlen_kv
-        ctx.causal = causal
-        ctx.softmax_scale = softmax_scale
-        ctx.is_varlen = is_varlen
-        return out, lse
-
-    def backward(
-        ctx,
-        do: torch.Tensor,
-        dlse: torch.Tensor,
-    ):
-        del dlse  # LSE doesn't support backward currently
-        q, k, v, out, lse, cu_seqlens_qo, cu_seqlens_kv = ctx.saved_tensors
-        dq, dk, dv = _flash_attn_varlen_backward(
-            do, q, k, v, out, lse,
-            cu_seqlens_qo, cu_seqlens_kv, ctx.max_seqlen_qo, ctx.max_seqlen_kv,
-            causal=ctx.causal, softmax_scale=ctx.softmax_scale,
-            is_varlen=ctx.is_varlen,
-        )
-        return dq, dk, dv, None, None, None, None, None, None, None
-
-
-def flash_attn_varlen_func(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    cu_seqlens_qo: torch.Tensor,
-    cu_seqlens_kv: torch.Tensor,
-    max_seqlen_qo: int,
-    max_seqlen_kv: int,
-    dropout_p: float = 0.0,
-    softmax_scale: Optional[float] = None,
-    causal: bool = False,
-    deterministic: bool = False,
-    is_varlen: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    assert dropout_p == 0.0
-    assert not deterministic
-    return FlashAttnVarlenFunc.apply(
-        q, k, v,
-        cu_seqlens_qo, cu_seqlens_kv, max_seqlen_qo, max_seqlen_kv,
-        causal, softmax_scale, is_varlen,
-    )
-
-
-def flash_attn_varlen_qkvpacked_func(
-    qkv: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    max_seqlen: int,
-    head_dim_qk: int,
-    dropout_p: float = 0.0,
-    softmax_scale: Optional[float] = None,
-    causal: bool = False,
-    deterministic: bool = False,
-    is_varlen: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    assert dropout_p == 0.0
-    assert not deterministic
-    return FlashAttnVarlenFunc.apply(
-        qkv[:, :, :head_dim_qk], qkv[:, :, head_dim_qk:head_dim_qk * 2], qkv[:, :, head_dim_qk * 2:],
-        cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
-        causal, softmax_scale, is_varlen,
-    )
-
-
-def flash_attn_varlen_kvpacked_func(
-    q: torch.Tensor,
-    kv: torch.Tensor,
-    cu_seqlens_qo: torch.Tensor,
-    cu_seqlens_kv: torch.Tensor,
-    max_seqlen_qo: int,
-    max_seqlen_kv: int,
-    head_dim_qk: int,
-    dropout_p: float = 0.0,
-    softmax_scale: Optional[float] = None,
-    causal: bool = False,
-    deterministic: bool = False,
-    is_varlen: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    assert dropout_p == 0.0
-    assert not deterministic
-    return FlashAttnVarlenFunc.apply(
-        q, kv[:, :, :head_dim_qk], kv[:, :, head_dim_qk:],
-        cu_seqlens_qo, cu_seqlens_kv, max_seqlen_qo, max_seqlen_kv,
-        causal, softmax_scale, is_varlen,
-    )
+1. 实现 `attn_dist_kernel` 和 `run_attn_dist_kernel` 函数
+2. 保留原有的双buffer和QK gemm架构
+3. 正确计算归一化注意力概率并在头维度求和
+4. 输出形状为 `[2, s_q, topk]` 的注意力分布
