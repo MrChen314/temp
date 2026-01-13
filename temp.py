@@ -45,8 +45,12 @@ struct AttnDistSharedMemoryPlan {
 
     bool is_kv_valid[2][B_TOPK];
     
-    // Head dimension reduction buffer
-    float attn_dist_reduce[2][B_TOPK];  // [warpgroup_idx][topk_position]
+    // Head dimension reduction buffer - staged to avoid atomicAdd
+    // [warpgroup_idx][warp_idx][topk_position]
+    // Each warp writes to its own buffer, then we merge them
+    float attn_dist_reduce_staged[2][4][B_TOPK];
+    // Final merged result for TMA store
+    float attn_dist_reduce[2][B_TOPK];
     
     // Barriers
     transac_bar_t bar_q, bar_k0_free[2], bar_k0_ready[2], bar_k1_free[2], bar_k1_ready[2], bar_is_kv_valid_ready;
@@ -102,14 +106,7 @@ attn_dist_kernel(__grid_constant__ const AttnDistParams params, __grid_constant_
         }
         plan.bar_is_kv_valid_ready.init(16);
         
-        // Initialize reduction buffers to zero
-        CUTE_UNROLL
-        for (int wg = 0; wg < 2; ++wg) {
-            CUTE_UNROLL
-            for (int i = 0; i < B_TOPK; ++i) {
-                plan.attn_dist_reduce[wg][i] = 0.0f;
-            }
-        }
+        // No need to initialize reduction buffers - they are fully overwritten each iteration
         
         fence_barrier_init();
     }
@@ -180,6 +177,7 @@ attn_dist_kernel(__grid_constant__ const AttnDistParams params, __grid_constant_
         };
 
         // Reduce over heads and store to global memory using TMA
+        // Optimized: use staged writes to avoid atomicAdd (better for SM90)
         auto reduce_heads_and_store = [&](int block_idx, int wg_idx) {
             // Step 1: Each thread sums its 2 rows (8 rows apart) for each column
             // rP layout: every 4 elements form a group, 0,1 belong to row0's two columns, 2,3 belong to row1's same two columns
@@ -205,25 +203,40 @@ attn_dist_kernel(__grid_constant__ const AttnDistParams params, __grid_constant_
             // Now: all 32 threads in warp hold same 16 rows' sum (but hold different columns)
             // Note: each thread still only knows its responsible 16 columns
             
-            // Step 3: Cross-warp reduction - 4 warps each hold different 16 rows
-            // After shfl_xor(4,8,16), every 4 threads within warp hold same data
-            // So each warp only needs first 4 threads (idx_in_warpgroup % 32 < 4) to write
-            // 4 warps x 4 threads = 16 threads write, each thread writes 16 columns
-            //
-            // atomicAdd: 4 warps each contribute 16 rows' sum, finally accumulate to 64 rows' total sum
+            // Step 3: Cross-warp reduction using staged writes (NO atomicAdd!)
+            // Each warp writes to its own staging buffer to avoid conflicts
+            // After shfl_xor(4,8,16), threads t%4==0,1,2,3 hold same data within each warp
+            // So only first 4 threads per warp need to write
+            int warp_in_warpgroup = idx_in_warpgroup / 32;  // 0, 1, 2, 3
             if (idx_in_warpgroup % 32 < 4) {
                 CUTE_UNROLL
                 for (int i = 0; i < 16; ++i) {
                     int col_idx = 8 * (i / 2) + (idx_in_warpgroup % 4) * 2 + (i % 2);
-                    atomicAdd(&plan.attn_dist_reduce[wg_idx][col_idx], local_sum[i]);
+                    // Each warp writes to its own staging buffer - NO CONFLICT!
+                    plan.attn_dist_reduce_staged[wg_idx][warp_in_warpgroup][col_idx] = local_sum[i];
                 }
             }
             
-            // Warpgroup sync - wait for all 4 warps to complete writing to shared memory
+            // Warpgroup sync - wait for all 4 warps to complete staged writes
             fence_view_async_shared();
             NamedBarrier::arrive_and_wait(128, wg_idx ? NamedBarriers::warpgroup1_sync : NamedBarriers::warpgroup0_sync);
             
-            // Step 4: Write to global memory using TMA store
+            // Step 4: Merge the 4 staged buffers into final result
+            // 128 threads, 64 elements to compute, so each thread handles ~0.5 elements
+            // Use first 64 threads, each computes one final sum
+            if (idx_in_warpgroup < B_TOPK) {
+                plan.attn_dist_reduce[wg_idx][idx_in_warpgroup] = 
+                    plan.attn_dist_reduce_staged[wg_idx][0][idx_in_warpgroup] +
+                    plan.attn_dist_reduce_staged[wg_idx][1][idx_in_warpgroup] +
+                    plan.attn_dist_reduce_staged[wg_idx][2][idx_in_warpgroup] +
+                    plan.attn_dist_reduce_staged[wg_idx][3][idx_in_warpgroup];
+            }
+            
+            // Sync again to ensure merge is complete
+            fence_view_async_shared();
+            NamedBarrier::arrive_and_wait(128, wg_idx ? NamedBarriers::warpgroup1_sync : NamedBarriers::warpgroup0_sync);
+            
+            // Step 5: Write to global memory using TMA store
             // Only one thread per warpgroup executes the TMA store
             bool s2g_pred = (warp_idx % 4 == wg_idx) && elect_one_sync();
             if (s2g_pred) {
@@ -239,14 +252,6 @@ attn_dist_kernel(__grid_constant__ const AttnDistParams params, __grid_constant_
                 );
             }
             cute::tma_store_arrive();
-            
-            // Clear shared memory for next round (all threads participate for speed)
-            if (idx_in_warpgroup < B_TOPK) {
-                plan.attn_dist_reduce[wg_idx][idx_in_warpgroup] = 0.0f;
-            }
-            
-            // Sync again to ensure clear is complete before next iteration
-            NamedBarrier::arrive_and_wait(128, wg_idx ? NamedBarriers::warpgroup1_sync : NamedBarriers::warpgroup0_sync);
         };
 
 
