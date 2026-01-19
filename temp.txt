@@ -1,107 +1,13 @@
-# SM90 FWD Kernel 添加 QK 矩阵乘结果输出功能
-
-## 需求背景
-为 SM90 架构的 `workspace/flash-mla/csrc/sm90/prefill/sparse/fwd.cu` 添加输出 QK 矩阵乘结果（P 矩阵）的功能，与 SM100 版本保持一致。
-
-## 需求场景与处理逻辑
-
-### 核心需求
-1. **P 矩阵输出**：在 mask_rP 执行后、online_softmax 之前，将 fp32 格式的 P 矩阵输出到全局内存
-2. **条件控制**：当 `p_out != nullptr` 时才执行输出
-3. **双 Warpgroup 处理**：WG0 和 WG1 分别处理不同的 TopK block，需要各自输出
-
-### 数据布局与线程映射
-
-**SM90 架构特点**：
-- B_H = 64, B_TOPK = 64
-- 每两个 block (block_idx 和 block_idx+1) 由 WG0 和 WG1 分别处理
-- 使用 WGMMA 指令，rP fragment 的布局需要通过 `get_AorC_row_idx` 和 `get_AorC_col_idx` 映射
-
-**rP Fragment 布局**（每线程）：
-- 每个线程持有 rP 中 2 行 × 多列的数据
-- `local_row_idx` = 0 或 1 表示两行
-- 行索引：`row = (idx_in_warpgroup/32)*16 + local_row_idx*8 + (idx_in_warpgroup%32/4)`
-- 列索引：`col = 8*(local_elem_idx/4) + (idx_in_warpgroup%4)*2 + (local_elem_idx&1)`
-
-**输出布局**：`[s_q, h_q, topk]`
-- `s_q`：由 `s_q_idx` 决定
-- `h_q`：由 `q_h_idx * B_H + row` 决定
-- `topk`：由 `block_idx * B_TOPK + col` 决定（WG0 处理偶数 block，WG1 处理奇数 block）
-
-## 架构技术方案
-
-### 影响文件
-
-| 文件路径 | 修改类型 | 影响函数/结构体 |
-|---------|---------|----------------|
-| `workspace/flash-mla/csrc/params.h` | 已修改 | `SparsePrefillParams` 结构体（SM100已添加 p_out）|
-| `workspace/flash-mla/csrc/sm90/prefill/sparse/fwd.cu` | 逻辑添加 | `sparse_attn_fwd_kernel` WG0/WG1 部分 |
-
-### 实现细节
-
-#### fwd.cu 修改位置
-
-**WG0 部分**（约第 313 行后，mask_rP 调用后）：
-```cpp
-// 现有代码
-mask_rP(Warpgroup0{});
-
-// === 在此处插入 P 输出代码 ===
-
-online_softmax_and_rescale_o(Warpgroup0{});
-```
-
-**WG1 部分**（约第 414 行后，mask_rP 调用后）：
-```cpp
-// 现有代码
-mask_rP(Warpgroup1{});
-
-// === 在此处插入 P 输出代码 ===
-
-// Wait for WG0 (for sM), online softmax
-NamedBarrier::arrive_and_wait(256, NamedBarriers::wg0_bunch_0_ready);
-```
-
-**输出代码实现**（定义为 lambda 函数以复用）：
-```cpp
-auto store_rP_to_global = [&](auto warpgroup_idx, int block_idx) {
-    if (params.p_out == nullptr) return;
-    constexpr bool IS_WG1 = std::is_same_v<decltype(warpgroup_idx), Warpgroup1>;
-    int cur_block_idx = block_idx + (IS_WG1 ? 1 : 0);
-    CUTE_UNROLL
-    for (int row_idx = 0; row_idx < 2; ++row_idx) {
-        int real_row = get_AorC_row_idx(row_idx, idx_in_warpgroup);
-        int h_idx = q_h_idx * B_H + real_row;
-        CUTE_UNROLL
-        for (int i = row_idx*2; i < size(rP); i += 4) {
-            int real_col = get_AorC_col_idx(i, idx_in_warpgroup);
-            int topk_idx = cur_block_idx * B_TOPK + real_col;
-            float* p_out_ptr = params.p_out + s_q_idx * params.h_q * params.topk 
-                               + h_idx * params.topk + topk_idx;
-            p_out_ptr[0] = rP(i);
-            p_out_ptr[1] = rP(i+1);
-        }
-    }
-};
-```
-
-## 边界条件与异常处理
-1. **nullptr 检查**：`p_out == nullptr` 时跳过输出
-2. **双 warpgroup 协调**：WG0 输出 block_idx，WG1 输出 block_idx+1
-3. **已有 params.h 修改**：p_out 字段已在 SM100 任务中添加，无需重复添加
-
-## 数据流动路径
-```
-WGMMA 计算 (rP, fp32)
-    ↓ mask_rP
-寄存器 (rP, mask 后的值)
-    ↓ 全局内存写入（本次新增）
-Global Memory (params.p_out, fp32)
-    ↓ (继续原有流程)
-online_softmax_and_rescale_o...
-```
-
-## 预期成果
-1. SM90 架构支持与 SM100 相同的 P 矩阵输出功能
-2. 输出格式：`float32`，布局 `[s_q, h_q, topk]`
-3. 对原有 kernel 性能影响最
+instantiation of "void sm100::bwd::head64::sparse_attn_bwd_kernel<HAVE_ROPE,TmaParams>(sm100::bwd::head64::SparseAttnBwdParams, TmaParams) [with HAVE_ROPE=false, TmaParams=sm100::bwd::head64::TmaParams<cute::tuple<int, int, int>, cute::TiledCopy<cute::Copy_Atom<cute::Copy_Traits<cute::SM90_TMA_LOAD, cute::C<65536>, cute::AuxTmaParams<cute::tuple<cute::ScaledBasis<cute::C<1>, 1>, cute::ScaledBasis<cute::C<1>, 0>, cute::ScaledBasis<cute::C<1>, 2>>, const cute::Layout<cute::tuple<cute::C<64>, cute::C<64>, cute::_1>, cute::tuple<cute::ScaledBasis<cute::C<1>, 1>, cute::ScaledBasis<cute::C<1>, 0>, cute::ScaledBasis<cute::C<1>, 2>>> &, const cute::Swizzle<3, 4, 3> &>>, bf16>, cute::Layout<cute::tuple<cute::_1, cute::tuple<cute::tuple<cute::tuple<cute::C<64>, cute::C<64>>, cute::_8>>>, cute::tuple<cute::C<0>, cute::tuple<cute::tuple<cute::tuple<cute::_64, cute::_1>, cute::C<4096>>>>>, cute::tuple<cute::_64, cute::_512>>, cute::tuple<int, int, int>, cute::TiledCopy<cute::Copy_Atom<cute::Copy_Traits<cute::SM90_TMA_LOAD, cute::C<65536>, cute::AuxTmaParams<cute::tuple<cute::ScaledBasis<cute::C<1>, 1>, cute::ScaledBasis<cute::C<1>, 0>, cute::ScaledBasis<cute::C<1>, 2>>, const cute::Layout<cute::tuple<cute::C<64>, cute::C<64>, cute::_1>, cute::tuple<cute::ScaledBasis<cute::C<1>, 1>, cute::ScaledBasis<cute::C<1>, 0>, cute::ScaledBasis<cute::C<1>, 2>>> &, const cute::Swizzle<3, 4, 3> &>>, bf16>, cute::Layout<cute::tuple<cute::_1, cute::tuple<cute::tuple<cute::tuple<cute::C<64>, cute::C<64>>, cute::_8>>>, cute::tuple<cute::C<0>, cute::tuple<cute::tuple<cute::tuple<cute::_64, cute::_1>, cute::C<4096>>>>>, cute::tuple<cute::_64, cute::_512>>, cute::tuple<int, int, int>, cute::TiledCopy<cute::Copy_Atom<cute::Copy_Traits<cute::SM90_TMA_STORE, cute::C<65536>, cute::AuxTmaParams<cute::tuple<cute::ScaledBasis<cute::C<1>, 1>, cute::ScaledBasis<cute::C<1>, 0>, cute::ScaledBasis<cute::C<1>, 2>>, const cute::Layout<cute::tuple<cute::C<64>, cute::C<64>, cute::_1>, cute::tuple<cute::ScaledBasis<cute::C<1>, 1>, cute::ScaledBasis<cute::C<1>, 0>, cute::ScaledBasis<cute::C<1>, 2>>> &, const cute::Swizzle<3, 4, 3> &>>, bf16>, cute::Layout<cute::tuple<cute::_1, cute::tuple<cute::tuple<cute::tuple<cute::C<64>, cute::C<64>>, cute::C<9>>>>, cute::tuple<cute::C<0>, cute::tuple<cute::tuple<cute::tuple<cute::_64, cute::_1>, cute::C<4096>>>>>, cute::tuple<cute::C<64>, cute::C<576>>>>]" at line 733 of /home/users/chenquanlin/workspace/flash_mla_bwd/FlashMLA/csrc/sm100/prefill/sparse/bwd/head64/instantiations/../phase1.cuh
+                    instantiation of "void sm100::bwd::head64::run_bwd_phase1_kernel<D_QK>(const sm100::bwd::head64::SparseAttnBwdParams &) [with D_QK=512]" at line 5 of /home/users/chenquanlin/workspace/flash_mla_bwd/FlashMLA/csrc/sm100/prefill/sparse/bwd/head64/instantiations/phase1_k512.cu
+        
+        /home/users/chenquanlin/workspace/flash_mla_bwd/FlashMLA/csrc/sm100/prefill/sparse/bwd/head64/instantiations/../phase1.cuh(497): error: no instance of constructor "Tensor" matches the argument list
+                    argument types are: (<error-type>)
+                          Tensor sQ = make_tensor(make_smem_ptr(plan.dKV_cfg.q_buf.data()), SmemLayoutQ{});
+                                 ^
+                  detected during:
+                    instantiation of "void sm100::bwd::head64::sparse_attn_bwd_kernel<HAVE_ROPE,TmaParams>(sm100::bwd::head64::SparseAttnBwdParams, TmaParams) [with HAVE_ROPE=false, TmaParams=sm100::bwd::head64::TmaParams<cute::tuple<int, int, int>, cute::TiledCopy<cute::Copy_Atom<cute::Copy_Traits<cute::SM90_TMA_LOAD, cute::C<65536>, cute::AuxTmaParams<cute::tuple<cute::ScaledBasis<cute::C<1>, 1>, cute::ScaledBasis<cute::C<1>, 0>, cute::ScaledBasis<cute::C<1>, 2>>, const cute::Layout<cute::tuple<cute::C<64>, cute::C<64>, cute::_1>, cute::tuple<cute::ScaledBasis<cute::C<1>, 1>, cute::ScaledBasis<cute::C<1>, 0>, cute::ScaledBasis<cute::C<1>, 2>>> &, const cute::Swizzle<3, 4, 3> &>>, bf16>, cute::Layout<cute::tuple<cute::_1, cute::tuple<cute::tuple<cute::tuple<cute::C<64>, cute::C<64>>, cute::_8>>>, cute::tuple<cute::C<0>, cute::tuple<cute::tuple<cute::tuple<cute::_64, cute::_1>, cute::C<4096>>>>>, cute::tuple<cute::_64, cute::_512>>, cute::tuple<int, int, int>, cute::TiledCopy<cute::Copy_Atom<cute::Copy_Traits<cute::SM90_TMA_LOAD, cute::C<65536>, cute::AuxTmaParams<cute::tuple<cute::ScaledBasis<cute::C<1>, 1>, cute::ScaledBasis<cute::C<1>, 0>, cute::ScaledBasis<cute::C<1>, 2>>, const cute::Layout<cute::tuple<cute::C<64>, cute::C<64>, cute::_1>, cute::tuple<cute::ScaledBasis<cute::C<1>, 1>, cute::ScaledBasis<cute::C<1>, 0>, cute::ScaledBasis<cute::C<1>, 2>>> &, const cute::Swizzle<3, 4, 3> &>>, bf16>, cute::Layout<cute::tuple<cute::_1, cute::tuple<cute::tuple<cute::tuple<cute::C<64>, cute::C<64>>, cute::_8>>>, cute::tuple<cute::C<0>, cute::tuple<cute::tuple<cute::tuple<cute::_64, cute::_1>, cute::C<4096>>>>>, cute::tuple<cute::_64, cute::_512>>, cute::tuple<int, int, int>, cute::TiledCopy<cute::Copy_Atom<cute::Copy_Traits<cute::SM90_TMA_STORE, cute::C<65536>, cute::AuxTmaParams<cute::tuple<cute::ScaledBasis<cute::C<1>, 1>, cute::ScaledBasis<cute::C<1>, 0>, cute::ScaledBasis<cute::C<1>, 2>>, const cute::Layout<cute::tuple<cute::C<64>, cute::C<64>, cute::_1>, cute::tuple<cute::ScaledBasis<cute::C<1>, 1>, cute::ScaledBasis<cute::C<1>, 0>, cute::ScaledBasis<cute::C<1>, 2>>> &, const cute::Swizzle<3, 4, 3> &>>, bf16>, cute::Layout<cute::tuple<cute::_1, cute::tuple<cute::tuple<cute::tuple<cute::C<64>, cute::C<64>>, cute::C<9>>>>, cute::tuple<cute::C<0>, cute::tuple<cute::tuple<cute::tuple<cute::_64, cute::_1>, cute::C<4096>>>>>, cute::tuple<cute::C<64>, cute::C<576>>>>]" at line 733
+                    instantiation of "void sm100::bwd::head64::run_bwd_phase1_kernel<D_QK>(const sm100::bwd::head64::SparseAttnBwdParams &) [with D_QK=512]" at line 5 of /home/users/chenquanlin/workspace/flash_mla_bwd/FlashMLA/csrc/sm100/prefill/sparse/bwd/head64/instantiations/phase1_k512.cu
+        
+        /home/users/chenquanlin/workspace/flash_mla_bwd/FlashMLA/csrc/sm100/prefill/sparse/bwd/head64/instantiations/../phase1.cuh(497): error: cannot deduce class template arguments
+                          Tensor sQ = make_tensor(make_smem_ptr(plan.dKV_cfg.q_buf.data()), SmemLayoutQ{});
