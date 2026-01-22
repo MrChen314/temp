@@ -2,12 +2,16 @@
 """
 Triton 实现的 Sparse MLA Backward Pass
 参考 tilelang 版本实现，与 ref_sparse_mla_bwd_interface 对比精度
+
+关键优化：
+1. 分块处理 D 维度，避免共享内存/寄存器溢出
+2. 使用较小的 block size: BLOCK_H=64, BLOCK_N=32
+3. 分阶段计算和写回
 """
 
 import torch
 import triton
 import triton.language as tl
-# from utils import assert_tensors_similar
 
 
 # ============================================================================
@@ -30,42 +34,30 @@ def preprocess_kernel(
     计算 Delta[b, s, h] = sum_d(O[b, s, h, d] * dO[b, s, h, d])
     Grid: (H, S, B)
     """
-    # 获取当前 block 的索引
     h_idx = tl.program_id(0)
     s_idx = tl.program_id(1)
     b_idx = tl.program_id(2)
     
-    # 计算 O 和 dO 的基址
     o_base = b_idx * stride_o_b + s_idx * stride_o_s + h_idx * stride_o_h
     do_base = b_idx * stride_do_b + s_idx * stride_do_s + h_idx * stride_do_h
     
-    # 累加器
     acc = 0.0
     
-    # 遍历 D 维度
     for d_start in range(0, D, BLOCK_D):
         d_offs = d_start + tl.arange(0, BLOCK_D)
         d_mask = d_offs < D
         
-        # 加载 O 和 dO
         o_vals = tl.load(O_ptr + o_base + d_offs * stride_o_d, mask=d_mask, other=0.0)
         do_vals = tl.load(dO_ptr + do_base + d_offs * stride_do_d, mask=d_mask, other=0.0)
         
-        # 累加 O * dO
         acc += tl.sum(o_vals.to(tl.float32) * do_vals.to(tl.float32))
     
-    # 存储结果
     delta_offset = b_idx * stride_delta_b + s_idx * stride_delta_s + h_idx * stride_delta_h
     tl.store(Delta_ptr + delta_offset, acc)
 
 
 def launch_preprocess(O, dO):
-    """
-    启动 preprocess kernel
-    O: [B, S, H, D]
-    dO: [B, S, H, D]
-    返回: Delta [B, S, H]
-    """
+    """启动 preprocess kernel"""
     B, S, H, D = O.shape
     Delta = torch.empty((B, S, H), dtype=torch.float32, device=O.device)
     
@@ -89,15 +81,12 @@ def launch_preprocess(O, dO):
 # ============================================================================
 @triton.jit
 def postprocess_kernel(
-    dKV_fp32_ptr,   # [B, S_kv, kv_group, D+D_tail] float32
-    dKV_bf16_ptr,   # [B, S_kv, kv_group, D+D_tail] bfloat16
-    stride_b, stride_s, stride_g, stride_d,
+    dKV_fp32_ptr,
+    dKV_bf16_ptr,
     total_elements: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """
-    将 dKV 从 float32 转换为 bfloat16
-    """
+    """将 dKV 从 float32 转换为 bfloat16"""
     pid = tl.program_id(0)
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offs < total_elements
@@ -107,11 +96,7 @@ def postprocess_kernel(
 
 
 def launch_postprocess(dKV_fp32):
-    """
-    启动 postprocess kernel
-    dKV_fp32: [B, S_kv, kv_group, D+D_tail] float32
-    返回: dKV_bf16 [B, S_kv, kv_group, D+D_tail] bfloat16
-    """
+    """启动 postprocess kernel"""
     dKV_bf16 = torch.empty_like(dKV_fp32, dtype=torch.bfloat16)
     total_elements = dKV_fp32.numel()
     
@@ -120,7 +105,6 @@ def launch_postprocess(dKV_fp32):
     
     postprocess_kernel[grid](
         dKV_fp32, dKV_bf16,
-        dKV_fp32.stride(0), dKV_fp32.stride(1), dKV_fp32.stride(2), dKV_fp32.stride(3),
         total_elements,
         BLOCK_SIZE,
     )
@@ -128,6 +112,9 @@ def launch_postprocess(dKV_fp32):
     return dKV_bf16
 
 
+# ============================================================================
+# Main BWD Kernel - 分块处理 D 维度
+# ============================================================================
 @triton.jit
 def sparse_mla_bwd_kernel(
     # 输入指针
@@ -157,7 +144,6 @@ def sparse_mla_bwd_kernel(
     # dKV strides
     stride_dkv_b, stride_dkv_s, stride_dkv_g, stride_dkv_d,
     # 常量参数
-    B: tl.constexpr,
     S: tl.constexpr,
     S_kv: tl.constexpr,
     H: tl.constexpr,
@@ -166,14 +152,20 @@ def sparse_mla_bwd_kernel(
     topk: tl.constexpr,
     kv_group: tl.constexpr,
     sm_scale,
-    # Block 大小
-    BLOCK_H: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_D: tl.constexpr,
+    # Block 大小 - 使用较小的 block 避免内存溢出
+    BLOCK_H: tl.constexpr,   # head block = 64
+    BLOCK_N: tl.constexpr,   # KV block = 32
+    BLOCK_D: tl.constexpr,   # D 分块大小 = 64
 ):
     """
-    优化版本的 Sparse MLA BWD kernel
-    使用向量化 tl.dot 操作
+    Sparse MLA BWD kernel
+    
+    关键优化: 分块处理 D 维度
+    - 将 D=512 分成 D/BLOCK_D = 8 个小块
+    - 每次只加载和计算一个 D 块
+    - 累加 attention scores 跨所有 D 块
+    
+    Grid: (S, B, kv_group * num_h_blocks)
     """
     sm_scale_log2 = sm_scale * 1.44269504
     
@@ -194,10 +186,6 @@ def sparse_mla_bwd_kernel(
     h_indices = h_start + h_offs
     h_mask = h_indices < ((g_idx + 1) * H_kv)
     
-    # D offsets
-    d_offs = tl.arange(0, BLOCK_D)
-    d_tail_offs = tl.arange(0, D_tail) if D_tail <= 64 else tl.arange(0, 64)
-    
     # Causal mask
     max_kv_idx = s_idx
     NS = topk // BLOCK_N
@@ -208,32 +196,16 @@ def sparse_mla_bwd_kernel(
     idx_base = b_idx * stride_idx_b + s_idx * stride_idx_s + g_idx * stride_idx_g
     kv_base = b_idx * stride_kv_b + g_idx * stride_kv_g
     
-    # 加载 Q: [BLOCK_H, D] - 分块加载
-    q_ptrs = Q_ptr + q_base + h_indices[:, None] * stride_q_h + d_offs[None, :] * stride_q_d
-    q_local = tl.load(q_ptrs, mask=h_mask[:, None] & (d_offs[None, :] < D), other=0.0).to(tl.float32)
-    
-    # 加载 Q_tail: [BLOCK_H, D_tail]
-    q_tail_ptrs = Q_ptr + q_base + h_indices[:, None] * stride_q_h + (D + d_tail_offs[None, :]) * stride_q_d
-    q_tail_local = tl.load(q_tail_ptrs, mask=h_mask[:, None] & (d_tail_offs[None, :] < D_tail), other=0.0).to(tl.float32)
-    
-    # 加载 dO: [BLOCK_H, D]
-    do_ptrs = dO_ptr + do_base + h_indices[:, None] * stride_do_h + d_offs[None, :] * stride_do_d
-    do_local = tl.load(do_ptrs, mask=h_mask[:, None] & (d_offs[None, :] < D), other=0.0).to(tl.float32)
-    
-    # 加载 Lse 和 Delta: [BLOCK_H]
+    # 加载 Lse 和 Delta: [BLOCK_H] - 这些是标量，很小
     lse_ptrs = Lse_ptr + b_idx * stride_lse_b + s_idx * stride_lse_s + h_indices * stride_lse_h
     lse_local = tl.load(lse_ptrs, mask=h_mask, other=0.0)
     
     delta_ptrs = Delta_ptr + b_idx * stride_delta_b + s_idx * stride_delta_s + h_indices * stride_delta_h
     delta_local = tl.load(delta_ptrs, mask=h_mask, other=0.0)
     
-    # 初始化 dQ 累加器
-    acc_dq = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
-    acc_dq_tail = tl.zeros([BLOCK_H, D_tail if D_tail <= 64 else 64], dtype=tl.float32)
-    
-    # 主循环
+    # ========== 主循环: 遍历 index blocks ==========
     for i_block in range(NS):
-        # 加载 indices
+        # 加载 indices: [BLOCK_N]
         n_offs = tl.arange(0, BLOCK_N)
         idx_ptrs = Indices_ptr + idx_base + (i_block * BLOCK_N + n_offs) * stride_idx_k
         indices = tl.load(idx_ptrs)
@@ -241,28 +213,51 @@ def sparse_mla_bwd_kernel(
         # Causal mask
         causal_mask = indices <= max_kv_idx
         
-        # 加载 KV: [BLOCK_N, D] 通过 gather
-        kv_local = tl.zeros([BLOCK_N, BLOCK_D], dtype=tl.float32)
-        kv_tail_local = tl.zeros([BLOCK_N, D_tail if D_tail <= 64 else 64], dtype=tl.float32)
+        # ========== 阶段1: 计算 attention scores (需要遍历所有 D 块) ==========
+        # acc_p = Q @ KV^T, 需要累加所有 D 块的贡献
+        acc_p = tl.zeros([BLOCK_H, BLOCK_N], dtype=tl.float32)
         
+        # 遍历 D 维度的块 (D 部分)
+        d_offs = tl.arange(0, BLOCK_D)
+        for d_block in range(0, D, BLOCK_D):
+            d_idx = d_block + d_offs
+            d_mask = d_idx < D
+            
+            # 加载 Q 块: [BLOCK_H, BLOCK_D]
+            q_ptrs = Q_ptr + q_base + h_indices[:, None] * stride_q_h + d_idx[None, :] * stride_q_d
+            q_block = tl.load(q_ptrs, mask=h_mask[:, None] & d_mask[None, :], other=0.0).to(tl.float32)
+            
+            # 加载 KV 块: [BLOCK_N, BLOCK_D] 通过 gather
+            kv_block = tl.zeros([BLOCK_N, BLOCK_D], dtype=tl.float32)
+            for n_i in tl.static_range(BLOCK_N):
+                kv_idx = tl.load(Indices_ptr + idx_base + (i_block * BLOCK_N + n_i) * stride_idx_k)
+                kv_row_ptr = KV_ptr + kv_base + kv_idx * stride_kv_s
+                kv_d_ptrs = kv_row_ptr + d_idx * stride_kv_d
+                kv_row = tl.load(kv_d_ptrs, mask=d_mask, other=0.0).to(tl.float32)
+                kv_block = tl.where((tl.arange(0, BLOCK_N) == n_i)[:, None], kv_row[None, :], kv_block)
+            
+            # 累加: Q @ KV^T
+            acc_p += tl.dot(q_block, tl.trans(kv_block))
+        
+        # D_tail 部分
+        d_tail_offs = tl.arange(0, BLOCK_D)
+        d_tail_mask = d_tail_offs < D_tail
+        
+        # 加载 Q_tail: [BLOCK_H, D_tail]
+        q_tail_ptrs = Q_ptr + q_base + h_indices[:, None] * stride_q_h + (D + d_tail_offs[None, :]) * stride_q_d
+        q_tail = tl.load(q_tail_ptrs, mask=h_mask[:, None] & d_tail_mask[None, :], other=0.0).to(tl.float32)
+        
+        # 加载 KV_tail: [BLOCK_N, D_tail]
+        kv_tail = tl.zeros([BLOCK_N, BLOCK_D], dtype=tl.float32)
         for n_i in tl.static_range(BLOCK_N):
             kv_idx = tl.load(Indices_ptr + idx_base + (i_block * BLOCK_N + n_i) * stride_idx_k)
             kv_row_ptr = KV_ptr + kv_base + kv_idx * stride_kv_s
-            
-            # 加载 KV 的 D 部分
-            kv_d_ptrs = kv_row_ptr + d_offs * stride_kv_d
-            kv_row = tl.load(kv_d_ptrs, mask=d_offs < D, other=0.0).to(tl.float32)
-            kv_local = tl.where((tl.arange(0, BLOCK_N) == n_i)[:, None], kv_row[None, :], kv_local)
-            
-            # 加载 KV_tail
             kv_tail_ptrs = kv_row_ptr + (D + d_tail_offs) * stride_kv_d
-            kv_tail_row = tl.load(kv_tail_ptrs, mask=d_tail_offs < D_tail, other=0.0).to(tl.float32)
-            kv_tail_local = tl.where((tl.arange(0, BLOCK_N) == n_i)[:, None], kv_tail_row[None, :], kv_tail_local)
+            kv_tail_row = tl.load(kv_tail_ptrs, mask=d_tail_mask, other=0.0).to(tl.float32)
+            kv_tail = tl.where((tl.arange(0, BLOCK_N) == n_i)[:, None], kv_tail_row[None, :], kv_tail)
         
-        # 计算 attention scores: Q @ KV^T
-        # [BLOCK_H, BLOCK_D] @ [BLOCK_D, BLOCK_N] -> [BLOCK_H, BLOCK_N]
-        acc_p = tl.dot(q_local, tl.trans(kv_local))
-        acc_p += tl.dot(q_tail_local, tl.trans(kv_tail_local))
+        # 累加 Q_tail @ KV_tail^T
+        acc_p += tl.dot(q_tail, tl.trans(kv_tail))
         
         # 应用 causal mask
         acc_p = tl.where(causal_mask[None, :], acc_p, -1e10)
@@ -270,46 +265,112 @@ def sparse_mla_bwd_kernel(
         # P = exp2(acc_p * sm_scale_log2 - Lse)
         P = tl.exp2(acc_p * sm_scale_log2 - lse_local[:, None])
         
-        # 计算 dP = dO @ V^T
-        acc_dp = tl.dot(do_local, tl.trans(kv_local))
+        # ========== 阶段2: 计算 dP ==========
+        # acc_dp = dO @ V^T (V = KV[:, :D])
+        acc_dp = tl.zeros([BLOCK_H, BLOCK_N], dtype=tl.float32)
+        
+        for d_block in range(0, D, BLOCK_D):
+            d_idx = d_block + d_offs
+            d_mask = d_idx < D
+            
+            # 加载 dO 块: [BLOCK_H, BLOCK_D]
+            do_ptrs = dO_ptr + do_base + h_indices[:, None] * stride_do_h + d_idx[None, :] * stride_do_d
+            do_block = tl.load(do_ptrs, mask=h_mask[:, None] & d_mask[None, :], other=0.0).to(tl.float32)
+            
+            # 加载 V 块 (= KV[:, :D]): [BLOCK_N, BLOCK_D]
+            v_block = tl.zeros([BLOCK_N, BLOCK_D], dtype=tl.float32)
+            for n_i in tl.static_range(BLOCK_N):
+                kv_idx = tl.load(Indices_ptr + idx_base + (i_block * BLOCK_N + n_i) * stride_idx_k)
+                kv_row_ptr = KV_ptr + kv_base + kv_idx * stride_kv_s
+                kv_d_ptrs = kv_row_ptr + d_idx * stride_kv_d
+                kv_row = tl.load(kv_d_ptrs, mask=d_mask, other=0.0).to(tl.float32)
+                v_block = tl.where((tl.arange(0, BLOCK_N) == n_i)[:, None], kv_row[None, :], v_block)
+            
+            # 累加: dO @ V^T
+            acc_dp += tl.dot(do_block, tl.trans(v_block))
         
         # dP = P * (acc_dp - Delta) * sm_scale
         dP = P * (acc_dp - delta_local[:, None]) * sm_scale
         
-        # 累加 dQ: dP @ KV
-        acc_dq += tl.dot(dP.to(q_local.dtype), kv_local)
-        acc_dq_tail += tl.dot(dP.to(q_tail_local.dtype), kv_tail_local)
+        # ========== 阶段3: 累加 dQ (分块处理) ==========
+        for d_block in range(0, D, BLOCK_D):
+            d_idx = d_block + d_offs
+            d_mask = d_idx < D
+            
+            # 加载 KV 块用于计算 dQ
+            kv_block = tl.zeros([BLOCK_N, BLOCK_D], dtype=tl.float32)
+            for n_i in tl.static_range(BLOCK_N):
+                kv_idx = tl.load(Indices_ptr + idx_base + (i_block * BLOCK_N + n_i) * stride_idx_k)
+                kv_row_ptr = KV_ptr + kv_base + kv_idx * stride_kv_s
+                kv_d_ptrs = kv_row_ptr + d_idx * stride_kv_d
+                kv_row = tl.load(kv_d_ptrs, mask=d_mask, other=0.0).to(tl.float32)
+                kv_block = tl.where((tl.arange(0, BLOCK_N) == n_i)[:, None], kv_row[None, :], kv_block)
+            
+            # dQ 块 = dP @ KV: [BLOCK_H, BLOCK_D]
+            dq_block = tl.dot(dP.to(tl.float32), kv_block)
+            
+            # 原子累加到 dQ (因为多个 index block 会累加到同一个 dQ 位置)
+            dq_base = b_idx * stride_dq_b + s_idx * stride_dq_s
+            dq_ptrs = dQ_ptr + dq_base + h_indices[:, None] * stride_dq_h + d_idx[None, :] * stride_dq_d
+            
+            # 使用原子加法累加 dQ
+            for h_i in tl.static_range(BLOCK_H):
+                for d_i in tl.static_range(BLOCK_D):
+                    if (h_start + h_i) < H and (d_block + d_i) < D:
+                        tl.atomic_add(dQ_ptr + dq_base + (h_start + h_i) * stride_dq_h + (d_block + d_i) * stride_dq_d, 
+                                     dq_block[h_i, d_i])
         
-        # 计算 dKV 并原子累加
-        # dKV = dP^T @ Q + P^T @ dO: [BLOCK_N, D]
-        dkv_local = tl.dot(tl.trans(dP.to(q_local.dtype)), q_local) + tl.dot(tl.trans(P.to(do_local.dtype)), do_local)
-        dkv_tail_local = tl.dot(tl.trans(dP.to(q_tail_local.dtype)), q_tail_local)
+        # dQ_tail = dP @ KV_tail
+        dq_tail_block = tl.dot(dP.to(tl.float32), kv_tail)
         
-        # 原子累加到 dKV
+        # 原子累加 dQ_tail
+        for h_i in tl.static_range(BLOCK_H):
+            for d_i in tl.static_range(BLOCK_D):
+                if (h_start + h_i) < H and d_i < D_tail:
+                    tl.atomic_add(dQ_ptr + b_idx * stride_dq_b + s_idx * stride_dq_s + 
+                                 (h_start + h_i) * stride_dq_h + (D + d_i) * stride_dq_d,
+                                 dq_tail_block[h_i, d_i])
+        
+        # ========== 阶段4: 计算并原子累加 dKV (分块处理) ==========
+        for d_block in range(0, D, BLOCK_D):
+            d_idx = d_block + d_offs
+            d_mask = d_idx < D
+            
+            # 加载 Q 块
+            q_ptrs = Q_ptr + q_base + h_indices[:, None] * stride_q_h + d_idx[None, :] * stride_q_d
+            q_block = tl.load(q_ptrs, mask=h_mask[:, None] & d_mask[None, :], other=0.0).to(tl.float32)
+            
+            # 加载 dO 块
+            do_ptrs = dO_ptr + do_base + h_indices[:, None] * stride_do_h + d_idx[None, :] * stride_do_d
+            do_block = tl.load(do_ptrs, mask=h_mask[:, None] & d_mask[None, :], other=0.0).to(tl.float32)
+            
+            # dKV = dP^T @ Q + P^T @ dO: [BLOCK_N, BLOCK_D]
+            dkv_block = tl.dot(tl.trans(dP.to(tl.float32)), q_block) + tl.dot(tl.trans(P.to(tl.float32)), do_block)
+            
+            # 原子累加到 dKV
+            for n_i in tl.static_range(BLOCK_N):
+                kv_idx = tl.load(Indices_ptr + idx_base + (i_block * BLOCK_N + n_i) * stride_idx_k)
+                dkv_row_ptr = dKV_ptr + b_idx * stride_dkv_b + kv_idx * stride_dkv_s + g_idx * stride_dkv_g
+                
+                # 提取第 n_i 行
+                n_mask = tl.arange(0, BLOCK_N) == n_i
+                dkv_row = tl.sum(tl.where(n_mask[:, None], dkv_block, 0.0), axis=0)
+                
+                # 向量化原子累加
+                tl.atomic_add(dkv_row_ptr + d_idx * stride_dkv_d, dkv_row, mask=d_mask)
+        
+        # dKV_tail = dP^T @ Q_tail: [BLOCK_N, D_tail]
+        dkv_tail_block = tl.dot(tl.trans(dP.to(tl.float32)), q_tail)
+        
+        # 原子累加 dKV_tail
         for n_i in tl.static_range(BLOCK_N):
             kv_idx = tl.load(Indices_ptr + idx_base + (i_block * BLOCK_N + n_i) * stride_idx_k)
             dkv_row_ptr = dKV_ptr + b_idx * stride_dkv_b + kv_idx * stride_dkv_s + g_idx * stride_dkv_g
             
-            # 提取第 n_i 行 (使用 mask + sum 代替直接索引)
             n_mask = tl.arange(0, BLOCK_N) == n_i
-            dkv_row = tl.sum(tl.where(n_mask[:, None], dkv_local, 0.0), axis=0)
-            dkv_tail_row = tl.sum(tl.where(n_mask[:, None], dkv_tail_local, 0.0), axis=0)
+            dkv_tail_row = tl.sum(tl.where(n_mask[:, None], dkv_tail_block, 0.0), axis=0)
             
-            # 向量化原子累加 D 部分
-            d_offs_local = tl.arange(0, BLOCK_D)
-            tl.atomic_add(dkv_row_ptr + d_offs_local * stride_dkv_d, dkv_row, mask=d_offs_local < D)
-            
-            # 向量化原子累加 D_tail 部分
-            d_tail_offs_local = tl.arange(0, D_tail) if D_tail <= 64 else tl.arange(0, 64)
-            tl.atomic_add(dkv_row_ptr + (D + d_tail_offs_local) * stride_dkv_d, dkv_tail_row, mask=d_tail_offs_local < D_tail)
-    
-    # 存储 dQ
-    dq_base = b_idx * stride_dq_b + s_idx * stride_dq_s
-    dq_ptrs = dQ_ptr + dq_base + h_indices[:, None] * stride_dq_h + d_offs[None, :] * stride_dq_d
-    tl.store(dq_ptrs, acc_dq.to(tl.bfloat16), mask=h_mask[:, None] & (d_offs[None, :] < D))
-    
-    dq_tail_ptrs = dQ_ptr + dq_base + h_indices[:, None] * stride_dq_h + (D + d_tail_offs[None, :]) * stride_dq_d
-    tl.store(dq_tail_ptrs, acc_dq_tail.to(tl.bfloat16), mask=h_mask[:, None] & (d_tail_offs[None, :] < D_tail))
+            tl.atomic_add(dkv_row_ptr + (D + d_tail_offs) * stride_dkv_d, dkv_tail_row, mask=d_tail_mask)
 
 
 # ============================================================================
@@ -352,15 +413,16 @@ def sparse_mla_bwd_triton(q, kv, o, do, indices, lse, sm_scale=None, is_causal=T
     # Step 1: Preprocess - 计算 Delta
     delta = launch_preprocess(o, do)
     
-    # Step 2: 分配输出 tensors
-    dq = torch.zeros_like(q)
+    # Step 2: 分配输出 tensors (dQ 使用 float32 因为要原子累加)
+    dq = torch.zeros(B, S, H, DQKV, dtype=torch.float32, device=q.device)
     dkv = torch.zeros(B, S_kv, kv_group, DQKV, dtype=torch.float32, device=q.device)
     
     # Step 3: 启动主 BWD kernel
     H_kv = H // kv_group
-    BLOCK_H = min(64, max(16, H_kv))  # 根据 H_kv 调整
-    BLOCK_N = 32  # Index block size
-    BLOCK_D = 512  # D 的处理块大小
+    # 使用较小的 block size 以避免内存溢出
+    BLOCK_H = min(64, max(16, H_kv))
+    BLOCK_N = 32   # 与 tilelang 一致
+    BLOCK_D = 64   # 分块处理 D 维度
     
     num_h_blocks = (H_kv + BLOCK_H - 1) // BLOCK_H
     grid = (S, B, kv_group * num_h_blocks)
@@ -384,25 +446,24 @@ def sparse_mla_bwd_triton(q, kv, o, do, indices, lse, sm_scale=None, is_causal=T
         # dKV strides
         dkv.stride(0), dkv.stride(1), dkv.stride(2), dkv.stride(3),
         # 常量
-        B, S, S_kv, H, D, D_tail, topk, kv_group,
+        S, S_kv, H, D, D_tail, topk, kv_group,
         sm_scale,
         BLOCK_H, BLOCK_N, BLOCK_D,
     )
     
-    # Step 4: Postprocess - 转换 dkv 为 bfloat16
+    # Step 4: 转换为 bfloat16
+    dq = dq.to(torch.bfloat16)
     dkv = launch_postprocess(dkv)
     
     return dq, dkv
 
 
 # ============================================================================
-# 参考实现 (从 sparse_mla_bwd.py 导入)
+# 参考实现
 # ============================================================================
 def ref_sparse_mla_bwd_interface(q, kv, o, do, indices, lse, sm_scale=None, is_causal=True):
-    """
-    参考实现：使用 PyTorch autograd 计算梯度
-    """
-    from sparse_mla_bwd.sparse_mla_fwd import ref_sparse_mla_fwd_interface
+    """参考实现：使用 PyTorch autograd 计算梯度"""
+    from sparse_mla_fwd import ref_sparse_mla_fwd_interface
     
     q = q.detach().clone()
     kv = kv.detach().clone()
@@ -452,15 +513,16 @@ def test_sparse_mla_bwd_triton(
     
     if check_correctness:
         # 精度检查
-        def calc_diff(a, b):
-            abs_diff = torch.abs(a - b)
+        def calc_diff(name, a, b):
+            abs_diff = torch.abs(a.float() - b.float())
             max_diff = abs_diff.max().item()
-            rel_diff = (abs_diff / (1e-4 + torch.abs(a))).mean().item()
+            mean_diff = abs_diff.mean().item()
+            rel_diff = (abs_diff / (1e-6 + torch.abs(b.float()))).mean().item()
+            print(f"{name}: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}, rel_diff={rel_diff:.6f}")
             return max_diff, rel_diff
 
-        max_diff, rel_diff = calc_diff(ref_dq, triton_dq)
-        max_diff, rel_diff = calc_diff(ref_dkv, triton_dkv)
-        print(f"{max_diff=}\n{rel_diff=}\n")
+        calc_diff("dQ", triton_dq, ref_dq)
+        calc_diff("dKV", triton_dkv, ref_dkv)
     
     # 性能测试
     per_token_flop = 2 * sum([
