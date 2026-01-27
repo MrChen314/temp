@@ -1,7 +1,392 @@
-// KV RoPE 用于 TiledMMA 的 Layout: [B_TOPK*2, D_ROPE/2] = [64, 32]
-// RoPE 部分也采用类似的 Dual GEMM 结构
-using SmemLayoutKVRoPE_TiledMMA = decltype(coalesce(tile_to_shape(
-    UMMA::Layout_K_SW64_Atom<bf16>{},
-    Shape<Int<B_TOPK*2>, Int<D_ROPE/2>>{},  // [64, 32]
+# Dual GEMM 输出到 TMEM 的映射机制
+
+## 核心答案
+
+**由 K 矩阵在 TMEM 中的行位置决定输出位置！**
+
+```
+Part 0: Q @ K[0:64]^T   → 输出到 TMEM P 的行 0-63
+Part 1: Q @ K[64:128]^T → 输出到 TMEM P 的行 64-127
+
+关键: K 矩阵的行索引决定了输出 P 的行索引
+```
+
+## 详细解释
+
+### 1. GEMM 的基本映射规则
+
+#### 标准 GEMM
+
+```
+C = A @ B^T
+
+其中:
+A: [M, K]
+B: [N, K]
+C: [M, N]
+
+C[i, j] = sum(A[i, k] * B[j, k] for k in range(K))
+```
+
+**关键**：输出 C 的行索引 i 来自 A，列索引 j 来自 B。
+
+#### 在 TMEM 中
+
+```
+对于 tcgen05.mma 指令:
+- A 矩阵在 TMEM 中
+- B 矩阵在 SMEM 中
+- C 矩阵输出到 TMEM 中
+
+输出映射:
+C 的行索引 = B 矩阵的行索引
+C 的列索引 = A 矩阵的列索引（在 TMEM 中的位置）
+```
+
+**等等，为什么 C 的行索引来自 B？**
+
+### 2. TMEM MMA 的特殊性
+
+#### tcgen05.mma.ts 的语义
+
+```cpp
+ku::utcmma_ts(tiled_mma_P, tQ, sK, tP, clear_accum);
+```
+
+**参数**:
+- `tQ`: A 矩阵，在 TMEM 中（Tensor Memory）
+- `sK`: B 矩阵，在 SMEM 中（Shared Memory）
+- `tP`: C 矩阵，输出到 TMEM 中
+
+**计算**:
+```
+P = Q @ K^T
+```
+
+#### TMEM 的 2D 坐标系统
+
+```
+TMEM 是一个 2D 数组:
+- 行维度（Row）: 0-511
+- 列维度（Col）: 0-511
+
+每个 MMA 操作:
+- 从 TMEM 读取 A（Q）
+- 从 SMEM 读取 B（K）
+- 写入 TMEM 的 C（P）
+
+输出位置由 B 矩阵的 shape 和 layout 决定！
+```
+
+### 3. Dual GEMM 的 K 矩阵布局
+
+#### K_nope 的 Reshape
+
+```cpp
+// config.h
+using SmemLayoutKNoPE_TiledMMA = decltype(coalesce(tile_to_shape(
+    UMMA::Layout_K_SW128_Atom<bf16>{},
+    Shape<Int<B_TOPK*2>, Int<D_V/2>>{},  // [128, 256]
     Step<_1, _2>{}
 ), Shape<_1, _1>{}));
+
+// phase1.cuh
+Tensor sK_nope = make_tensor(
+    make_smem_ptr(plan.u.k.k_nope[cur_buf].data()), 
+    SmemLayoutKNoPE_TiledMMA{}  // [128, 256]
+);
+```
+
+**K_nope 被 reshape 为 [128, 256]！**
+
+```
+原始: K_nope [64, 512]
+Reshape: K_nope_reshaped [128, 256]
+
+行 0-63:   K 的前 256 维（对应 Part 0）
+行 64-127: K 的后 256 维（对应 Part 1）
+```
+
+#### 分割 K 矩阵
+
+```cpp
+Tensor sK_nope_divided = flat_divide(sK_nope, Tile<Int<B_TOPK*2>, Int<D_V/4>>{})(_, _, _0{}, _);
+
+for (int kv_nope_part_idx = 0; kv_nope_part_idx < 2; ++kv_nope_part_idx) {
+    ku::utcmma_ts(tiled_mma_P, 
+                  kv_nope_part_idx ? tQ_nope_part1 : tQ_nope_part0,
+                  sK_nope_divided(_, _, kv_nope_part_idx),
+                  tP, clear_accum);
+}
+```
+
+**`sK_nope_divided(_, _, kv_nope_part_idx)` 选择 K 的不同行！**
+
+```
+kv_nope_part_idx = 0:
+  sK_nope_divided(_, _, 0) = K_reshaped[0:64, :]   ← 前 64 行
+
+kv_nope_part_idx = 1:
+  sK_nope_divided(_, _, 1) = K_reshaped[64:128, :] ← 后 64 行
+```
+
+### 4. 输出映射机制
+
+#### 关键规则
+
+**tcgen05.mma 的输出行索引 = B 矩阵（K）的行索引！**
+
+```
+Iteration 0:
+  Q @ K[0:64]^T
+  K 的行索引: 0-63
+  → 输出到 P 的行 0-63
+
+Iteration 1:
+  Q @ K[64:128]^T
+  K 的行索引: 64-127
+  → 输出到 P 的行 64-127
+```
+
+#### 为什么？
+
+**因为 GEMM 的定义：C[i, j] = sum(A[i, k] * B[j, k])**
+
+```
+对于 P = Q @ K^T:
+P[i, j] = sum(Q[i, k] * K[j, k] for k)
+
+输出 P 的行索引 i 来自 Q
+输出 P 的列索引 j 来自 K
+
+但在 TMEM 的坐标系统中:
+- TMEM 的"行"对应 K 的行索引
+- TMEM 的"列"对应 Q 的列索引（在 TMEM 中的位置）
+```
+
+### 5. 完整的映射过程
+
+#### Iteration 0: Part 0
+
+```cpp
+ku::utcmma_ts(tiled_mma_P, 
+              tQ_nope_part0,              // Q[64, 256], TMEM 列 256-319
+              sK_nope_divided(_, _, 0),   // K[64, 256], SMEM 行 0-63
+              tP, 
+              true);
+
+计算:
+P = Q @ K^T
+  = Q[64, 256] @ K[64, 256]^T
+  = [64, 64]
+
+输出位置:
+- K 的行索引: 0-63
+- Q 的 TMEM 列: 256-319
+- → P 输出到 TMEM 行 0-63, 列 400-463
+```
+
+#### Iteration 1: Part 1
+
+```cpp
+ku::utcmma_ts(tiled_mma_P, 
+              tQ_nope_part1,              // Q[64, 256], TMEM 列 320-383
+              sK_nope_divided(_, _, 1),   // K[64, 256], SMEM 行 64-127
+              tP, 
+              false);
+
+计算:
+P = Q @ K^T
+  = Q[64, 256] @ K[64, 256]^T
+  = [64, 64]
+
+输出位置:
+- K 的行索引: 64-127
+- Q 的 TMEM 列: 320-383
+- → P 输出到 TMEM 行 64-127, 列 400-463
+```
+
+### 6. 可视化
+
+#### K 矩阵的布局
+
+```
+K_nope_reshaped [128, 256]:
+
+┌─────────────────────────────┐
+│ Row 0-63                    │  ← Part 0
+│ K[:, 0:256]                 │
+├─────────────────────────────┤
+│ Row 64-127                  │  ← Part 1
+│ K[:, 256:512]               │
+└─────────────────────────────┘
+```
+
+#### 输出映射
+
+```
+Iteration 0:
+  Q @ K[0:64]^T
+  ↓
+  TMEM P[0:63, :]
+
+Iteration 1:
+  Q @ K[64:128]^T
+  ↓
+  TMEM P[64:127, :]
+
+最终 TMEM P:
+┌─────────────────────────────┐
+│ Row 0-63                    │  ← Part 0 结果
+│ Q @ K[0:64]^T               │
+├─────────────────────────────┤
+│ Row 64-127                  │  ← Part 1 结果
+│ Q @ K[64:128]^T             │
+└─────────────────────────────┘
+```
+
+### 7. 代码验证
+
+#### flat_divide 的作用
+
+```cpp
+Tensor sK_nope_divided = flat_divide(sK_nope, Tile<Int<B_TOPK*2>, Int<D_V/4>>{})(_, _, _0{}, _);
+```
+
+**`flat_divide` 把 K 矩阵分成多个部分，可以通过索引访问。**
+
+```
+sK_nope: [128, 256]
+
+flat_divide 后:
+sK_nope_divided(_, _, 0, _): [64, 256]  ← 行 0-63
+sK_nope_divided(_, _, 1, _): [64, 256]  ← 行 64-127
+```
+
+#### 循环中的选择
+
+```cpp
+for (int kv_nope_part_idx = 0; kv_nope_part_idx < 2; ++kv_nope_part_idx) {
+    ku::utcmma_ts(tiled_mma_P, 
+                  kv_nope_part_idx ? tQ_nope_part1 : tQ_nope_part0,
+                  sK_nope_divided(_, _, kv_nope_part_idx),  // 选择 K 的不同行
+                  tP, clear_accum);
+}
+
+kv_nope_part_idx = 0:
+  sK_nope_divided(_, _, 0) → K 的行 0-63   → 输出到 P 的行 0-63
+
+kv_nope_part_idx = 1:
+  sK_nope_divided(_, _, 1) → K 的行 64-127 → 输出到 P 的行 64-127
+```
+
+### 8. 为什么这样设计？
+
+#### 原因 1: 硬件的自然映射
+
+```
+tcgen05.mma 指令的硬件实现:
+- B 矩阵（K）的每一行对应输出 C（P）的一行
+- 这是 Tensor Core 的自然映射方式
+- 不需要额外的地址计算
+```
+
+#### 原因 2: 避免冲突
+
+```
+如果两次 MMA 写入相同的 TMEM 行:
+- 需要 read-modify-write
+- 增加延迟
+- 破坏流水线
+
+分别写入不同行:
+- 无冲突
+- 可以并行（虽然实际是顺序执行）
+- 延迟合并到后续操作
+```
+
+#### 原因 3: Layout 优化
+
+```
+K 矩阵的 reshape 和 TMEM 的输出映射完美配合:
+- K[0:64] → P[0:63]
+- K[64:128] → P[64:127]
+
+自然且高效，无需额外的数据重排
+```
+
+### 9. 数学验证
+
+#### 原始计算
+
+```
+P = Q @ K^T
+  = [64, 512] @ [64, 512]^T
+  = [64, 64]
+```
+
+#### Dual GEMM 分解
+
+```
+Q = [Q0 | Q1]  where Q0 = Q[:, 0:256], Q1 = Q[:, 256:512]
+K = [K0 | K1]  where K0 = K[:, 0:256], K1 = K[:, 256:512]
+
+P = Q @ K^T
+  = [Q0 | Q1] @ [K0 | K1]^T
+  = Q0 @ K0^T + Q1 @ K1^T
+
+Part 0: Q0 @ K0^T = [64, 256] @ [64, 256]^T = [64, 64]
+Part 1: Q1 @ K1^T = [64, 256] @ [64, 256]^T = [64, 64]
+```
+
+#### Reshape 后的 K
+
+```
+K_reshaped [128, 256]:
+  Row 0-63:   K0 (原 K 的前 256 列)
+  Row 64-127: K1 (原 K 的后 256 列)
+
+MMA 操作:
+  Q0 @ K_reshaped[0:64]^T   → P[0:63]   ✓
+  Q1 @ K_reshaped[64:128]^T → P[64:127] ✓
+```
+
+### 10. 总结
+
+#### 输出位置的决定因素
+
+| 因素 | 作用 | 值 |
+|------|------|-----|
+| **K 的行索引** | 决定 P 的行索引 | 0-63 或 64-127 |
+| **Q 的 TMEM 列** | 决定 P 的列索引 | 400-463 |
+| **TiledMMA 配置** | 决定输出 shape | [64, 64] |
+
+#### 关键规则
+
+```
+tcgen05.mma 的输出映射:
+P 的 TMEM 行索引 = K 的行索引
+P 的 TMEM 列索引 = Q 的 TMEM 列索引
+```
+
+#### Dual GEMM 的映射
+
+```
+Part 0:
+  K[0:64]   → P[0:63]   (前 64 行)
+
+Part 1:
+  K[64:128] → P[64:127] (后 64 行)
+
+自动、自然、高效！
+```
+
+### 11. 关键要点
+
+1. ✓ **K 的行索引决定输出位置**：这是 tcgen05.mma 的硬件特性
+2. ✓ **Reshape 实现分割**：K[128, 256] 的前后 64 行对应两部分
+3. ✓ **flat_divide 选择行**：`sK_nope_divided(_, _, idx)` 选择不同行
+4. ✓ **自然映射**：无需额外地址计算，硬件自动处理
+5. ✓ **无冲突设计**：两次 MMA 写入不同行，避免冲突
+
+**这就是 dual GEMM 输出到 TMEM 的完整映射机制！**
