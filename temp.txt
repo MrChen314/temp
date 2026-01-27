@@ -1,33 +1,94 @@
-cuda实现将tilelang的preprocess、bwd、postprocess放在一个kernel中
-共有3个WG
-
-WG0(数据加载)：
-1.使用TMA预取加载Q\dO
-2.循环加载KV
-
-
-WG1:
-1.执行QK矩阵乘（包含nope和rope两部分），使用utcmma_ss（qk都在SMEM）累加到TMEM的P
-    第一次矩阵乘
-    优化手段：Implicit Dual GEMM
-    TiledMMA：SM100_MMA_F16BF16_SS_NOELECT
-    指令：utcmma_ss
-    输入1：SharedMemoryPlan.u.q_kv.q_nope
-    输入2：SharedMemoryPlan.u.q_kv.kv_nope
-    输出位置：tmem_cols.p
-    输出形状：[B_H, B_TOPK]
-    注意：对tmem_cols.p执行clear_accum
-
-    第二次矩阵乘
-    TiledMMA：SM100_MMA_F16BF16_WS_SS_NOELECT
-    指令：utcmma_ss
-    输入1：SharedMemoryPlan.u.q_kv.q_rope
-    输入2：SharedMemoryPlan.u.q_kv.kv_rope
-    输出位置：tmem_cols.p
-    输出形状：[B_H, B_TOPK]
-    形式：累加
-
-
-WG2:
-1.计算delta -> 从全局内存读取O，SMEM读取dO，计算delta
-
+ // ========================================================================
+    // 创建 TiledMMA 对象
+    // ========================================================================
+    TiledMMA tiled_mma_P_nope = TiledMMA_P_NoPE{};   // NoPE: SMEM-SMEM
+    TiledMMA tiled_mma_P_rope = TiledMMA_P_RoPE{};   // RoPE: SMEM-SMEM (WS)
+    
+    // ========================================================================
+    // 创建 P 矩阵的 TMEM 张量
+    // P 的形状: [B_H, B_TOPK*2] = [64, 64] (Dual GEMM 使用 2 倍 N)
+    // ========================================================================
+    Tensor tP = partition_fragment_C(tiled_mma_P_nope, Shape<Int<B_H>, Int<B_TOPK*2>>{});
+    tP.data().get() = tmem_cols::P;
+    
+    // ========================================================================
+    // 计算 P = Q @ K^T
+    // ========================================================================
+    if (k < num_k_blocks) {
+        // ----------------------------------------------------------------
+        // 创建 SMEM 张量视图
+        // ----------------------------------------------------------------
+        // Q NoPE: 使用 TiledMMA 专用的 layout
+        Tensor sQ_nope = make_tensor(
+            make_smem_ptr(plan.u.q_kv.q_nope.data()),
+            SmemLayoutQNoPE_TiledMMA{}  // [64, 512]
+        );
+        
+        // KV NoPE: reshape 为 [B_TOPK*2, D_V/2] = [64, 256] 用于 Dual GEMM
+        // 参见 docs/Dual GEMM 输出到 TMEM 的映射机制.md
+        Tensor sKV_nope = make_tensor(
+            make_smem_ptr(plan.u.q_kv.kv_nope.data()),
+            SmemLayoutKVNoPE_TiledMMA{}  // [64, 256]
+        );
+        
+        // ----------------------------------------------------------------
+        // 第一次矩阵乘: P = Q_nope @ K_nope^T (Dual GEMM)
+        // 
+        // Dual GEMM 分解 (参见 docs/Dual GEMM 中 Q 在 SMEM 的 Layout 分析.md):
+        // P = Q @ K^T = Q0 @ K0^T + Q1 @ K1^T
+        // 其中:
+        //   Q0 = Q[:, 0:256],   Q1 = Q[:, 256:512]
+        //   K0 = K[:, 0:256],   K1 = K[:, 256:512]
+        // 
+        // K 的 reshape:
+        //   K_reshaped [64, 256]:
+        //     Row 0-31:  K[:, 0:256]  (Part 0)
+        //     Row 32-63: K[:, 256:512] (Part 1)
+        // 
+        // 输出映射:
+        //   K 的行索引决定 P 的行索引
+        //   Part 0: K[0:32] -> P[0:31]
+        //   Part 1: K[32:64] -> P[32:63]
+        // ----------------------------------------------------------------
+        
+        // 分割 Q NoPE: 按列分割为 [64, 256] × 2
+        // flat_divide 将 Q 分成两部分: Q[:, 0:256] 和 Q[:, 256:512]
+        Tensor sQ_nope_divided = flat_divide(sQ_nope, Tile<Int<B_H>, Int<D_V/2>>{})(_, _, _0{}, _);
+        
+        // 分割 KV NoPE: 按行分割为 [32, 256] × 2
+        // sKV_nope 已经是 [64, 256], flat_divide 将其分成:
+        //   Part 0: sKV_nope[0:32, :]   (对应 K[:, 0:256])
+        //   Part 1: sKV_nope[32:64, :]  (对应 K[:, 256:512])
+        Tensor sKV_nope_divided = flat_divide(sKV_nope, Tile<Int<B_TOPK*2>, Int<D_V/4>>{})(_, _, _0{}, _);
+        
+        // 等待 Q NoPE 和 KV NoPE 数据就绪
+        // TODO: 添加相应的 barrier 等待逻辑
+        
+        // ----------------------------------------------------------------
+        // 执行 NoPE 部分的 Dual GEMM
+        // 
+        // 根据流程文档:
+        // - 第一次矩阵乘 (NoPE): 需要 clear_accum
+        // - 每次 K 块迭代都需要重新计算 P，所以 NoPE 第一部分总是 clear
+        // ----------------------------------------------------------------
+        CUTE_UNROLL
+        for (int nope_part_idx = 0; nope_part_idx < 2; ++nope_part_idx) {
+            // TODO: 等待 KV NoPE 数据就绪
+            // plan.bar_kv_nope_ready.wait(...);
+            ku::tcgen05_after_thread_sync();
+            
+            // NoPE 第一部分需要 clear_accum (每次 K 块迭代都 clear)
+            // NoPE 第二部分累加
+            bool clear_accum = (nope_part_idx == 0);
+            
+            // P = Q_nope_part @ KV_nope_part^T (第一部分) 或
+            // P += Q_nope_part @ KV_nope_part^T (第二部分)
+            // 使用 SMEM-SMEM MMA
+            ku::utcmma_ss(
+                tiled_mma_P_nope,
+                sQ_nope_divided(_, _, nope_part_idx),     // Q[:, part*256:(part+1)*256]
+                sKV_nope_divided(_, _, nope_part_idx),   // KV[part*32:(part+1)*32, :]
+                tP,
+                clear_accum
+            );
+        }
