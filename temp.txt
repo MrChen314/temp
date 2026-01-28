@@ -1,241 +1,47 @@
-template<int D_QK>
-void run_bwd_phase1_kernel(const SparseAttnBwdParams& params) {
-    static_assert(D_QK == 576 || D_QK == 512);  // Only support these two QK dimensions
-    using Kernel = KernelTemplate<D_QK>;
+============================================================
+测试 FlashMLA sparse bwd delta 正确性
+参数: S_q=1024, S_kv=2048, H_q=128, H_kv=1
+       D_qk=576, D_v=512, topk=512, dtype=torch.bfloat16
+============================================================
+=== BWD Phase1 Launch Config ===
+  smem_size: 202352 bytes (max: 232448)
+  grid: (2048, 1, 1)
+  block: (384, 1, 1)
+  cluster: (2, 1, 1)
+  max_active_blocks: 1
+  device: CF-NG-BZZ2-O (SM 10.0)
+  params: s_q=1024, s_kv=2048, topk=512, h_q=128, d_qk=576, d_v=512
+  TMA descriptor addresses: q=0x7f5cfe000000, kv=0x7f5d07000000, dO=0x7f5d88000000, o=0x7f5d80000000
+  Strides: q_s_q=73728, q_h_q=576, kv_s_kv=576
+================================
+CUTLASS cluster launch failed with status: 11
+  Error details:
+    Status 0 = kSuccess
+    Status 1 = kErrorMisalignedOperand
+    Status 2 = kErrorInvalidDataType
+    Status 3 = kErrorInvalidLayout
+    Status 4 = kErrorInvalidProblem
+    Status 5 = kErrorNotSupported
+    Status 6 = kErrorWorkspaceNull
+    Status 7 = kErrorCudaHostAlloc
+    Status 8 = kErrorInvalidWorkspace
+    Status 9 = kErrorInvalidKernel
+    Status 10 = kErrorArchMismatch
+    Status 11 = kErrorInternal
+    Status 12 = kErrorInvalidNode
+    Status 13 = kErrorMmaPolicyMismatch
+  CUDA error: unspecified launch failure
+CUTLASS error (/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/sm100/prefill/sparse/bwd/head128/instantiations/../phase1.cuh:606): 11
 
-    // === Parameter validation ===
-    KU_ASSERT(params.h_kv == 1);                    // KV head count must be 1 (MLA feature)
-    KU_ASSERT(params.topk % Kernel::B_TOPK == 0);   // TopK must be multiple of B_TOPK (skip boundary check)
-    KU_ASSERT(params.h_q == Kernel::B_H);           // Query head count must equal B_H
-    KU_ASSERT(params.d_qk == D_QK);
-    KU_ASSERT(params.delta != nullptr);             // Delta output must be provided
-    KU_ASSERT(params.stride_delta_s_q > 0);         // Delta stride must be positive
-    KU_ASSERT(params.stride_delta_h_q > 0);         // Delta stride must be positive
-    
-    // === Additional debug validations ===
-    KU_ASSERT(params.s_q > 0);                      // s_q must be positive for valid grid
-    KU_ASSERT(params.s_kv > 0);                     // s_kv must be positive
-    KU_ASSERT(params.topk > 0);                     // topk must be positive
-    KU_ASSERT(params.q != nullptr);                 // Q tensor must be valid
-    KU_ASSERT(params.kv != nullptr);                // KV tensor must be valid
-    KU_ASSERT(params.dO != nullptr);                // dO tensor must be valid
-    KU_ASSERT(params.o != nullptr);                 // O tensor must be valid (for delta computation)
-    KU_ASSERT(params.indices != nullptr);           // indices must be valid
-    KU_ASSERT(params.d_v == Kernel::D_V);           // D_V must match (512)
-    
-    // === Debug: Print shared memory size ===
-    constexpr size_t smem_size_check = sizeof(typename Kernel::SharedMemoryPlan);
-    // SM100 max dynamic shared memory is typically 228KB (233472 bytes)
-    KU_ASSERT(smem_size_check <= 233472 && "SharedMemoryPlan exceeds SM100 max dynamic shared memory");
-
-    // === Create TMA descriptor for Q (2SM mode) ===
-    // Q shape: [h_q, d_qk, s_q] = [h_q, 576, s_q] (包含 NoPE 512 + RoPE 64)
-    auto shape_Q = make_shape(params.h_q, Kernel::D_Q, params.s_q);
-    auto tma_Q = cute::make_tma_copy(
-        SM100_TMA_2SM_LOAD_NOSPLIT{},  // 2SM TMA for cluster
-        make_tensor(
-            make_gmem_ptr((bf16*)params.q),
-            make_layout(
-                shape_Q,
-                make_stride(params.stride_q_h_q, _1{}, params.stride_q_s_q)
-            )
-        ),
-        (typename Kernel::SmemLayoutQ){}
-    );
-
-    // === Create TMA descriptor for dO (2SM mode) ===
-    // dO shape: [h_q, d_v, s_q]
-    auto shape_dO = make_shape(params.h_q, params.d_v, params.s_q);
-    auto tma_dO = cute::make_tma_copy(
-        SM100_TMA_2SM_LOAD_NOSPLIT{},  // 2SM TMA for cluster
-        make_tensor(
-            make_gmem_ptr((bf16*)params.dO),
-            make_layout(
-                shape_dO,
-                make_stride(params.stride_dO_h_q, _1{}, params.stride_dO_s_q)
-            )
-        ),
-        (typename Kernel::SmemLayoutdO){}
-    );
-
-    // === Create TMA descriptor for O (to read forward output for Delta computation) ===
-    // O shape: [h_q, d_v, s_q]
-    auto shape_O = make_shape(params.h_q, params.d_v, params.s_q);
-    auto tma_O = cute::make_tma_copy(
-        SM100_TMA_2SM_LOAD_NOSPLIT{},  // 2SM TMA for cluster
-        make_tensor(
-            make_gmem_ptr((bf16*)params.o),
-            make_layout(
-                shape_O,
-                make_stride(params.stride_o_h_q, _1{}, params.stride_o_s_q)
-            )
-        ),
-        (typename Kernel::SmemLayoutdO){}  // Reuse dO layout
-    );
-
-    // === Create TensorMap for KV (for TMA gather) ===
-    // KV shape: [d_qk, s_kv] = [576, s_kv] (包含 NoPE 512 + RoPE 64)
-    CUtensorMap tensor_map_kv;
-    {
-        uint64_t size[2] = {Kernel::D_Q, (unsigned long)params.s_kv};  // [d_qk, s_kv]
-        uint64_t stride[1] = {params.stride_kv_s_kv*sizeof(bf16)};  // Row stride
-        uint32_t box_size[2] = {64, 1};    // Box size per load: 64 cols x 1 row
-        uint32_t elem_stride[2] = {1, 1};  // Element stride
-        CUresult res = CUTLASS_CUDA_DRIVER_WRAPPER_CALL(cuTensorMapEncodeTiled)(
-            &tensor_map_kv,
-            CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
-            2,                                                      // 2D tensor
-            params.kv,                                              // Global memory pointer
-            size,
-            stride,
-            box_size,
-            elem_stride,
-            CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,   // No interleave
-            CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,         // 128-byte swizzle
-            CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B,  // L2 cache promotion
-            CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE   // No OOB fill
-        );
-        KU_ASSERT(res == CUresult::CUDA_SUCCESS);
-    }
-
-    // === Assemble TMA parameter struct ===
-    TmaParams<
-        decltype(shape_Q), decltype(tma_Q),
-        decltype(shape_dO), decltype(tma_dO),
-        decltype(shape_O), decltype(tma_O)
-    > tma_params = {
-        shape_Q, tma_Q,
-        shape_dO, tma_dO,
-        shape_O, tma_O,
-        tensor_map_kv
-    };
-    
-    // 使用 KernelTemplate 实例化的 kernel (与正向传播保持一致)
-    auto kernel = &sparse_attn_bwd_kernel_part0<Kernel, decltype(tma_params)>;
-
-    // === Configure and launch kernel with cluster (2CTA mode) ===
-    constexpr size_t smem_size = sizeof(typename Kernel::SharedMemoryPlan);  // Dynamic shared memory size
-    
-    // Debug: Verify shared memory size is within limits
-    int device_id;
-    KU_CUDA_CHECK(cudaGetDevice(&device_id));
-    cudaDeviceProp prop;
-    KU_CUDA_CHECK(cudaGetDeviceProperties(&prop, device_id));
-    KU_ASSERT(smem_size <= (size_t)prop.sharedMemPerBlockOptin && 
-              "SharedMemoryPlan exceeds device max dynamic shared memory");
-    
-    // Debug: Verify cluster support
-    KU_ASSERT(prop.major >= 9 && "Cluster launch requires SM90+ (compute capability 9.0+)");
-    
-    KU_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-    
-    // Debug: Verify grid dimensions
-    KU_ASSERT(2*params.s_q <= prop.maxGridSize[0] && "Grid dimension X exceeds device limit");
-    KU_ASSERT(Kernel::NUM_THREADS <= prop.maxThreadsPerBlock && "Block size exceeds device limit");
-    
-    // Critical: Grid size must be a multiple of cluster size
-    KU_ASSERT((2*params.s_q) % 2 == 0 && "Grid X dimension must be multiple of cluster X dimension (2)");
-    // Grid X = 2*s_q should always be even, but verify anyway
-
-    // 2CTA Cluster Launch:
-    // - Grid: 2*s_q blocks (2 CTAs per query token)
-    // - Block: NUM_THREADS (384) threads
-    // - Cluster: (2, 1, 1) - 2 CTAs form a cluster
-    cutlass::ClusterLaunchParams launch_params = {
-        dim3(2*params.s_q, 1, 1),       // Grid: 2 CTAs per query
-        dim3(Kernel::NUM_THREADS, 1, 1),// Block: 384 threads
-        dim3(2, 1, 1),                  // Cluster: 2 CTAs
-        smem_size,                      // Dynamic shared memory
-        params.stream                   // CUDA stream
-    };
-    
-    // Debug: Check maximum active blocks per SM
-    int max_active_blocks = 0;
-    cudaError_t occ_err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &max_active_blocks, kernel, Kernel::NUM_THREADS, smem_size
-    );
-    if (occ_err != cudaSuccess) {
-        printf("Warning: cudaOccupancyMaxActiveBlocksPerMultiprocessor failed: %s\n", 
-               cudaGetErrorString(occ_err));
-    } else {
-        KU_ASSERT(max_active_blocks >= 1 && "Kernel cannot be launched: max_active_blocks < 1");
-    }
-    
-    // Debug: Set cluster scheduling policy
-    cudaError_t cluster_sched_err = cudaFuncSetAttribute(
-        kernel, cudaFuncAttributeClusterSchedulingPolicyPreference, 
-        cudaClusterSchedulingPolicySpread
-    );
-    if (cluster_sched_err != cudaSuccess) {
-        printf("Warning: Failed to set cluster scheduling policy: %s\n", 
-               cudaGetErrorString(cluster_sched_err));
-    }
-    
-    // Try to set non-portable cluster size
-    cudaError_t cluster_size_err = cudaFuncSetAttribute(
-        kernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1
-    );
-    if (cluster_size_err != cudaSuccess) {
-        printf("Warning: Failed to set non-portable cluster size: %s\n", 
-               cudaGetErrorString(cluster_size_err));
-    }
-    
-    // Debug: Synchronize and check for any prior CUDA errors
-    cudaError_t sync_err = cudaDeviceSynchronize();
-    if (sync_err != cudaSuccess) {
-        printf("CUDA error before kernel launch: %s\n", cudaGetErrorString(sync_err));
-    }
-    cudaError_t prior_err = cudaGetLastError();
-    if (prior_err != cudaSuccess) {
-        printf("Prior CUDA error: %s\n", cudaGetErrorString(prior_err));
-    }
-    
-    // Debug: Print launch configuration before launch
-    printf("=== BWD Phase1 Launch Config ===\n");
-    printf("  smem_size: %zu bytes (max: %zu)\n", smem_size, (size_t)prop.sharedMemPerBlockOptin);
-    printf("  grid: (%d, 1, 1)\n", 2*params.s_q);
-    printf("  block: (%d, 1, 1)\n", Kernel::NUM_THREADS);
-    printf("  cluster: (2, 1, 1)\n");
-    printf("  max_active_blocks: %d\n", max_active_blocks);
-    printf("  device: %s (SM %d.%d)\n", prop.name, prop.major, prop.minor);
-    printf("  params: s_q=%d, s_kv=%d, topk=%d, h_q=%d, d_qk=%d, d_v=%d\n", 
-           params.s_q, params.s_kv, params.topk, params.h_q, params.d_qk, params.d_v);
-    printf("  TMA descriptor addresses: q=%p, kv=%p, dO=%p, o=%p\n",
-           params.q, params.kv, params.dO, params.o);
-    printf("  Strides: q_s_q=%d, q_h_q=%d, kv_s_kv=%d\n",
-           params.stride_q_s_q, params.stride_q_h_q, params.stride_kv_s_kv);
-    printf("================================\n");
-    
-    cutlass::Status status = cutlass::launch_kernel_on_cluster(
-        launch_params, (void*)kernel, params, tma_params
-    );
-    
-    // Debug: More detailed error reporting
-    if (status != cutlass::Status::kSuccess) {
-        printf("CUTLASS cluster launch failed with status: %d\n", (int)status);
-        printf("  Error details:\n");
-        printf("    Status 0 = kSuccess\n");
-        printf("    Status 1 = kErrorMisalignedOperand\n");
-        printf("    Status 2 = kErrorInvalidDataType\n");
-        printf("    Status 3 = kErrorInvalidLayout\n");
-        printf("    Status 4 = kErrorInvalidProblem\n");
-        printf("    Status 5 = kErrorNotSupported\n");
-        printf("    Status 6 = kErrorWorkspaceNull\n");
-        printf("    Status 7 = kErrorCudaHostAlloc\n");
-        printf("    Status 8 = kErrorInvalidWorkspace\n");
-        printf("    Status 9 = kErrorInvalidKernel\n");
-        printf("    Status 10 = kErrorArchMismatch\n");
-        printf("    Status 11 = kErrorInternal\n");
-        printf("    Status 12 = kErrorInvalidNode\n");
-        printf("    Status 13 = kErrorMmaPolicyMismatch\n");
-        
-        // Check for any pending CUDA errors
-        cudaError_t cuda_err = cudaGetLastError();
-        if (cuda_err != cudaSuccess) {
-            printf("  CUDA error: %s\n", cudaGetErrorString(cuda_err));
-        }
-    }
-    KU_CUTLASS_CHECK(status);
-}
-
-}  // namespace sm100::bwd::head128
+  FlashMLA 测试失败: CUTLASS error (/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/sm100/prefill/sparse/bwd/head128/instantiations/../phase1.cuh:606): CUTLASS error: 11
+Traceback (most recent call last):
+  File "/home/users/chenquanlin/workspace/operator/test_delta.py", line 184, in test_flashmla_delta_correctness
+    flashmla_delta = compute_flashmla_delta(q, kv, o, do, indices, lse, sm_scale, D_v)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/users/chenquanlin/workspace/operator/test_delta.py", line 57, in compute_flashmla_delta
+    dQ, dKV, delta_out = flash_mla_sparse_bwd(
+                         ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/users/chenquanlin/workspace/operator/FlashMLA/flash_mla/flash_mla_interface.py", line 252, in flash_mla_sparse_bwd
+    results = flash_mla_cuda.sparse_prefill_bwd(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: CUTLASS error (/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/sm100/prefill/sparse/bwd/head128/instantiations/../phase1.cuh:606): CUTLASS error: 11
