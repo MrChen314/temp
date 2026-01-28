@@ -1,14 +1,3 @@
-CUTLASS error (/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/sm100/prefill/sparse/bwd/head128/instantiations/../phase1.cuh:480): 11
-
-  FlashMLA 测试失败: CUTLASS error (/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/sm100/prefill/sparse/bwd/head128/instantiations/../phase1.cuh:480): CUTLASS error: 11
-Traceback (most recent call last):
-  File "/home/users/chenquanlin/workspace/operator/test_delta.py", line 184, in test_flashmla_delta_correctness
-    flashmla_delta = compute_flashmla_delta(q, kv, o, do, indices, lse, sm_scale, D_v)
-                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/users/chenquanlin/workspace/operator/test_delta.py", line 57, in compute_flashmla_delta
-    dQ, dKV, delta_out = flash_mla_sparse_bwd(
-                         ^^^^^^^^^^^^^^^^^^^^^
-  File "/home/users/chenquanlin/workspace/operator/FlashMLA/flash_mla/flash_mla_interface.py", line 252, in flash_mla_sparse_bwd
-    results = flash_mla_cuda.sparse_prefill_bwd(
-              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-RuntimeError: CUTLASS error (/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/sm100/prefill/sparse/bwd/head128/instantiations/../phase1.cuh:480): CUTLASS error: 11
+    KU_ASSERT(params.delta != nullptr);             // Delta output must be provided
+    KU_ASSERT(params.stride_delta_s_q > 0);         // Delta stride must be positive
+    KU_ASSERT(params.stride_delta_h_q > 0);         // Delta stride must be positive
