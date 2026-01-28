@@ -58,22 +58,8 @@ void run_bwd_phase1_kernel(const SparseAttnBwdParams& params) {
         (typename Kernel::SmemLayoutdO){}
     );
 
-    // === Create TMA descriptor for O (to read forward output for Delta computation) ===
-    // O shape: [h_q, d_v, s_q]
-    auto shape_O = make_shape(params.h_q, params.d_v, params.s_q);
-    auto tma_O = cute::make_tma_copy(
-        SM100_TMA_2SM_LOAD_NOSPLIT{},  // 2SM TMA for cluster
-        make_tensor(
-            make_gmem_ptr((bf16*)params.o),
-            make_layout(
-                shape_O,
-                make_stride(params.stride_o_h_q, _1{}, params.stride_o_s_q)
-            )
-        ),
-        (typename Kernel::SmemLayoutdO){}  // Reuse dO layout
-    );
-
     // === Create TensorMap for KV (for TMA gather) ===
+    // Note: O is read directly from global memory in Delta computation, no TMA needed
     // KV shape: [d_qk, s_kv] = [576, s_kv] (包含 NoPE 512 + RoPE 64)
     CUtensorMap tensor_map_kv;
     {
@@ -101,12 +87,10 @@ void run_bwd_phase1_kernel(const SparseAttnBwdParams& params) {
     // === Assemble TMA parameter struct ===
     TmaParams<
         decltype(shape_Q), decltype(tma_Q),
-        decltype(shape_dO), decltype(tma_dO),
-        decltype(shape_O), decltype(tma_O)
+        decltype(shape_dO), decltype(tma_dO)
     > tma_params = {
         shape_Q, tma_Q,
         shape_dO, tma_dO,
-        shape_O, tma_O,
         tensor_map_kv
     };
     
@@ -247,6 +231,34 @@ void run_bwd_phase1_kernel(const SparseAttnBwdParams& params) {
         printf("Prior CUDA error: %s\n", cudaGetErrorString(prior_err));
     }
     
+    // Debug: Check memory alignment (TMA requires 128-byte alignment)
+    constexpr size_t TMA_ALIGNMENT = 128;
+    bool q_aligned = (reinterpret_cast<uintptr_t>(params.q) % TMA_ALIGNMENT == 0);
+    bool kv_aligned = (reinterpret_cast<uintptr_t>(params.kv) % TMA_ALIGNMENT == 0);
+    bool dO_aligned = (reinterpret_cast<uintptr_t>(params.dO) % TMA_ALIGNMENT == 0);
+    bool o_aligned = (reinterpret_cast<uintptr_t>(params.o) % TMA_ALIGNMENT == 0);
+    
+    if (!q_aligned || !kv_aligned || !dO_aligned || !o_aligned) {
+        printf("WARNING: Memory alignment issues detected!\n");
+        printf("  q alignment: %s (addr: %p, offset: %zu)\n", 
+               q_aligned ? "OK" : "FAIL", params.q, 
+               reinterpret_cast<uintptr_t>(params.q) % TMA_ALIGNMENT);
+        printf("  kv alignment: %s (addr: %p, offset: %zu)\n", 
+               kv_aligned ? "OK" : "FAIL", params.kv,
+               reinterpret_cast<uintptr_t>(params.kv) % TMA_ALIGNMENT);
+        printf("  dO alignment: %s (addr: %p, offset: %zu)\n", 
+               dO_aligned ? "OK" : "FAIL", params.dO,
+               reinterpret_cast<uintptr_t>(params.dO) % TMA_ALIGNMENT);
+        printf("  o alignment: %s (addr: %p, offset: %zu)\n", 
+               o_aligned ? "OK" : "FAIL", params.o,
+               reinterpret_cast<uintptr_t>(params.o) % TMA_ALIGNMENT);
+    }
+    
+    // Debug: Check TmaParams struct size and alignment
+    constexpr size_t tma_params_size = sizeof(decltype(tma_params));
+    constexpr size_t tma_params_align = alignof(decltype(tma_params));
+    printf("  TmaParams size: %zu bytes, alignment: %zu bytes\n", tma_params_size, tma_params_align);
+    
     // Debug: Print launch configuration before launch
     printf("=== BWD Phase1 Launch Config ===\n");
     printf("  smem_size: %zu bytes (max: %zu)\n", smem_size, (size_t)prop.sharedMemPerBlockOptin);
@@ -263,60 +275,27 @@ void run_bwd_phase1_kernel(const SparseAttnBwdParams& params) {
            params.stride_q_s_q, params.stride_q_h_q, params.stride_kv_s_kv);
     printf("================================\n");
     
-    // Use native cudaLaunchKernelEx for better error reporting
-    cudaLaunchConfig_t cuda_launch_config;
-    memset(&cuda_launch_config, 0, sizeof(cuda_launch_config));
-    cuda_launch_config.gridDim = dim3(2*params.s_q, 1, 1);
-    cuda_launch_config.blockDim = dim3(Kernel::NUM_THREADS, 1, 1);
-    cuda_launch_config.dynamicSmemBytes = smem_size;
-    cuda_launch_config.stream = params.stream;
-    
-    // Set cluster dimensions
-    cudaLaunchAttribute cluster_attr;
-    cluster_attr.id = cudaLaunchAttributeClusterDimension;
-    cluster_attr.val.clusterDim.x = 2;
-    cluster_attr.val.clusterDim.y = 1;
-    cluster_attr.val.clusterDim.z = 1;
-    
-    cudaLaunchAttribute attrs[1] = {cluster_attr};
-    cuda_launch_config.attrs = attrs;
-    cuda_launch_config.numAttrs = 1;
-    
-    printf("=== Attempting cudaLaunchKernelEx ===\n");
-    printf("  gridDim: (%d, %d, %d)\n", cuda_launch_config.gridDim.x, cuda_launch_config.gridDim.y, cuda_launch_config.gridDim.z);
-    printf("  blockDim: (%d, %d, %d)\n", cuda_launch_config.blockDim.x, cuda_launch_config.blockDim.y, cuda_launch_config.blockDim.z);
-    printf("  clusterDim: (2, 1, 1)\n");
-    printf("  dynamicSmemBytes: %zu\n", cuda_launch_config.dynamicSmemBytes);
-    
-    // Prepare kernel arguments
-    void* kernel_args[] = {(void*)&params, (void*)&tma_params};
-    
-    cudaError_t launch_err = cudaLaunchKernelEx(&cuda_launch_config, (void*)kernel, kernel_args);
+    // Debug option: Try direct CUDA launch first to isolate cluster vs kernel issues
+    // Set to true to bypass cluster launch and use direct kernel launch for debugging
+    constexpr bool DEBUG_USE_DIRECT_LAUNCH = false;
     
     cutlass::Status status;
-    if (launch_err != cudaSuccess) {
-        printf("cudaLaunchKernelEx failed: %s (error code: %d)\n", 
-               cudaGetErrorString(launch_err), (int)launch_err);
-        
-        // Try to get more detailed error info
-        cudaError_t last_err = cudaGetLastError();
-        if (last_err != launch_err) {
-            printf("Additional CUDA error: %s\n", cudaGetErrorString(last_err));
-        }
-        
-        status = cutlass::Status::kErrorInternal;
-    } else {
-        printf("cudaLaunchKernelEx succeeded (kernel queued)\n");
-        
-        // Sync and check for kernel execution errors
-        cudaError_t sync_err = cudaDeviceSynchronize();
-        if (sync_err != cudaSuccess) {
-            printf("Kernel execution failed: %s\n", cudaGetErrorString(sync_err));
+    if constexpr (DEBUG_USE_DIRECT_LAUNCH) {
+        // Direct launch without cluster (for debugging)
+        // Note: This will break 2CTA features but helps isolate if issue is cluster-related
+        printf("DEBUG: Using direct kernel launch (cluster features will be broken)\n");
+        kernel<<<params.s_q, Kernel::NUM_THREADS, smem_size, params.stream>>>(params, tma_params);
+        cudaError_t launch_err = cudaGetLastError();
+        if (launch_err != cudaSuccess) {
+            printf("Direct launch failed: %s\n", cudaGetErrorString(launch_err));
             status = cutlass::Status::kErrorInternal;
         } else {
-            printf("Kernel execution completed successfully\n");
             status = cutlass::Status::kSuccess;
         }
+    } else {
+        status = cutlass::launch_kernel_on_cluster(
+            launch_params, (void*)kernel, params, tma_params
+        );
     }
     
     // Debug: More detailed error reporting
