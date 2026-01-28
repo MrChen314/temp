@@ -1,29 +1,14 @@
-        // === Output P to global memory (all WG1 threads participate) ===
-        if (params.p_out != nullptr) {
-            // Sync WG1 threads to ensure MMA is complete
-            NamedBarrier::arrive_and_wait(128, NamedBarriers::wg1_sync);
-            ku::tcgen05_after_thread_sync();
-            
-            // Each thread in the first 64 (warp 4-5) reads P from TMEM
-            // warp_idx 4: threads 0-31, warp_idx 5: threads 32-63
-            if (warp_idx == 4 || warp_idx == 5) {
-                // Read P from TMEM using warp-cooperative load
-                float p_row[B_TOPK];
-                ku::tmem_ld_32dp32bNx<B_TOPK>(tmem_cols::P + (warp_idx - 4) * B_TOPK, p_row);
-                cutlass::arch::fence_view_async_tmem_load();
-                
-                // Calculate row indices
-                const int local_row = lane_idx + (warp_idx - 4) * 32;  // 0-63
-                const int global_head_idx = cta_idx * (B_H/2) + local_row;
-                
-                // Write to global memory for all k_blocks
-                // Note: P is computed per k_block, here we output the last k_block's P
-                float* gP_row = params.p_out + s_q_idx * params.stride_p_out_s_q 
-                              + global_head_idx * params.stride_p_out_h_q;
-                
-                CUTE_UNROLL
-                for (int col = 0; col < B_TOPK; ++col) {
-                    gP_row[col] = p_row[col];
-                }
-            }
-        }
+CUTLASS error (/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/sm100/prefill/sparse/bwd/head128/instantiations/../phase1.cuh:480): 11
+
+  FlashMLA 测试失败: CUTLASS error (/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/sm100/prefill/sparse/bwd/head128/instantiations/../phase1.cuh:480): CUTLASS error: 11
+Traceback (most recent call last):
+  File "/home/users/chenquanlin/workspace/operator/test_delta.py", line 184, in test_flashmla_delta_correctness
+    flashmla_delta = compute_flashmla_delta(q, kv, o, do, indices, lse, sm_scale, D_v)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/users/chenquanlin/workspace/operator/test_delta.py", line 57, in compute_flashmla_delta
+    dQ, dKV, delta_out = flash_mla_sparse_bwd(
+                         ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/users/chenquanlin/workspace/operator/FlashMLA/flash_mla/flash_mla_interface.py", line 252, in flash_mla_sparse_bwd
+    results = flash_mla_cuda.sparse_prefill_bwd(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: CUTLASS error (/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/sm100/prefill/sparse/bwd/head128/instantiations/../phase1.cuh:480): CUTLASS error: 11
