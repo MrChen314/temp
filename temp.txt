@@ -1,12 +1,109 @@
-FlashMLA 测试失败: /home/users/chenquanlin/workspace/operator/FlashMLA/flash_mla/cuda.cpython-312-x86_64-linux-gnu.so: undefined symbol: _ZN5sm1003bwd7head12821run_bwd_phase1_kernelILi512EEEvRK19SparseAttnBwdParams
-Traceback (most recent call last):
-  File "/home/users/chenquanlin/workspace/operator/test_delta.py", line 184, in test_flashmla_delta_correctness
-    flashmla_delta = compute_flashmla_delta(q, kv, o, do, indices, lse, sm_scale, D_v)
-                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/users/chenquanlin/workspace/operator/test_delta.py", line 55, in compute_flashmla_delta
-    from flash_mla import flash_mla_sparse_bwd
-  File "/home/users/chenquanlin/workspace/operator/FlashMLA/flash_mla/__init__.py", line 3, in <module>
-    from flash_mla.flash_mla_interface import (
-  File "/home/users/chenquanlin/workspace/operator/FlashMLA/flash_mla/flash_mla_interface.py", line 6, in <module>
-    import flash_mla.cuda as flash_mla_cuda
-ImportError: /home/users/chenquanlin/workspace/operator/FlashMLA/flash_mla/cuda.cpython-312-x86_64-linux-gnu.so: undefined symbol: _ZN5sm1003bwd7head12821run_bwd_phase1_kernelILi512EEEvRK19SparseAttnBwdParams
+# SM100 反向 MLA 资源占用分析
+
+基于 `tilelang/examples/deepseek_v32/sparse_mla_bwd.py` 的 TileLang 反向实现分析。该实现是一个完整的 Sparse MLA backward kernel，包含预处理、核心反向计算和后处理三个阶段。
+
+关键配置：`D=512`, `D_tail=64`, `block_H=64`, `BS=32`, `topk=2048`, `threads=256`。
+
+## 1. TileLang 实现特点
+
+TileLang 自动管理 Shared Memory，不会使用 SM100 的 TMEM（需要手动管理）。如果转换为 CUDA 实现，需要显式管理 TMEM 和 Shared Memory。
+
+## 2. Shared Memory 占用分析
+
+### 当前 TileLang 实现中的 Shared Memory 分配
+
+| 变量 | Shape | 数据类型 | 大小 (KB) | 用途 | 生命周期 |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| `Q_shared` | [64, 512] | bf16 | 64 | Query 主维度 | 全程 |
+| `Q_tail_shared` | [64, 64] | bf16 | 8 | Query RoPE 维度 | 全程 |
+| `KV_shared` | [32, 512] | bf16 | 32 | Key 主维度 | 每个 topk block |
+| `KV_tail_shared` | [32, 64] | bf16 | 4 | Key RoPE 维度 | 每个 topk block |
+| `dO_shared` | [64, 512] | bf16 | 64 | dOutput | 全程 |
+| `P_shared_cast` | [64, 32] | bf16 | 4 | Attention Scores | 每个 topk block |
+| `dP_shared_cast` | [64, 32] | bf16 | 4 | dAttention Scores | 每个 topk block |
+| `dQ_shared` | [64, 512] | bf16 | 64 | dQuery 主维度 | 输出阶段 |
+| `dQ_tail_shared` | [64, 64] | bf16 | 8 | dQuery RoPE 维度 | 输出阶段 |
+| `acc_dkv_shared` | [16, 512] | float32 | 32 | dKV 主维度累加 | 每个 topk block |
+| `acc_dkv_tail_shared` | [16, 64] | float32 | 4 | dKV RoPE 维度累加 | 每个 topk block |
+
+### Shared Memory 使用模式
+
+1. **静态分配**: `Q_shared`, `Q_tail_shared`, `dO_shared` - 136 KB
+2. **循环内分配**: `KV_shared`, `KV_tail_shared`, `P_shared_cast`, `dP_shared_cast`, `acc_dkv_shared`, `acc_dkv_tail_shared` - 76 KB
+3. **输出阶段**: `dQ_shared`, `dQ_tail_shared` - 72 KB
+
+**理论最大占用**: ~136 KB (静态) + 76 KB (循环) = **212 KB**
+
+### 内存复用分析
+
+实际运行时内存是分时复用的：
+- 静态内存 (136KB) 一直存在
+- 循环内存 (76KB) 每个 topk block 复用
+- 输出内存 (72KB) 与循环内存可以部分重叠
+
+**实际峰值占用**: ~136 KB + max(76KB, 72KB) = **212 KB**
+
+## 3. CUDA 实现资源占用分析
+
+如果将 TileLang 转换为 CUDA 实现，需要考虑 SM100 的 TMEM 和 Shared Memory。
+
+### 建议的 CUDA 实现内存布局
+
+#### A. TMEM (Tensor Memory) 分配
+
+| 变量 | Shape | 数据类型 | 列分配 | 大小 (KB) | 用途 |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| `P` | [64, 32] | float32 | 0~16 | 8 | Attention Scores |
+| `dP` | [64, 32] | float32 | 16~32 | 8 | dAttention Scores |
+| `dKV_accum` | [32, 576] | float32 | 32~176 | 72 | dKV 累加缓冲 |
+| `dQ` | [64, 576] | float32 | 176~464 | 144 | dQuery 累加缓冲 |
+
+**TMEM 总占用**: 464 列 × 128 行 × 4 字节 = **232 KB** (90.6% 利用率)
+
+#### B. Shared Memory 分配 (CUDA 版本)
+
+| 变量 | Shape | 数据类型 | 大小 (KB) | 用途 | 生命周期 |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| `Q` | [64, 576] | bf16 | 72 | Query (NoPE+RoPE) | 全程 |
+| `KV` | [32, 576] | bf16 | 36 | Key/Value | 每个 topk block |
+| `dO` | [64, 512] | bf16 | 64 | dOutput | 全程 |
+| `s` | [64, 32] | bf16 | 4 | Attention Scores (S) | 每个 topk block |
+| `ds` | [64, 32] | bf16 | 4 | dAttention Scores (dS) | 每个 topk block |
+
+**Shared Memory 总占用**: 72 + 36 + 64 + 4 + 4 = **180 KB** (78% 利用率)
+
+### CUDA 实现的优势
+
+1. **TMEM 精度保证**: 将高精度的累加器 (dQ, dKV_accum, P, dP) 存储在 TMEM 中，确保反向传播的数值稳定性
+2. **计算优化**: TMEM 支持直接进行 Tensor Core 操作，且 fp32 累加在 TMEM 中效率极高
+3. **Smem 角色转变**: Shared Memory 主要用于缓存输入 (Q, KV, dO)，利用 SM100 较大的 Smem 容量换取更简单的访存逻辑
+
+## 4. 性能考虑
+
+### 计算复杂度
+- **主要 GEMM 操作**:
+  - Q×K^T: [64, 512] × [32, 512] → [64, 32]
+  - dO×K^T: [64, 512] × [32, 512] → [64, 32]
+  - dP×K: [64, 32] × [32, 512] → [64, 512]
+  - dP×Q^T: [64, 32] × [64, 512] → [32, 512]
+
+### 内存带宽需求
+- **输入加载**: Q(64×576), dO(64×512), KV blocks(32×576 × topk/32)
+- **输出存储**: dQ(64×576), dKV(32×576 × topk/32)
+
+**理论内存带宽**: ~500 GB/s (考虑数据复用)
+
+## 5. 结论
+
+### TileLang 版本
+- **Shared Memory**: 212 KB (93% SM100 限制)
+- **优势**: 开发简便，自动优化
+- **限制**: 无法利用 TMEM，可能性能 suboptimal
+
+### CUDA 版本
+- **TMEM**: 232 KB (90.6% 利用率)
+- **Shared Memory**: 180 KB (78% 利用率)
+- **优势**: 充分利用 SM100 硬件特性，关键计算路径保持 fp32 高精度，且 Smem 占用仍处于安全范围内
+- **挑战**: 开发复杂度高，需要手动内存管理
+
+该反向实现的核心优化点在于平衡计算精度与硬件资源利用，Sparse MLA 的 backward pass 在资源受限的场景下展现出显著的内存效率。
