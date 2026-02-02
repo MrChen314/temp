@@ -1,192 +1,210 @@
-## 口头报告：SM100_TMEM_LOAD_32dp32bNx 用法调研总结
+#include "test_2sm_mma.cuh"
+#include <torch/extension.h>
+#include <c10/cuda/CUDAStream.h>
 
----
-
-### 一、核心概念
-
-**SM100_TMEM_LOAD_32dp32bNx** 是NVIDIA CUTLASS库为**Blackwell架构（SM100）第五代TensorCore (TCGen05)**提供的**Tensor Memory (TMEM)加载指令**封装。
-
-**命名解析：**
-- **SM100**: 对应Blackwell架构（如B100/B200）
-- **TMEM_LOAD**: 从Tensor Memory加载数据到寄存器
-- **32dp**: 32 data path lanes（32个数据路径通道）
-- **32b**: 32-bit pattern（每通道32位数据模式）
-- **Nx**: repeated N times（在列方向重复N次）
-
----
-
-### 二、NVIDIA官方PTX文档定义
-
-根据[NVIDIA PTX ISA文档](https://docs.nvidia.com/cuda/parallel-thread-execution/)中关于**tcgen05.ld**指令的说明：
-
-#### 2.1 指令语法
-```ptx
-tcgen05.ld.sync.aligned.shape.num{.pack}.b32  r, [taddr];
-
-.shape = { .16x64b, .16x128b, .16x256b, .16x32bx2, .32x32b }
-.num   = { .x1, .x2, .x4, .x8, .x16, .x32, .x64, .x128 }
-```
-
-#### 2.2 数据移动形状说明
-| Shape | 含义 |
-|-------|------|
-| `.32x32b` | 32个lane，每个lane加载32bit数据 |
-| `.16x64b` | 16个lane，每个lane加载64bit数据 |
-| `.16x128b` | 16个lane，每个lane加载128bit数据 |
-| `.16x256b` | 16个lane，每个lane加载256bit数据 |
-
-#### 2.3 Tensor Memory结构
-- **二维矩阵结构**：128行(lanes) × 512列
-- **每个cell**：32-bit (4字节)
-- **地址格式**：32位，高16位=lane index，低16位=column index
-- **warp访问限制**：一个warp只能访问32个lane
-
-来源：[PTX ISA文档 - tcgen05-instructions](https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-instructions)
-
----
-
-### 三、CUTLASS库实现
-
-在CUTLASS库`include/cute/arch/copy_sm100.hpp`中的具体实现：
-
-#### 3.1 结构体定义示例（SM100_TMEM_LOAD_32dp32b1x）
-```cpp
-// 32 data path lanes, 32-bit pattern, repeated 1 time
-struct SM100_TMEM_LOAD_32dp32b1x {
-  using SRegisters = uint32_t[1];
-  using DRegisters = uint32_t[1];
-
-  CUTE_HOST_DEVICE static void
-  copy(uint32_t const& src_addr, uint32_t& dst0) {
-    asm volatile ("tcgen05.ld.sync.aligned.32x32b.x1.b32"
-                  "{%0},"
-                  "[%1];\n"
-    : "=r"(dst0)
-    : "r"(src_addr));
-  }
-};
-```
-
-#### 3.2 支持的变体（N值）
-| 结构体名称 | 重复次数 | 输出寄存器数 |
-|-----------|---------|-------------|
-| SM100_TMEM_LOAD_32dp32b1x | 1次 | 1个uint32_t |
-| SM100_TMEM_LOAD_32dp32b2x | 2次 | 2个uint32_t |
-| SM100_TMEM_LOAD_32dp32b4x | 4次 | 4个uint32_t |
-| SM100_TMEM_LOAD_32dp32b8x | 8次 | 8个uint32_t |
-| SM100_TMEM_LOAD_32dp32b16x | 16次 | 16个uint32_t |
-| SM100_TMEM_LOAD_32dp32b32x | 32次 | 32个uint32_t |
-| SM100_TMEM_LOAD_32dp32b64x | 64次 | 64个uint32_t |
-| SM100_TMEM_LOAD_32dp32b128x | 128次 | 128个uint32_t |
-
-#### 3.3 对应的PTX指令映射
-| CUTLASS结构体 | PTX指令 |
-|--------------|---------|
-| SM100_TMEM_LOAD_32dp32b1x | `tcgen05.ld.sync.aligned.32x32b.x1.b32` |
-| SM100_TMEM_LOAD_32dp32b128x | `tcgen05.ld.sync.aligned.32x32b.x128.b32` |
-
-来源：[CUTLASS GitHub - copy_sm100.hpp](https://github.com/NVIDIA/cutlass/blob/main/include/cute/arch/copy_sm100.hpp)
-
----
-
-### 四、FlashMLA中的封装使用
-
-您引用的代码（[`intrinsics.cuh`](FlashMLA/csrc/kerutils/include/kerutils/device/sm100/intrinsics.cuh)第271-299行）是对CUTLASS库的进一步封装：
-
-```cpp
-template <int kNumElements>
-__device__ __forceinline__
-void tmem_ld_32dp32bNx(uint32_t tmem_start, void* data_) {
-    uint32_t* data = (uint32_t*)data_;
-    static_assert(kNumElements == 1 || kNumElements == 2 || ...);
+// Kernel 实现 (cluster dims 在 launch 时指定)
+__global__ void test_utcmma_ss_kernel(
+    const bf16* __restrict__ Q,
+    const bf16* __restrict__ K,
+    float* __restrict__ P_out
+) {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000 && __CUDA_ARCH__ < 1200))
+    extern __shared__ char smem_raw[];
+    SharedMemory& smem = *reinterpret_cast<SharedMemory*>(smem_raw);
     
-    [&]<size_t... Is>(cute::index_sequence<Is...>) {
-        if constexpr (kNumElements == 1) {
-            cute::SM100_TMEM_LOAD_32dp32b1x::copy(tmem_start, data[Is]...);
-        } else if constexpr (kNumElements == 2) {
-            cute::SM100_TMEM_LOAD_32dp32b2x::copy(tmem_start, data[Is]...);
+    const int cta_idx = blockIdx.x % 2;  // 0 or 1
+    const int tid = threadIdx.x;
+    const int warp_idx = tid / 32;
+    
+    // 1. 初始化 barrier
+    if (warp_idx == 0) {
+        if (cute::elect_one_sync()) {
+            smem.bar_mma_done.init(1);
+            cutlass::arch::fence_barrier_init();
         }
-        // ... 其他情况
-    }(cute::make_index_sequence<kNumElements>{});
+    }
+    
+    cute::cluster_sync();  // We must add a cluster_sync() here, or operations from CTA1 may launch before barrier initialization in CTA0
+    
+    // 2. 分配 TMEM：512 列，供 2 个 CTA 共享
+    if (warp_idx == 0) {
+        if (cute::elect_one_sync()) {
+            cute::TMEM::Allocator2Sm().allocate(512, smem.tmem_start_addr);
+            TRAP_ONLY_DEVICE_ASSERT(smem.tmem_start_addr.data()[0] == 0);
+            cute::TMEM::Allocator2Sm().release_allocation_lock();
+        }
+    }
+    
+    __syncthreads();
+    cute::cluster_sync();
+    
+    // 3. 从 Global Memory 加载 Q, K 到 SMEM
+    // 每个 CTA 加载各自的一半：CTA0 加载前64行，CTA1 加载后64行
+    const int q_row_offset = cta_idx * (M/2);
+    const int k_row_offset = cta_idx * (N/2);
+    
+    // 加载 Q: [64, 256]
+    for (int i = tid; i < (M/2) * K_DIM; i += blockDim.x) {
+        int row = i / K_DIM;
+        int col = i % K_DIM;
+        int global_row = q_row_offset + row;
+        smem.q[i] = Q[global_row * K_DIM + col];
+    }
+    
+    // 加载 K: [64, 256]
+    for (int i = tid; i < (N/2) * K_DIM; i += blockDim.x) {
+        int row = i / K_DIM;
+        int col = i % K_DIM;
+        int global_row = k_row_offset + row;
+        smem.k[i] = K[global_row * K_DIM + col];
+    }
+    
+    __syncthreads();
+    cute::cluster_sync();
+    
+    // 4. 构造 SMEM Tensor
+    auto sQ = cute::make_tensor(cute::make_smem_ptr(smem.q), SmemLayoutQ{});
+    auto sK = cute::make_tensor(cute::make_smem_ptr(smem.k), SmemLayoutK{});
+    
+    // 5. 初始化 TiledMMA 并分配 TMEM fragment
+    TiledMMA_P tiled_mma;
+    auto tP = cute::partition_fragment_C(tiled_mma, cute::Shape<cute::Int<M/2>, cute::Int<N>>{});
+    tP.data().get() = smem.tmem_start_addr[0];  // 使用动态分配的 TMEM 地址
+    
+    // 6. 执行 utcmma_ss (只在 CTA0 的特定 warp 中执行，参考 phase1.cuh:494-540)
+    if (cta_idx == 0 && warp_idx == 0 && cute::elect_one_sync()) {
+        ku::tcgen05_after_thread_sync();
+        ku::utcmma_ss(tiled_mma, sQ, sK, tP, true);  // clear_accum = true
+        ku::umma_arrive_multicast_2x1SM_noelect(smem.bar_mma_done, 1|2);
+    }
+    
+    // 等待 MMA 完成
+    smem.bar_mma_done.wait(0);
+    ku::tcgen05_after_thread_sync();
+    
+    // 7. 从 TMEM 读取结果到寄存器，然后写入全局内存
+    // 每个 CTA 读取一半结果：CTA0 读 P[0:64, :], CTA1 读 P[64:128, :]
+    // TMEM 布局：每个 CTA 存 [M/2, N] = [64, 128] 的结果
+    
+    // 使用 tmem_ld 读取：每个线程读取若干元素
+    // 32dp32bNx 模式：32 个数据路径，每个路径 32bit (即 1 个 float)
+    
+    const int p_row_offset = cta_idx * (M/2);
+    
+    // 每个线程处理多行
+    // 总共 64 行，128 列，每个 CTA 128 线程
+    // 简单方案：每个线程读取一行的一部分
+    
+    // TMEM 中 tP 的数据布局需要按照 MMA traits 中的 CLayout 来解析
+    // CLayout: Layout<Shape<_2, Shape<Int<M/2>, Int<N>>>, Stride<Int<M/2>, Stride<_1, Int<M>>>>
+    // 这意味着数据是按 (cta, (row, col)) 的顺序存储的
+    
+    // 对于 M=128, N=128:
+    // - 每个 CTA 存储 64 行 x 128 列 = 8192 个 float
+    // - TMEM 地址 = TMEM_COL_P + row + col * M
+    
+    // 每个线程读取并写出若干元素
+    constexpr int ELEMENTS_PER_THREAD = (M/2 * N) / NUM_THREADS;  // 8192 / 128 = 64
+    // 读取 TMEM 到寄存器（参考 phase1.cuh 的用法）
+    // 使用 32dp32bNx 批量读取模式：
+    // - 32dp: 32 个数据路径（对应 warp 内 32 个线程）
+    // - 32b: 每个数据路径 32bit（1 个 float）
+    // - Nx: 在列方向重复 N 次，一次读取 N 列数据
+    
+    // 使用 float2 数组配合批量读取（参考 phase1.cuh 第176行）
+    // ELEMENTS_PER_THREAD = 64，对应 32 个 float2
+    float2 local_p[ELEMENTS_PER_THREAD / 2];
+    
+    // 计算 TMEM 起始列地址（根据 CLayout stride: <M/2, <1, M>>）
+    uint32_t tmem_col = smem.tmem_start_addr[0] + cta_idx * (M/2);
+    
+    // 批量读取 64 列数据（参考 phase1.cuh 第177行）
+    // 64 是支持的 kNumElements 值（文档第77行）
+    ku::tmem_ld_32dp32bNx<ELEMENTS_PER_THREAD>(tmem_col, local_p);
+    
+    // 同步原语（参考 phase1.cuh 第178-179行）
+    cutlass::arch::fence_view_async_tmem_load();
+    ku::tcgen05_before_thread_sync();
+    __syncthreads();
+    
+    // 转换为 float 指针用于后续写出
+    float* local_p_float = reinterpret_cast<float*>(local_p);
+    
+    // 写入全局内存
+    for (int i = 0; i < ELEMENTS_PER_THREAD; ++i) {
+        int linear_idx = tid * ELEMENTS_PER_THREAD + i;
+        int row = linear_idx / N;
+        int col = linear_idx % N;
+        int global_row = p_row_offset + row;
+        P_out[global_row * N + col] = local_p_float[i];
+    }
+
+#endif
 }
-```
 
-**功能说明**：
-- 使用C++17折叠表达式自动展开参数
-- 根据`kNumElements`模板参数选择对应的CUTLASS加载指令
-- 支持的kNumElements值：1, 2, 4, 8, 16, 32, 64, 128
+// C++ wrapper
+void launch_test_utcmma_ss(
+    const bf16* Q,
+    const bf16* K,
+    float* P_out,
+    cudaStream_t stream
+) {
+    dim3 grid(2, 1, 1);  // 2 CTAs
+    dim3 block(NUM_THREADS, 1, 1);
+    
+    // Cluster 配置
+    cudaLaunchConfig_t config;
+    memset(&config, 0, sizeof(config));
+    config.gridDim = grid;
+    config.blockDim = block;
+    config.dynamicSmemBytes = SMEM_SIZE;
+    config.stream = stream;
+    
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeClusterDimension;
+    attrs[0].val.clusterDim.x = 2;
+    attrs[0].val.clusterDim.y = 1;
+    attrs[0].val.clusterDim.z = 1;
+    config.attrs = attrs;
+    config.numAttrs = 1;
+    
+    cudaLaunchKernelEx(&config, test_utcmma_ss_kernel, Q, K, P_out);
+}
 
----
+// Python binding: 接受 torch tensor
+torch::Tensor utcmma_ss_forward(torch::Tensor Q, torch::Tensor K) {
+    // 检查输入
+    TORCH_CHECK(Q.is_cuda(), "Q must be a CUDA tensor");
+    TORCH_CHECK(K.is_cuda(), "K must be a CUDA tensor");
+    TORCH_CHECK(Q.dtype() == torch::kBFloat16, "Q must be bfloat16");
+    TORCH_CHECK(K.dtype() == torch::kBFloat16, "K must be bfloat16");
+    TORCH_CHECK(Q.dim() == 2 && Q.size(0) == M && Q.size(1) == K_DIM, 
+                "Q shape must be [128, 256]");
+    TORCH_CHECK(K.dim() == 2 && K.size(0) == N && K.size(1) == K_DIM,
+                "K shape must be [128, 256]");
+    TORCH_CHECK(Q.is_contiguous(), "Q must be contiguous");
+    TORCH_CHECK(K.is_contiguous(), "K must be contiguous");
+    
+    // 创建输出 tensor
+    auto options = torch::TensorOptions()
+        .dtype(torch::kFloat32)
+        .device(Q.device());
+    torch::Tensor P_out = torch::empty({M, N}, options);
+    
+    // 获取数据指针
+    const bf16* Q_ptr = reinterpret_cast<const bf16*>(Q.data_ptr<at::BFloat16>());
+    const bf16* K_ptr = reinterpret_cast<const bf16*>(K.data_ptr<at::BFloat16>());
+    float* P_out_ptr = P_out.data_ptr<float>();
+    
+    // 获取 CUDA stream
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+    
+    // 调用 kernel
+    launch_test_utcmma_ss(Q_ptr, K_ptr, P_out_ptr, stream);
+    
+    return P_out;
+}
 
-### 五、使用场景和执行流程
-
-#### 5.1 典型UMMA计算流程
-```
-1. tcgen05.alloc  → 分配TMEM
-2. tcgen05.mma    → 矩阵乘加，结果存入TMEM
-3. tcgen05.commit + mbarrier.wait → 等待计算完成
-4. tcgen05.ld     → 从TMEM加载结果到寄存器 ★
-5. ALU计算        → 后处理（如激活函数）
-6. 写回Global Memory
-7. tcgen05.dealloc → 释放TMEM
-```
-
-#### 5.2 同步机制
-```ptx
-// 发起异步加载
-tcgen05.ld.sync.aligned.32x32b.x4.b32 {%acc0, %acc1, %acc2, %acc3}, [tmem_ptr];
-// 等待加载完成
-tcgen05.wait::ld.sync.aligned;
-// 安全使用寄存器数据
-add.f32 %acc0, %acc0, %bias0;
-```
-
-来源：[知乎 - UMMA指令介绍](https://zhuanlan.zhihu.com/p/2641783283)
-
----
-
-### 六、内存布局图示
-
-**`.32x32b`形状的TMEM布局**（执行`tcgen05.ld.32x32b.xN`时）：
-
-```
-一个warp访问TMEM的32个lane：
-┌─────────────────────────────────────────────────┐
-│ Lane 0:  [ Col0 ][ Col1 ]...[ ColN-1 ]  (N×32b) │
-│ Lane 1:  [ Col0 ][ Col1 ]...[ ColN-1 ]  (N×32b) │
-│ ...                                              │
-│ Lane 31: [ Col0 ][ Col1 ]...[ ColN-1 ]  (N×32b) │
-└─────────────────────────────────────────────────┘
-每个Lane加载 (32 × .num) bits 数据
-```
-
-来源：[PTX文档 - Figure 183](https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-mma-fragment-3232b)
-
----
-
-### 七、关键技术要点总结
-
-| 项目 | 说明 |
-|------|------|
-| **目标架构** | SM100（Blackwell B100/B200）需`sm_100a`编译 |
-| **指令类型** | warp粒度同步执行的异步指令 |
-| **前置条件** | 需要先通过`tcgen05.alloc`分配TMEM |
-| **同步方式** | 必须用`tcgen05.wait::ld`等待完成 |
-| **最大加载量** | `.x128`变体可一次加载128×32bit = 512B/线程 |
-| **使能宏** | 需定义`CUTE_ARCH_TCGEN05_TMEM_ENABLED` |
-
----
-
-### 八、参考资料来源
-
-1. **NVIDIA PTX ISA官方文档**: https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-instructions-tcgen05-ld
-2. **CUTLASS GitHub库**: https://github.com/NVIDIA/cutlass/blob/main/include/cute/arch/copy_sm100.hpp
-3. **知乎技术文章 - Blackwell架构学习**: https://blog.csdn.net/article
-4. **知乎技术文章 - UMMA指令介绍**: https://zhuanlan.zhihu.com/p/268603882
-5. **Colfax Research - Blackwell GEMM教程**: https://research.colfax-intl.com/cutlass-tutorial-writing-gemm-kernels-using-tensor-memory-for-nvidia-blackwell-gpus/
-
----
-
-**报告结束。** 如需更详细的某一方面信息，可以进一步调研。
-ReportID: 760af7c4-1d0f-46c3-bd07-a6ce84e97920
-ConversationID: 62d84813-51c2-40d0-b0f4-1e99daaeb41e
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("utcmma_ss", &utcmma_ss_forward, "Test utcmma_ss (CUDA)");
+}
