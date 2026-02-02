@@ -1,138 +1,123 @@
-#!/usr/bin/env python3
-"""
-Test script for utcmma_ss (SM100 2x1SM SS MMA)
-Tests the CUDA kernel against PyTorch reference implementation.
-"""
 
 import torch
-import test_2sm_mma_cuda  # 编译后的模块
+import triton
+import triton.language as tl
+import math
 
 
-def test_utcmma_ss():
-    """Test utcmma_ss precision against PyTorch matmul"""
-    print("=" * 60)
-    print("Testing utcmma_ss (SM100 2x1SM SS MMA)")
-    print("=" * 60)
+@triton.jit
+def triton_attn_dist_kernel(
+    p_out_ptr,      # [s_q, h_q, topk]
+    output_ptr,     # [s_q, topk]
+    sm_scale,
+    s_q, topk,
+    stride_p_s, stride_p_h, stride_p_k,
+    stride_o_s, stride_o_k,
+    H_Q: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    s_idx = tl.program_id(0)
+    k_offs = tl.arange(0, BLOCK_K)    
+    acc = tl.zeros([BLOCK_K], dtype=tl.float32)
     
-    # 矩阵规格
-    M, N, K = 128, 128, 256
-    print(f"Q shape: [{M}, {K}]")
-    print(f"K shape: [{N}, {K}]")
-    print(f"P shape: [{M}, {N}] = Q @ K.T")
-    print()
+    for h_idx in range(H_Q):
+        p_ptrs = p_out_ptr + s_idx * stride_p_s + h_idx * stride_p_h + k_offs * stride_p_k
+        
+        p = tl.load(p_ptrs)
+        attn_score = p * sm_scale
+        
+        max_val = tl.max(attn_score, axis=0)
+        exp_val = tl.exp(attn_score - max_val)
+        sum_exp = tl.sum(exp_val, axis=0)
+        attn_prob = exp_val / sum_exp  # [BLOCK_K]
+        
+        acc += attn_prob
     
-    # 生成输入数据
-    torch.manual_seed(42)
-    Q = torch.randn(M, K, dtype=torch.bfloat16, device='cuda')
-    K_mat = torch.randn(N, K, dtype=torch.bfloat16, device='cuda')
-    
-    print(f"Q dtype: {Q.dtype}, device: {Q.device}")
-    print(f"K dtype: {K_mat.dtype}, device: {K_mat.device}")
-    print()
-    
-    # CUDA kernel 计算
-    print("Running CUDA kernel...")
-    P_cuda = test_2sm_mma_cuda.utcmma_ss(Q, K_mat)
-    torch.cuda.synchronize()
-    print(f"P_cuda shape: {P_cuda.shape}, dtype: {P_cuda.dtype}")
-    
-    # PyTorch 参考计算
-    print("Running PyTorch reference...")
-    P_ref = torch.matmul(Q.float(), K_mat.float().T)
-    print(f"P_ref shape: {P_ref.shape}, dtype: {P_ref.dtype}")
-    print()
-    
-    # 精度对比
-    diff = (P_cuda - P_ref).abs()
-    max_diff = diff.max().item()
-    mean_diff = diff.mean().item()
-    
-    # 相对误差
-    rel_diff = diff / (P_ref.abs() + 1e-6)
-    max_rel_diff = rel_diff.max().item()
-    mean_rel_diff = rel_diff.mean().item()
-    
-    print("=" * 60)
-    print("Precision Results:")
-    print("=" * 60)
-    print(f"Max absolute diff:  {max_diff:.6e}")
-    print(f"Mean absolute diff: {mean_diff:.6e}")
-    print(f"Max relative diff:  {max_rel_diff:.6e}")
-    print(f"Mean relative diff: {mean_rel_diff:.6e}")
-    print()
-    
-    # 打印部分结果用于调试
-    print("Sample values (first 5x5 block):")
-    print("CUDA result:")
-    print(P_cuda[:5, :5])
-    print("Reference result:")
-    print(P_ref[:5, :5])
-    print()
-    
-    # 断言精度在合理范围内
-    # bf16 输入、float 累加，允许的误差范围
-    threshold = 1e-2
-    if max_diff < threshold:
-        print(f"✓ Test PASSED! (max_diff={max_diff:.6e} < {threshold})")
-        return True
-    else:
-        print(f"✗ Test FAILED! (max_diff={max_diff:.6e} >= {threshold})")
-        return False
+    o_ptrs = output_ptr + s_idx * stride_o_s + k_offs * stride_o_k
+    tl.store(o_ptrs, acc / H_Q)
 
 
-def test_different_inputs():
-    """Test with different input patterns"""
-    print("\n" + "=" * 60)
-    print("Testing with different input patterns")
-    print("=" * 60)
+def triton_attn_dist(p_out: torch.Tensor, sm_scale) -> torch.Tensor:
+    s_q, h_q, topk = p_out.shape
+    output = torch.empty((s_q, topk), device=p_out.device, dtype=p_out.dtype)
+
+    assert topk == triton.next_power_of_2(topk)
     
-    M, N, K = 128, 128, 256
-    test_cases = [
-        ("All ones", torch.ones, torch.ones),
-        ("All zeros", torch.zeros, torch.zeros),
-        ("Identity-like", lambda *args, **kwargs: torch.eye(M, K, **kwargs), 
-                          lambda *args, **kwargs: torch.eye(N, K, **kwargs)),
-        ("Random uniform", lambda *args, **kwargs: torch.rand(*args, **kwargs) * 2 - 1,
-                          lambda *args, **kwargs: torch.rand(*args, **kwargs) * 2 - 1),
-    ]
+    grid = (s_q,)
     
-    all_passed = True
-    for name, q_gen, k_gen in test_cases:
-        try:
-            Q = q_gen(M, K, dtype=torch.bfloat16, device='cuda')
-            K_mat = k_gen(N, K, dtype=torch.bfloat16, device='cuda')
-            
-            P_cuda = test_2sm_mma_cuda.utcmma_ss(Q, K_mat)
-            P_ref = torch.matmul(Q.float(), K_mat.float().T)
-            
-            max_diff = (P_cuda - P_ref).abs().max().item()
-            status = "✓" if max_diff < 1e-2 else "✗"
-            print(f"{status} {name}: max_diff = {max_diff:.6e}")
-            
-            if max_diff >= 1e-2:
-                all_passed = False
-        except Exception as e:
-            print(f"✗ {name}: ERROR - {e}")
-            all_passed = False
+    triton_attn_dist_kernel[grid](
+        p_out, output, sm_scale,
+        s_q, topk,
+        p_out.stride(0), p_out.stride(1), p_out.stride(2),
+        output.stride(0), output.stride(1),
+        H_Q=h_q,
+        BLOCK_K=topk,
+    )
+    return output
+
+
+def ref_torch_attn_sum(
+    p_out: torch.Tensor,      # [s_q, h_q, topk]
+    sm_scale
+) -> torch.Tensor:
+    attn_score = p_out * sm_scale
+    attn_prob = torch.softmax(attn_score, dim=-1)  # [s_q, h_q, topk]
+    attn_sum = attn_prob.sum(dim=1)  # [s_q, topk]
+    attn_sum = attn_sum / attn_sum.sum(-1, keepdim=True)
     
-    return all_passed
+    return attn_sum
+
+
+def benchmark():
+    s_q = 16 * 1024  # 16384
+    h_q = 128
+    topk = 2048
+    sm_scale = 1.0 / math.sqrt(64)
+    
+    print(f"Benchmark Configuration:")
+    print(f"  s_q = {s_q}, h_q = {h_q}, topk = {topk}")
+    print(f"  Input shape: [{s_q}, {h_q}, {topk}]")
+    print(f"  sm_scale = {sm_scale:.6f}")
+    print()
+    
+    p_out = torch.randn(s_q, h_q, topk, device='cuda', dtype=torch.float32)
+    
+    print("Correctness Check:")
+    ref_out = ref_torch_attn_sum(p_out, sm_scale)
+    triton_out = triton_attn_dist(p_out, sm_scale)
+
+    def calc_diff(a, b):
+        abs_diff = torch.abs(a - b)
+        max_diff = abs_diff.max().item()
+        rel_diff = (abs_diff / (1e-4 + torch.abs(a))).mean().item()
+        return max_diff, rel_diff
+
+    max_diff, rel_diff = calc_diff(ref_out, triton_out.to(ref_out.dtype))
+    print(f"{max_diff=}\n{rel_diff=}\n")
+    is_close = rel_diff < 0.01
+    
+    print("Performance Benchmark (using triton.testing.do_bench):")
+    
+    torch_ms = triton.testing.do_bench(
+        lambda: ref_torch_attn_sum(p_out, sm_scale),
+        warmup=100,
+        rep=1000,
+    )
+    print(f"  PyTorch:  {torch_ms:.4f} ms")
+    
+    triton_ms = triton.testing.do_bench(
+        lambda: triton_attn_dist(p_out, sm_scale),
+        warmup=100,
+        rep=1000,
+    )
+    print(f"  Triton:   {triton_ms:.4f} ms")
+    
+    speedup = torch_ms / triton_ms
+    print(f"  Speedup:  {speedup:.2f}x")
+    print()
+    
+    return is_close
 
 
 if __name__ == "__main__":
-    print("CUDA Device:", torch.cuda.get_device_name())
-    print("CUDA Capability:", torch.cuda.get_device_capability())
-    print()
-    
-    passed = test_utcmma_ss()
-    
-    if passed:
-        passed = test_different_inputs()
-    
-    print("\n" + "=" * 60)
-    if passed:
-        print("All tests PASSED!")
-    else:
-        print("Some tests FAILED!")
-    print("=" * 60)
-    
-    exit(0 if passed else 1)
+    benchmark()
