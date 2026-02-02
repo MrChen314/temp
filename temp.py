@@ -1,227 +1,203 @@
-Using pip 25.1.1 from /usr/local/lib/python3.12/dist-packages/pip (python 3.12)
-Looking in indexes: http://mirrors.baidubce.com/pypi/simple/
-Obtaining file:///home/users/chenquanlin/workspace/dsv32/FlashMLA
-  Preparing metadata (setup.py): started
-  Running command python setup.py egg_info
-  Compiling using NVCC 12.9
-  running egg_info
-  creating /tmp/pip-pip-egg-info-v96tnlu7/flash_mla.egg-info
-  writing /tmp/pip-pip-egg-info-v96tnlu7/flash_mla.egg-info/PKG-INFO
-  writing dependency_links to /tmp/pip-pip-egg-info-v96tnlu7/flash_mla.egg-info/dependency_links.txt
-  writing top-level names to /tmp/pip-pip-egg-info-v96tnlu7/flash_mla.egg-info/top_level.txt
-  writing manifest file '/tmp/pip-pip-egg-info-v96tnlu7/flash_mla.egg-info/SOURCES.txt'
-  reading manifest file '/tmp/pip-pip-egg-info-v96tnlu7/flash_mla.egg-info/SOURCES.txt'
-  adding license file 'LICENSE'
-  writing manifest file '/tmp/pip-pip-egg-info-v96tnlu7/flash_mla.egg-info/SOURCES.txt'
-  Preparing metadata (setup.py): finished with status 'done'
-Installing collected packages: flash_mla
-  DEPRECATION: Legacy editable install of flash_mla==1.0.0+3ddd21e from file:///home/users/chenquanlin/workspace/dsv32/FlashMLA (setup.py develop) is deprecated. pip 25.3 will enforce this behaviour change. A possible replacement is to add a pyproject.toml or enable --use-pep517, and use setuptools >= 64. If the resulting installation is not behaving as expected, try using --config-settings editable_mode=compat. Please consult the setuptools documentation for more information. Discussion can be found at https://github.com/pypa/pip/issues/11457
-  Running setup.py develop for flash_mla
-    Running command python setup.py develop
-    Compiling using NVCC 12.9
-    running develop
-    /usr/local/lib/python3.12/dist-packages/setuptools/command/develop.py:41: EasyInstallDeprecationWarning: easy_install command is deprecated.
-    !!
+#include "test_2sm_mma.cuh"
+#include <torch/extension.h>
+#include <c10/cuda/CUDAStream.h>
 
-            ********************************************************************************
-            Please avoid running ``setup.py`` and ``easy_install``.
-            Instead, use pypa/build, pypa/installer or other
-            standards-based tools.
-
-            See https://github.com/pypa/setuptools/issues/917 for details.
-            ********************************************************************************
-
-    !!
-      easy_install.initialize_options(self)
-    /usr/local/lib/python3.12/dist-packages/setuptools/_distutils/cmd.py:90: SetuptoolsDeprecationWarning: setup.py install is deprecated.
-    !!
-
-            ********************************************************************************
-            Please avoid running ``setup.py`` directly.
-            Instead, use pypa/build, pypa/installer or other
-            standards-based tools.
-
-            See https://blog.ganssle.io/articles/2021/10/setup-py-deprecated.html for details.
-            ********************************************************************************
-
-    !!
-      self.initialize_options()
-    running egg_info
-    writing flash_mla.egg-info/PKG-INFO
-    writing dependency_links to flash_mla.egg-info/dependency_links.txt
-    writing top-level names to flash_mla.egg-info/top_level.txt
-    reading manifest file 'flash_mla.egg-info/SOURCES.txt'
-    adding license file 'LICENSE'
-    writing manifest file 'flash_mla.egg-info/SOURCES.txt'
-    running build_ext
-    building 'flash_mla.cuda' extension
-    Emitting ninja build file /home/users/chenquanlin/workspace/dsv32/FlashMLA/build/temp.linux-x86_64-cpython-312/build.ninja...
-    Compiling objects...
-    Allowing ninja to set a default number of workers... (overridable by setting the environment variable MAX_JOBS=N)
-    [1/1] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output /home/users/chenquanlin/workspace/dsv32/FlashMLA/build/temp.linux-x86_64-cpython-312/csrc/sm100/prefill/sparse/fwd.o.d -I/home/users/chenquanlin/workspace/dsv32/FlashMLA/csrc -I/home/users/chenquanlin/workspace/dsv32/FlashMLA/csrc/sm90 -I/home/users/chenquanlin/workspace/dsv32/FlashMLA/csrc/cutlass/include -I/home/users/chenquanlin/workspace/dsv32/FlashMLA/csrc/cutlass/tools/util/include -I/usr/local/lib/python3.12/dist-packages/torch/include -I/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/cuda/include -I/usr/include/python3.12 -c -c /home/users/chenquanlin/workspace/dsv32/FlashMLA/csrc/sm100/prefill/sparse/fwd.cu -o /home/users/chenquanlin/workspace/dsv32/FlashMLA/build/temp.linux-x86_64-cpython-312/csrc/sm100/prefill/sparse/fwd.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -DNDEBUG -D_USE_MATH_DEFINES -Wno-deprecated-declarations -U__CUDA_NO_HALF_OPERATORS__ -U__CUDA_NO_HALF_CONVERSIONS__ -U__CUDA_NO_HALF2_OPERATORS__ -U__CUDA_NO_BFLOAT16_CONVERSIONS__ --expt-relaxed-constexpr --expt-extended-lambda --use_fast_math --ptxas-options=-v,--register-usage-level=10 -gencode arch=compute_100a,code=sm_100a -gencode arch=compute_90a,code=sm_90a --threads 32 -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1016"' -DTORCH_EXTENSION_NAME=cuda
-    FAILED: /home/users/chenquanlin/workspace/dsv32/FlashMLA/build/temp.linux-x86_64-cpython-312/csrc/sm100/prefill/sparse/fwd.o
-    /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output /home/users/chenquanlin/workspace/dsv32/FlashMLA/build/temp.linux-x86_64-cpython-312/csrc/sm100/prefill/sparse/fwd.o.d -I/home/users/chenquanlin/workspace/dsv32/FlashMLA/csrc -I/home/users/chenquanlin/workspace/dsv32/FlashMLA/csrc/sm90 -I/home/users/chenquanlin/workspace/dsv32/FlashMLA/csrc/cutlass/include -I/home/users/chenquanlin/workspace/dsv32/FlashMLA/csrc/cutlass/tools/util/include -I/usr/local/lib/python3.12/dist-packages/torch/include -I/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/cuda/include -I/usr/include/python3.12 -c -c /home/users/chenquanlin/workspace/dsv32/FlashMLA/csrc/sm100/prefill/sparse/fwd.cu -o /home/users/chenquanlin/workspace/dsv32/FlashMLA/build/temp.linux-x86_64-cpython-312/csrc/sm100/prefill/sparse/fwd.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -DNDEBUG -D_USE_MATH_DEFINES -Wno-deprecated-declarations -U__CUDA_NO_HALF_OPERATORS__ -U__CUDA_NO_HALF_CONVERSIONS__ -U__CUDA_NO_HALF2_OPERATORS__ -U__CUDA_NO_BFLOAT16_CONVERSIONS__ --expt-relaxed-constexpr --expt-extended-lambda --use_fast_math --ptxas-options=-v,--register-usage-level=10 -gencode arch=compute_100a,code=sm_100a -gencode arch=compute_90a,code=sm_90a --threads 32 -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1016"' -DTORCH_EXTENSION_NAME=cuda
-    /home/users/chenquanlin/workspace/dsv32/FlashMLA/csrc/sm100/prefill/sparse/fwd.cu(830): error: name followed by "::" must be a class or namespace name
-              Layout<Shape<Int<Kernel::B_H/2>, Int<Kernel::B_TOPK>>, Stride<Int<Kernel::B_TOPK>, _1>>{}
-                               ^
-
-    /home/users/chenquanlin/workspace/dsv32/FlashMLA/csrc/sm100/prefill/sparse/fwd.cu(830): error: name followed by "::" must be a class or namespace name
-              Layout<Shape<Int<Kernel::B_H/2>, Int<Kernel::B_TOPK>>, Stride<Int<Kernel::B_TOPK>, _1>>{}
-                                                   ^
-
-    /home/users/chenquanlin/workspace/dsv32/FlashMLA/csrc/sm100/prefill/sparse/fwd.cu(830): error: name followed by "::" must be a class or namespace name
-              Layout<Shape<Int<Kernel::B_H/2>, Int<Kernel::B_TOPK>>, Stride<Int<Kernel::B_TOPK>, _1>>{}
-                                                                                ^
-
-    /home/users/chenquanlin/workspace/dsv32/FlashMLA/csrc/cutlass/include/cute/container/tuple.hpp(199): error: incomplete type "cute::eso::ESO<true, true, cute::Int<<error-constant>>, cute::Int<<error-constant>>>" (aka "cute::eso::ESO<true, true, cute::C<<error-constant>>, cute::C<<error-constant>>>") is not allowed
-      struct tuple : eso::ESO_t<T...>
-                     ^
-              detected during:
-                instantiation of class "cute::tuple<T...> [with T=<cute::C<<error-constant>>, cute::C<<error-constant>>>]" at line 843 of /usr/include/c++/13/type_traits
-                instantiation of class "std::is_empty<_Tp> [with _Tp=cute::tuple<cute::C<<error-constant>>, cute::C<<error-constant>>>]" at line 82
-                instantiation of "const bool cute::eso::is_first_empty_v [with First=cute::tuple<cute::C<<error-constant>>, cute::C<<error-constant>>>, Rest=<cute::tuple<cute::C<<error-constant>>, cute::_1>>]" at line 87
-                instantiation of type "cute::eso::ESO_t<cute::tuple<cute::C<<error-constant>>, cute::C<<error-constant>>>, cute::tuple<cute::C<<error-constant>>, cute::_1>>" at line 199
-                instantiation of class "cute::tuple<T...> [with T=<cute::tuple<cute::C<<error-constant>>, cute::C<<error-constant>>>, cute::tuple<cute::C<<error-constant>>, cute::_1>>]" at line 100 of /home/users/chenquanlin/workspace/dsv32/FlashMLA/csrc/cutlass/include/cute/layout.hpp
-                instantiation of class "cute::Layout<Shape, Stride> [with Shape=cute::tuple<cute::C<<error-constant>>, cute::C<<error-constant>>>, Stride=cute::tuple<cute::C<<error-constant>>, cute::_1>]" at line 830 of /home/users/chenquanlin/workspace/dsv32/FlashMLA/csrc/sm100/prefill/sparse/fwd.cu
-
-    /home/users/chenquanlin/workspace/dsv32/FlashMLA/csrc/cutlass/include/cute/container/tuple.hpp(199): error: incomplete type "cute::eso::ESO<true, true, cute::Int<<error-constant>>, cute::_1>" (aka "cute::eso::ESO<true, true, cute::C<<error-constant>>, cute::C<1>>") is not allowed
-      struct tuple : eso::ESO_t<T...>
-                     ^
-              detected during:
-                instantiation of class "cute::tuple<T...> [with T=<cute::C<<error-constant>>, cute::_1>]" at line 843 of /usr/include/c++/13/type_traits
-                instantiation of class "std::is_empty<_Tp> [with _Tp=cute::tuple<cute::C<<error-constant>>, cute::_1>]" at line 84
-                instantiation of "const bool cute::eso::is_rest_empty_v [with First=cute::tuple<cute::C<<error-constant>>, cute::C<<error-constant>>>, Rest=<cute::tuple<cute::C<<error-constant>>, cute::_1>>]" at line 87
-                instantiation of type "cute::eso::ESO_t<cute::tuple<cute::C<<error-constant>>, cute::C<<error-constant>>>, cute::tuple<cute::C<<error-constant>>, cute::_1>>" at line 199
-                instantiation of class "cute::tuple<T...> [with T=<cute::tuple<cute::C<<error-constant>>, cute::C<<error-constant>>>, cute::tuple<cute::C<<error-constant>>, cute::_1>>]" at line 100 of /home/users/chenquanlin/workspace/dsv32/FlashMLA/csrc/cutlass/include/cute/layout.hpp
-                instantiation of class "cute::Layout<Shape, Stride> [with Shape=cute::tuple<cute::C<<error-constant>>, cute::C<<error-constant>>>, Stride=cute::tuple<cute::C<<error-constant>>, cute::_1>]" at line 830 of /home/users/chenquanlin/workspace/dsv32/FlashMLA/csrc/sm100/prefill/sparse/fwd.cu
-
-    /home/users/chenquanlin/workspace/dsv32/FlashMLA/csrc/cutlass/include/cute/container/tuple.hpp(199): error: incomplete type "cute::eso::ESO<true, true, cute::Shape<cute::Int<<error-constant>>, cute::Int<<error-constant>>>, cute::Stride<cute::Int<<error-constant>>, cute::_1>>" (aka "cute::eso::ESO<true, true, cute::tuple<cute::C<<error-constant>>, cute::C<<error-constant>>>, cute::tuple<cute::C<<error-constant>>, cute::C<1>>>") is not allowed
-      struct tuple : eso::ESO_t<T...>
-                     ^
-              detected during:
-                instantiation of class "cute::tuple<T...> [with T=<cute::tuple<cute::C<<error-constant>>, cute::C<<error-constant>>>, cute::tuple<cute::C<<error-constant>>, cute::_1>>]" at line 100 of /home/users/chenquanlin/workspace/dsv32/FlashMLA/csrc/cutlass/include/cute/layout.hpp
-                instantiation of class "cute::Layout<Shape, Stride> [with Shape=cute::tuple<cute::C<<error-constant>>, cute::C<<error-constant>>>, Stride=cute::tuple<cute::C<<error-constant>>, cute::_1>]" at line 830 of /home/users/chenquanlin/workspace/dsv32/FlashMLA/csrc/sm100/prefill/sparse/fwd.cu
-
-    /home/users/chenquanlin/workspace/dsv32/FlashMLA/csrc/cutlass/include/cute/container/tuple.hpp(205): error: "ESO_t" is not a nonstatic data member or base class of class "cute::tuple<cute::Shape<cute::Int<<error-constant>>, cute::Int<<error-constant>>>, cute::Stride<cute::Int<<error-constant>>, cute::_1>>" (aka "cute::tuple<cute::tuple<cute::C<<error-constant>>, cute::C<<error-constant>>>, cute::tuple<cute::C<<error-constant>>, cute::C<1>>>")
-        tuple(T const&... t) : eso::ESO_t<T...>(t...) {}
-                               ^
-              detected during:
-                instantiation of "cute::tuple<T...>::tuple(const T &...) [with T=<cute::tuple<cute::C<<error-constant>>, cute::C<<error-constant>>>, cute::tuple<cute::C<<error-constant>>, cute::_1>>]" at line 109 of /home/users/chenquanlin/workspace/dsv32/FlashMLA/csrc/cutlass/include/cute/layout.hpp
-                instantiation of "cute::Layout<Shape, Stride>::Layout(const Shape &, const Stride &) [with Shape=cute::tuple<cute::C<<error-constant>>, cute::C<<error-constant>>>, Stride=cute::tuple<cute::C<<error-constant>>, cute::_1>]" at line 831 of /home/users/chenquanlin/workspace/dsv32/FlashMLA/csrc/sm100/prefill/sparse/fwd.cu
-
-    7 errors detected in the compilation of "/home/users/chenquanlin/workspace/dsv32/FlashMLA/csrc/sm100/prefill/sparse/fwd.cu".
-    ninja: build stopped: subcommand failed.
-    Traceback (most recent call last):
-      File "/usr/local/lib/python3.12/dist-packages/torch/utils/cpp_extension.py", line 2557, in _run_ninja_build
-        subprocess.run(
-      File "/usr/lib/python3.12/subprocess.py", line 571, in run
-        raise CalledProcessError(retcode, process.args,
-    subprocess.CalledProcessError: Command '['ninja', '-v']' returned non-zero exit status 1.
-
-    The above exception was the direct cause of the following exception:
-
-    Traceback (most recent call last):
-      File "<string>", line 2, in <module>
-      File "<pip-setuptools-caller>", line 35, in <module>
-      File "/home/users/chenquanlin/workspace/dsv32/FlashMLA/setup.py", line 113, in <module>
-        setup(
-      File "/usr/local/lib/python3.12/dist-packages/setuptools/__init__.py", line 117, in setup
-        return distutils.core.setup(**attrs)
-               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-      File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/core.py", line 186, in setup
-        return run_commands(dist)
-               ^^^^^^^^^^^^^^^^^^
-      File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/core.py", line 202, in run_commands
-        dist.run_commands()
-      File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/dist.py", line 1002, in run_commands
-        self.run_command(cmd)
-      File "/usr/local/lib/python3.12/dist-packages/setuptools/dist.py", line 1104, in run_command
-        super().run_command(command)
-      File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/dist.py", line 1021, in run_command
-        cmd_obj.run()
-      File "/usr/local/lib/python3.12/dist-packages/setuptools/command/develop.py", line 35, in run
-        self.install_for_development()
-      File "/usr/local/lib/python3.12/dist-packages/setuptools/command/develop.py", line 112, in install_for_development
-        self.run_command('build_ext')
-      File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/cmd.py", line 357, in run_command
-        self.distribution.run_command(command)
-      File "/usr/local/lib/python3.12/dist-packages/setuptools/dist.py", line 1104, in run_command
-        super().run_command(command)
-      File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/dist.py", line 1021, in run_command
-        cmd_obj.run()
-      File "/usr/local/lib/python3.12/dist-packages/setuptools/command/build_ext.py", line 99, in run
-        _build_ext.run(self)
-      File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/command/build_ext.py", line 368, in run
-        self.build_extensions()
-      File "/usr/local/lib/python3.12/dist-packages/torch/utils/cpp_extension.py", line 1052, in build_extensions
-        build_ext.build_extensions(self)
-      File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/command/build_ext.py", line 484, in build_extensions
-        self._build_extensions_serial()
-      File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/command/build_ext.py", line 510, in _build_extensions_serial
-        self.build_extension(ext)
-      File "/usr/local/lib/python3.12/dist-packages/setuptools/command/build_ext.py", line 264, in build_extension
-        _build_ext.build_extension(self, ext)
-      File "/usr/local/lib/python3.12/dist-packages/Cython/Distutils/build_ext.py", line 136, in build_extension
-        super().build_extension(ext)
-      File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/command/build_ext.py", line 565, in build_extension
-        objects = self.compiler.compile(
-                  ^^^^^^^^^^^^^^^^^^^^^^
-      File "/usr/local/lib/python3.12/dist-packages/torch/utils/cpp_extension.py", line 836, in unix_wrap_ninja_compile
-        _write_ninja_file_and_compile_objects(
-      File "/usr/local/lib/python3.12/dist-packages/torch/utils/cpp_extension.py", line 2209, in _write_ninja_file_and_compile_objects
-        _run_ninja_build(
-      File "/usr/local/lib/python3.12/dist-packages/torch/utils/cpp_extension.py", line 2574, in _run_ninja_build
-        raise RuntimeError(message) from e
-    RuntimeError: Error compiling objects for extension
-    error: subprocess-exited-with-error
+// Kernel 实现 (cluster dims 在 launch 时指定)
+__global__ void test_utcmma_ss_kernel(
+    const bf16* __restrict__ Q,
+    const bf16* __restrict__ K,
+    float* __restrict__ P_out
+) {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000 && __CUDA_ARCH__ < 1200))
+    extern __shared__ char smem_raw[];
+    SharedMemory& smem = *reinterpret_cast<SharedMemory*>(smem_raw);
     
-    × python setup.py develop did not run successfully.
-    │ exit code: 1
-    ╰─> See above for output.
+    const int cta_idx = blockIdx.x % 2;  // 0 or 1
+    const int tid = threadIdx.x;
+    const int warp_idx = tid / 32;
     
-    note: This error originates from a subprocess, and is likely not a problem with pip.
-    full command: /usr/bin/python -c '
-    exec(compile('"'"''"'"''"'"'
-    # This is <pip-setuptools-caller> -- a caller that pip uses to run setup.py
-    #
-    # - It imports setuptools before invoking setup.py, to enable projects that directly
-    #   import from `distutils.core` to work with newer packaging standards.
-    # - It provides a clear error message when setuptools is not installed.
-    # - It sets `sys.argv[0]` to the underlying `setup.py`, when invoking `setup.py` so
-    #   setuptools doesn'"'"'t think the script is `-c`. This avoids the following warning:
-    #     manifest_maker: standard file '"'"'-c'"'"' not found".
-    # - It generates a shim setup.py, for handling setup.cfg-only projects.
-    import os, sys, tokenize, traceback
+    // 1. 初始化 barrier 和分配 TMEM
+    if (warp_idx == 0) {
+        if (cute::elect_one_sync()) {
+            smem.bar_mma_done.init(1);
+            cutlass::arch::fence_barrier_init();
+        }
+        cute::cluster_sync();
+        // 分配 TMEM：512 列，供 2 个 CTA 共享
+        cute::TMEM::Allocator2Sm().allocate(512, smem.tmem_start_addr);
+        TRAP_ONLY_DEVICE_ASSERT(smem.tmem_start_addr.data()[0] == 0);
+        cute::TMEM::Allocator2Sm().release_allocation_lock();
+    }
     
-    try:
-        import setuptools
-    except ImportError:
-        print(
-            "ERROR: Can not execute `setup.py` since setuptools failed to import in "
-            "the build environment with exception:",
-            file=sys.stderr,
-        )
-        traceback.print_exc()
-        sys.exit(1)
     
-    __file__ = %r
-    sys.argv[0] = __file__
+    __syncthreads();
+    cute::cluster_sync();
     
-    if os.path.exists(__file__):
-        filename = __file__
-        with tokenize.open(__file__) as f:
-            setup_py_code = f.read()
-    else:
-        filename = "<auto-generated setuptools caller>"
-        setup_py_code = "from setuptools import setup; setup()"
+    // 2. 从 Global Memory 加载 Q, K 到 SMEM
+    // 每个 CTA 加载各自的一半：CTA0 加载前64行，CTA1 加载后64行
+    const int q_row_offset = cta_idx * (M/2);
+    const int k_row_offset = cta_idx * (N/2);
     
-    exec(compile(setup_py_code, filename, "exec"))
-    '"'"''"'"''"'"' % ('"'"'/home/users/chenquanlin/workspace/dsv32/FlashMLA/setup.py'"'"',), "<pip-setuptools-caller>", "exec"))' develop --no-deps
-    cwd: /home/users/chenquanlin/workspace/dsv32/FlashMLA/
-error: subprocess-exited-with-error
+    // 加载 Q: [64, 256]
+    for (int i = tid; i < (M/2) * K_DIM; i += blockDim.x) {
+        int row = i / K_DIM;
+        int col = i % K_DIM;
+        int global_row = q_row_offset + row;
+        smem.q[i] = Q[global_row * K_DIM + col];
+    }
+    
+    // 加载 K: [64, 256]
+    for (int i = tid; i < (N/2) * K_DIM; i += blockDim.x) {
+        int row = i / K_DIM;
+        int col = i % K_DIM;
+        int global_row = k_row_offset + row;
+        smem.k[i] = K[global_row * K_DIM + col];
+    }
+    
+    __syncthreads();
+    cute::cluster_sync();
+    
+    // 3. 构造 SMEM Tensor
+    auto sQ = cute::make_tensor(cute::make_smem_ptr(smem.q), SmemLayoutQ{});
+    auto sK = cute::make_tensor(cute::make_smem_ptr(smem.k), SmemLayoutK{});
+    
+    // 4. 初始化 TiledMMA 并分配 TMEM fragment
+    TiledMMA_P tiled_mma;
+    auto tP = cute::partition_fragment_C(tiled_mma, cute::Shape<cute::Int<M/2>, cute::Int<N>>{});
+    tP.data().get() = smem.tmem_start_addr[0];  // 使用动态分配的 TMEM 地址
+    
+    // 5. 执行 utcmma_ss
+    ku::tcgen05_after_thread_sync();
+    ku::utcmma_ss(tiled_mma, sQ, sK, tP, true);  // clear_accum = true
+    ku::umma_arrive_multicast_2x1SM_noelect(smem.bar_mma_done, 1|2);
+    
+    // 等待 MMA 完成
+    smem.bar_mma_done.wait(0);
+    ku::tcgen05_after_thread_sync();
+    
+    // 6. 从 TMEM 读取结果到寄存器，然后写入全局内存
+    // 每个 CTA 读取一半结果：CTA0 读 P[0:64, :], CTA1 读 P[64:128, :]
+    // TMEM 布局：每个 CTA 存 [M/2, N] = [64, 128] 的结果
+    
+    // 使用 tmem_ld 读取：每个线程读取若干元素
+    // 32dp32bNx 模式：32 个数据路径，每个路径 32bit (即 1 个 float)
+    
+    const int p_row_offset = cta_idx * (M/2);
+    
+    // 每个线程处理多行
+    // 总共 64 行，128 列，每个 CTA 128 线程
+    // 简单方案：每个线程读取一行的一部分
+    
+    // TMEM 中 tP 的数据布局需要按照 MMA traits 中的 CLayout 来解析
+    // CLayout: Layout<Shape<_2, Shape<Int<M/2>, Int<N>>>, Stride<Int<M/2>, Stride<_1, Int<M>>>>
+    // 这意味着数据是按 (cta, (row, col)) 的顺序存储的
+    
+    // 对于 M=128, N=128:
+    // - 每个 CTA 存储 64 行 x 128 列 = 8192 个 float
+    // - TMEM 地址 = TMEM_COL_P + row + col * M
+    
+    // 每个线程读取并写出若干元素
+    constexpr int ELEMENTS_PER_THREAD = (M/2 * N) / NUM_THREADS;  // 8192 / 128 = 64
+    // 读取 TMEM 到寄存器（参考 phase1.cuh 的用法）
+    // 使用 32dp32bNx 批量读取模式：
+    // - 32dp: 32 个数据路径（对应 warp 内 32 个线程）
+    // - 32b: 每个数据路径 32bit（1 个 float）
+    // - Nx: 在列方向重复 N 次，一次读取 N 列数据
+    
+    // 使用 float2 数组配合批量读取（参考 phase1.cuh 第176行）
+    // ELEMENTS_PER_THREAD = 64，对应 32 个 float2
+    float2 local_p[ELEMENTS_PER_THREAD / 2];
+    
+    // 计算 TMEM 起始列地址（根据 CLayout stride: <M/2, <1, M>>）
+    uint32_t tmem_col = smem.tmem_start_addr[0] + cta_idx * (M/2);
+    
+    // 批量读取 64 列数据（参考 phase1.cuh 第177行）
+    // 64 是支持的 kNumElements 值（文档第77行）
+    ku::tmem_ld_32dp32bNx<ELEMENTS_PER_THREAD>(tmem_col, local_p);
+    
+    // 同步原语（参考 phase1.cuh 第178-179行）
+    cutlass::arch::fence_view_async_tmem_load();
+    ku::tcgen05_before_thread_sync();
+    __syncthreads();
+    
+    // 转换为 float 指针用于后续写出
+    float* local_p_float = reinterpret_cast<float*>(local_p);
+    
+    // 写入全局内存
+    for (int i = 0; i < ELEMENTS_PER_THREAD; ++i) {
+        int linear_idx = tid * ELEMENTS_PER_THREAD + i;
+        int row = linear_idx / N;
+        int col = linear_idx % N;
+        int global_row = p_row_offset + row;
+        P_out[global_row * N + col] = local_p_float[i];
+    }
 
-× python setup.py develop did not run successfully.
-│ exit code: 1
-╰─> See above for output.
+#endif
+}
 
-note: This error originates from a subprocess, and is likely not a problem with pip.
+// C++ wrapper
+void launch_test_utcmma_ss(
+    const bf16* Q,
+    const bf16* K,
+    float* P_out,
+    cudaStream_t stream
+) {
+    dim3 grid(2, 1, 1);  // 2 CTAs
+    dim3 block(NUM_THREADS, 1, 1);
+    
+    // Cluster 配置
+    cudaLaunchConfig_t config;
+    memset(&config, 0, sizeof(config));
+    config.gridDim = grid;
+    config.blockDim = block;
+    config.dynamicSmemBytes = SMEM_SIZE;
+    config.stream = stream;
+    
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeClusterDimension;
+    attrs[0].val.clusterDim.x = 2;
+    attrs[0].val.clusterDim.y = 1;
+    attrs[0].val.clusterDim.z = 1;
+    config.attrs = attrs;
+    config.numAttrs = 1;
+    
+    cudaLaunchKernelEx(&config, test_utcmma_ss_kernel, Q, K, P_out);
+}
+
+// Python binding: 接受 torch tensor
+torch::Tensor utcmma_ss_forward(torch::Tensor Q, torch::Tensor K) {
+    // 检查输入
+    TORCH_CHECK(Q.is_cuda(), "Q must be a CUDA tensor");
+    TORCH_CHECK(K.is_cuda(), "K must be a CUDA tensor");
+    TORCH_CHECK(Q.dtype() == torch::kBFloat16, "Q must be bfloat16");
+    TORCH_CHECK(K.dtype() == torch::kBFloat16, "K must be bfloat16");
+    TORCH_CHECK(Q.dim() == 2 && Q.size(0) == M && Q.size(1) == K_DIM, 
+                "Q shape must be [128, 256]");
+    TORCH_CHECK(K.dim() == 2 && K.size(0) == N && K.size(1) == K_DIM,
+                "K shape must be [128, 256]");
+    TORCH_CHECK(Q.is_contiguous(), "Q must be contiguous");
+    TORCH_CHECK(K.is_contiguous(), "K must be contiguous");
+    
+    // 创建输出 tensor
+    auto options = torch::TensorOptions()
+        .dtype(torch::kFloat32)
+        .device(Q.device());
+    torch::Tensor P_out = torch::empty({M, N}, options);
+    
+    // 获取数据指针
+    const bf16* Q_ptr = reinterpret_cast<const bf16*>(Q.data_ptr<at::BFloat16>());
+    const bf16* K_ptr = reinterpret_cast<const bf16*>(K.data_ptr<at::BFloat16>());
+    float* P_out_ptr = P_out.data_ptr<float>();
+    
+    // 获取 CUDA stream
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+    
+    // 调用 kernel
+    launch_test_utcmma_ss(Q_ptr, K_ptr, P_out_ptr, stream);
+    
+    return P_out;
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("utcmma_ss", &utcmma_ss_forward, "Test utcmma_ss (CUDA)");
+}
