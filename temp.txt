@@ -1,5 +1,55 @@
-auto sA_frag = thr_mma.partition_fragment_A(sS);
-auto sB_frag = thr_mma.partition_fragment_B(sdO_k);
-if (tid == 0) {
-  printf("kloops A=%d B=%d\n", int(size<2>(sA_frag)), int(size<2>(sB_frag)));
-}
+root@tjzj-inf-sci-k8s-bzz2-0203:/home/users/chenquanlin/workspace/operator/test_operator/k_major_vs_mn_major# python test_k_mn_major.py 
+[k_mn_major debug][cta=0] finish 1: inputs loaded to SMEM
+[k_mn_major debug][cta=1] finish 1: inputs loaded to SMEM
+[k_mn_major debug][cta=1] sS(m0,k0..7):[k_mn_major debug][cta=0] sS(m0,k0..7):   0.1943   0.1943   1.1016   1.1016   0.1973   0.1973   0.3867   0.3867  -1.9375  -1.9375  -2.3125  -2.3125  -1.2969  -1.2969   1.3906   1.3906
+
+[k_mn_major debug][cta=0] sdO_k(n0,k0..7):[k_mn_major debug][cta=1] sdO_k(n0,k0..7):   0.1387   0.1387  -1.1797  -1.1797   0.5391   0.5391   0.5117   0.5117  -0.4648  -0.4648   1.3828   1.3828   1.6641   1.6641  -0.0579  -0.0579
+
+[k_mn_major debug][cta=0] sdO_mn(n0,k0..7):[k_mn_major debug][cta=1] sdO_mn(n0,k0..7):   0.1387   0.1387  -1.1797  -1.1797   0.5391   0.5391   0.5117   0.5117  -0.4648  -0.4648   1.3828   1.3828   1.6641   1.6641  -0.0579  -0.0579
+
+[k_mn_major debug][cta=0] dot(row=0,col=0): ref=   6.84005 k=   6.84005 mn=   6.84005 |diff_k|=   0.00000 |diff_mn|=   0.00000
+[k_mn_major debug][cta=1] dot(row=0,col=0): ref=   6.84005 k=   6.84005 mn=   6.84005 |diff_k|=   0.00000 |diff_mn|=   0.00000
+[k_mn_major debug][cta=0] dot(row=0,col=128): ref=   7.00403 k=   7.00403 mn=   7.00403 |diff_k|=   0.00000 |diff_mn|=   0.00000
+[k_mn_major debug][cta=1] dot(row=0,col=128): ref=   7.00403 k=   7.00403 mn=   7.00403 |diff_k|=   0.00000 |diff_mn|=   0.00000
+[k_mn_major debug][cta=0] finish 2: TMEM allocated base=0
+[k_mn_major debug][cta=1] finish 2: TMEM allocated base=0
+[k_mn_major debug][cta=0] finish 3: launch MMA K-major part0
+[k_mn_major debug][cta=1] finish 3: launch MMA MN-major part0
+[k_mn_major debug][cta=0] finish 3: launch MMA K-major part1(acc)
+[k_mn_major debug][cta=1] finish 3: launch MMA MN-major part1(acc)
+[k_mn_major debug][cta=0] finish 4: MMA done, start TMEM readback
+[k_mn_major debug][cta=1] finish 4: MMA done, start TMEM readback
+[k_mn_major debug][cta=0] tmem row=0 half=1 addr=0 vals(0..3)=(   7.0040, -10.7653,  -2.9991, -10.6824)
+[k_mn_major debug][cta=1] tmem row=0 half=1 addr=0 vals(0..3)=(   7.6799, -14.2187,  -2.4963, -13.2218)
+[k_mn_major debug][cta=0] tmem row=0 half=0 addr=0 vals(0..3)=(   6.8400,   2.9316, -15.4634,   6.3082)
+[k_mn_major debug][cta=1] tmem row=0 half=0 addr=0 vals(0..3)=(   6.8400,   2.9316, -15.4634,   6.3082)
+[k_mn_major debug][cta=1] out row0 col0..7:[k_mn_major debug][cta=0] out row0 col0..7:    6.8400    6.8400    2.9316    2.9316  -15.4634  -15.4634    6.3082    6.3082    0.2713    0.2713   -1.6209   -1.6209   -7.1839   -7.1839  -15.3249  -15.3249
+
+[k_mn_major debug][cta=1] out row0 col128..135:[k_mn_major debug][cta=0] out row0 col128..135:    7.6799    7.0040  -14.2187  -10.7653   -2.4963   -2.9991  -13.2218  -10.6824   -8.8543  -10.4301  -13.5213  -21.2315    2.3479    2.2499    1.9069   -5.7774
+
+[k_mn_major debug][cta=1] row0 col0/128: out=(   6.84005,   7.67992) ref=(   6.84005,   7.00403) abs_diff=(   0.00000,   0.67589)
+[k_mn_major debug][cta=0] row0 col0/128: out=(   6.84005,   7.00403) ref=(   6.84005,   7.00403) abs_diff=(   0.00000,   0.00000)
+[k_mn_major debug][cta=1] finish 5: TMEM freed, kernel done
+[k_mn_major debug][cta=0] finish 5: TMEM freed, kernel done
+================================================================
+k_major_vs_mn_major precision check
+================================================================
+s_bf16 shape: (128, 64)
+dO shape:     (128, 256)
+dV_ref shape: (64, 256)
+
+dV_cuda_k vs torch_ref:
+  max_abs  = 7.629395e-06
+  mean_abs = 2.536617e-07
+  max_rel  = 3.649607e-04
+
+dV_cuda_mn vs torch_ref:
+  max_abs  = 1.949768e+01
+  mean_abs = 2.460753e+00
+  max_rel  = 2.486578e+03
+
+dV_cuda_k vs dV_cuda_mn:
+  max_abs  = 1.949768e+01
+  mean_abs = 2.460753e+00
+
+Result: FAIL
