@@ -1,55 +1,210 @@
-root@tjzj-inf-sci-k8s-bzz2-0203:/home/users/chenquanlin/workspace/operator/test_operator/k_major_vs_mn_major# python test_k_mn_major.py 
-[k_mn_major debug][cta=0] finish 1: inputs loaded to SMEM
-[k_mn_major debug][cta=1] finish 1: inputs loaded to SMEM
-[k_mn_major debug][cta=1] sS(m0,k0..7):[k_mn_major debug][cta=0] sS(m0,k0..7):   0.1943   0.1943   1.1016   1.1016   0.1973   0.1973   0.3867   0.3867  -1.9375  -1.9375  -2.3125  -2.3125  -1.2969  -1.2969   1.3906   1.3906
+#include "test_k_mn_major.cuh"
 
-[k_mn_major debug][cta=0] sdO_k(n0,k0..7):[k_mn_major debug][cta=1] sdO_k(n0,k0..7):   0.1387   0.1387  -1.1797  -1.1797   0.5391   0.5391   0.5117   0.5117  -0.4648  -0.4648   1.3828   1.3828   1.6641   1.6641  -0.0579  -0.0579
+#include <torch/extension.h>
+#include <c10/cuda/CUDAStream.h>
+#include <kerutils/kerutils.cuh>
+#include <cutlass/arch/arch.h>
 
-[k_mn_major debug][cta=0] sdO_mn(n0,k0..7):[k_mn_major debug][cta=1] sdO_mn(n0,k0..7):   0.1387   0.1387  -1.1797  -1.1797   0.5391   0.5391   0.5117   0.5117  -0.4648  -0.4648   1.3828   1.3828   1.6641   1.6641  -0.0579  -0.0579
+using namespace test_operator::k_major_vs_mn_major;
+using cutlass::arch::fence_barrier_init;
 
-[k_mn_major debug][cta=0] dot(row=0,col=0): ref=   6.84005 k=   6.84005 mn=   6.84005 |diff_k|=   0.00000 |diff_mn|=   0.00000
-[k_mn_major debug][cta=1] dot(row=0,col=0): ref=   6.84005 k=   6.84005 mn=   6.84005 |diff_k|=   0.00000 |diff_mn|=   0.00000
-[k_mn_major debug][cta=0] dot(row=0,col=128): ref=   7.00403 k=   7.00403 mn=   7.00403 |diff_k|=   0.00000 |diff_mn|=   0.00000
-[k_mn_major debug][cta=1] dot(row=0,col=128): ref=   7.00403 k=   7.00403 mn=   7.00403 |diff_k|=   0.00000 |diff_mn|=   0.00000
-[k_mn_major debug][cta=0] finish 2: TMEM allocated base=0
-[k_mn_major debug][cta=1] finish 2: TMEM allocated base=0
-[k_mn_major debug][cta=0] finish 3: launch MMA K-major part0
-[k_mn_major debug][cta=1] finish 3: launch MMA MN-major part0
-[k_mn_major debug][cta=0] finish 3: launch MMA K-major part1(acc)
-[k_mn_major debug][cta=1] finish 3: launch MMA MN-major part1(acc)
-[k_mn_major debug][cta=0] finish 4: MMA done, start TMEM readback
-[k_mn_major debug][cta=1] finish 4: MMA done, start TMEM readback
-[k_mn_major debug][cta=0] tmem row=0 half=1 addr=0 vals(0..3)=(   7.0040, -10.7653,  -2.9991, -10.6824)
-[k_mn_major debug][cta=1] tmem row=0 half=1 addr=0 vals(0..3)=(   7.6799, -14.2187,  -2.4963, -13.2218)
-[k_mn_major debug][cta=0] tmem row=0 half=0 addr=0 vals(0..3)=(   6.8400,   2.9316, -15.4634,   6.3082)
-[k_mn_major debug][cta=1] tmem row=0 half=0 addr=0 vals(0..3)=(   6.8400,   2.9316, -15.4634,   6.3082)
-[k_mn_major debug][cta=1] out row0 col0..7:[k_mn_major debug][cta=0] out row0 col0..7:    6.8400    6.8400    2.9316    2.9316  -15.4634  -15.4634    6.3082    6.3082    0.2713    0.2713   -1.6209   -1.6209   -7.1839   -7.1839  -15.3249  -15.3249
+__global__ void test_k_mn_major_kernel(
+    const bf16* __restrict__ s_bf16,
+    const bf16* __restrict__ dO,
+    float* __restrict__ dV_cuda_k,
+    float* __restrict__ dV_cuda_mn
+) {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000 && __CUDA_ARCH__ < 1200))
+    using namespace cute;
 
-[k_mn_major debug][cta=1] out row0 col128..135:[k_mn_major debug][cta=0] out row0 col128..135:    7.6799    7.0040  -14.2187  -10.7653   -2.4963   -2.9991  -13.2218  -10.6824   -8.8543  -10.4301  -13.5213  -21.2315    2.3479    2.2499    1.9069   -5.7774
+    extern __shared__ char smem_raw[];
+    SharedMemory& smem = *reinterpret_cast<SharedMemory*>(smem_raw);
 
-[k_mn_major debug][cta=1] row0 col0/128: out=(   6.84005,   7.67992) ref=(   6.84005,   7.00403) abs_diff=(   0.00000,   0.67589)
-[k_mn_major debug][cta=0] row0 col0/128: out=(   6.84005,   7.00403) ref=(   6.84005,   7.00403) abs_diff=(   0.00000,   0.00000)
-[k_mn_major debug][cta=1] finish 5: TMEM freed, kernel done
-[k_mn_major debug][cta=0] finish 5: TMEM freed, kernel done
-================================================================
-k_major_vs_mn_major precision check
-================================================================
-s_bf16 shape: (128, 64)
-dO shape:     (128, 256)
-dV_ref shape: (64, 256)
+    const int cta_idx = blockIdx.x % 2;
+    const int tid = threadIdx.x;
+    const int warp_idx = tid / 32;
 
-dV_cuda_k vs torch_ref:
-  max_abs  = 7.629395e-06
-  mean_abs = 2.536617e-07
-  max_rel  = 3.649607e-04
+    if (warp_idx == 0 && elect_one_sync()) {
+        smem.bar_c_ready.init(1);
+        fence_barrier_init();
+    }
+    __syncthreads();
+    cluster_sync();
 
-dV_cuda_mn vs torch_ref:
-  max_abs  = 1.949768e+01
-  mean_abs = 2.460753e+00
-  max_rel  = 2.486578e+03
+    Tensor sS = make_tensor(make_smem_ptr(smem.s.data()), SmemLayoutS{});
+    Tensor sdO_k = make_tensor(make_smem_ptr(smem.dO_k.data()), SmemLayoutDO_K{});
+    Tensor sdO_mn = make_tensor(make_smem_ptr(smem.dO_mn.data()), SmemLayoutDO_MN{});
 
-dV_cuda_k vs dV_cuda_mn:
-  max_abs  = 1.949768e+01
-  mean_abs = 2.460753e+00
+    // Load s (transpose [128,64] -> [64,128])
+    constexpr int S_ELEMENTS = M * K_DIM;
+    constexpr int S_ELEMENTS_PER_THREAD = (S_ELEMENTS + NUM_THREADS - 1) / NUM_THREADS;
+    for (int i = 0; i < S_ELEMENTS_PER_THREAD; ++i) {
+        int linear_idx = tid * S_ELEMENTS_PER_THREAD + i;
+        if (linear_idx < S_ELEMENTS) {
+            int row_m = linear_idx / K_DIM;
+            int col_k = linear_idx % K_DIM;
+            sS(row_m, col_k) = s_bf16[col_k * M + row_m];
+        }
+    }
 
-Result: FAIL
+    // Load dO into two layouts (transpose [128,256] -> [256,128])
+    constexpr int DO_ELEMENTS = N * K_DIM;
+    constexpr int DO_ELEMENTS_PER_THREAD = (DO_ELEMENTS + NUM_THREADS - 1) / NUM_THREADS;
+    for (int i = 0; i < DO_ELEMENTS_PER_THREAD; ++i) {
+        int linear_idx = tid * DO_ELEMENTS_PER_THREAD + i;
+        if (linear_idx < DO_ELEMENTS) {
+            int row_n = linear_idx / K_DIM;
+            int col_k = linear_idx % K_DIM;
+            bf16 val = dO[col_k * N + row_n];
+            sdO_k(row_n, col_k) = val;
+            sdO_mn(row_n, col_k) = val;
+        }
+    }
+
+    __syncthreads();
+    cluster_sync();
+
+    if (warp_idx == 0) {
+        TMEM::Allocator2Sm().allocate(512, smem.tmem_start_addr.data());
+        TMEM::Allocator2Sm().release_allocation_lock();
+    }
+    __syncthreads();
+
+    if (cta_idx == 0) {
+        TiledMMA_dKV_K tiled_mma_k{};
+        Tensor tdV = partition_fragment_C(tiled_mma_k, Shape<Int<M>, Int<N>>{});
+        tdV.data().get() = tmem_cols::dV;
+
+        if (warp_idx == 0 && elect_one_sync()) {
+            ku::utcmma_ss(tiled_mma_k, sS, sdO_k, tdV, true);
+            ku::umma_arrive_noelect(smem.bar_c_ready);
+        }
+    } else {
+        TiledMMA_dKV_MN tiled_mma_mn{};
+        Tensor tdV = partition_fragment_C(tiled_mma_mn, Shape<Int<M>, Int<N>>{});
+        tdV.data().get() = tmem_cols::dV;
+
+        if (warp_idx == 0 && elect_one_sync()) {
+            ku::utcmma_ss(tiled_mma_mn, sS, sdO_mn, tdV, true);
+            ku::umma_arrive_noelect(smem.bar_c_ready);
+        }
+    }
+
+    smem.bar_c_ready.wait(0);
+    // if (cta_idx == 0) {
+    //     smem.bar_c_ready.wait(0);
+    // }
+
+    ku::tcgen05_after_thread_sync();
+    __syncthreads();
+
+    // Read TMEM output and write to global memory
+    constexpr int OUT_ROWS = M;
+    constexpr int OUT_COLS = N;
+    constexpr int FLOAT2_PER_ROW = OUT_COLS / 2 / 2;
+
+    int logical_row = tid % OUT_ROWS;
+    int col_half = tid / OUT_ROWS;  // 0 or 1
+
+    uint32_t tmem_base = smem.tmem_start_addr.data()[0];
+    uint32_t tmem_addr = tmem_base + (uint32_t(logical_row) << 16) + tmem_cols::dV;
+
+    float2 dV_row[FLOAT2_PER_ROW];
+    ku::tmem_ld_32dp32bNx<OUT_COLS / 2>(tmem_addr, dV_row);
+    cutlass::arch::fence_view_async_tmem_load();
+    ku::tcgen05_before_thread_sync();
+
+    float* dst = (cta_idx == 0) ? dV_cuda_k : dV_cuda_mn;
+    const int col_base = col_half * (OUT_COLS / 2);
+    for (int c = 0; c < FLOAT2_PER_ROW; ++c) {
+        dst[logical_row * OUT_COLS + col_base + c * 2] = dV_row[c].x;
+        dst[logical_row * OUT_COLS + col_base + c * 2 + 1] = dV_row[c].y;
+    }
+
+    __syncthreads();
+    cluster_sync();
+
+    if (warp_idx == 0 && elect_one_sync()) {
+        TMEM::Allocator2Sm().free(smem.tmem_start_addr.data()[0], 512);
+    }
+#endif
+}
+
+void launch_test_k_mn_major(
+    const bf16* s_bf16,
+    const bf16* dO,
+    float* dV_cuda_k,
+    float* dV_cuda_mn,
+    cudaStream_t stream
+) {
+    dim3 grid(2, 1, 1);
+    dim3 block(NUM_THREADS, 1, 1);
+
+    cudaError_t attr_err = cudaFuncSetAttribute(
+        test_k_mn_major_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        SMEM_SIZE
+    );
+    if (attr_err != cudaSuccess) {
+        fprintf(stderr, "cudaFuncSetAttribute failed: %s\n", cudaGetErrorString(attr_err));
+        return;
+    }
+
+    cudaLaunchConfig_t config;
+    memset(&config, 0, sizeof(config));
+    config.gridDim = grid;
+    config.blockDim = block;
+    config.dynamicSmemBytes = SMEM_SIZE;
+    config.stream = stream;
+
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeClusterDimension;
+    attrs[0].val.clusterDim.x = 2;
+    attrs[0].val.clusterDim.y = 1;
+    attrs[0].val.clusterDim.z = 1;
+    config.attrs = attrs;
+    config.numAttrs = 1;
+
+    cudaError_t err = cudaLaunchKernelEx(&config, test_k_mn_major_kernel, s_bf16, dO, dV_cuda_k, dV_cuda_mn);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "cudaLaunchKernelEx failed: %s\n", cudaGetErrorString(err));
+        return;
+    }
+}
+
+std::tuple<torch::Tensor, torch::Tensor> k_mn_major_forward(
+    torch::Tensor s_bf16,
+    torch::Tensor dO
+) {
+    TORCH_CHECK(s_bf16.is_cuda(), "s_bf16 must be a CUDA tensor");
+    TORCH_CHECK(dO.is_cuda(), "dO must be a CUDA tensor");
+    TORCH_CHECK(s_bf16.dtype() == torch::kBFloat16, "s_bf16 must be bfloat16");
+    TORCH_CHECK(dO.dtype() == torch::kBFloat16, "dO must be bfloat16");
+    TORCH_CHECK(s_bf16.dim() == 2 && s_bf16.size(0) == K_DIM && s_bf16.size(1) == M,
+                "s_bf16 shape must be [128, 64]");
+    TORCH_CHECK(dO.dim() == 2 && dO.size(0) == K_DIM && dO.size(1) == N,
+                "dO shape must be [128, 256]");
+    TORCH_CHECK(s_bf16.is_contiguous(), "s_bf16 must be contiguous");
+    TORCH_CHECK(dO.is_contiguous(), "dO must be contiguous");
+
+    auto options_f32 = torch::TensorOptions().dtype(torch::kFloat32).device(s_bf16.device());
+    torch::Tensor dV_cuda_k = torch::empty({M, N}, options_f32);
+    torch::Tensor dV_cuda_mn = torch::empty({M, N}, options_f32);
+
+    const bf16* s_ptr = reinterpret_cast<const bf16*>(s_bf16.data_ptr<at::BFloat16>());
+    const bf16* dO_ptr = reinterpret_cast<const bf16*>(dO.data_ptr<at::BFloat16>());
+    float* dV_k_ptr = dV_cuda_k.data_ptr<float>();
+    float* dV_mn_ptr = dV_cuda_mn.data_ptr<float>();
+
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+    launch_test_k_mn_major(s_ptr, dO_ptr, dV_k_ptr, dV_mn_ptr, stream);
+
+    cudaError_t err = cudaStreamSynchronize(stream);
+    TORCH_CHECK(err == cudaSuccess, "CUDA kernel failed: ", cudaGetErrorString(err));
+
+    return std::make_tuple(dV_cuda_k, dV_cuda_mn);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("k_mn_major", &k_mn_major_forward, "Compare K-major and MN-major dKV MMA (CUDA)");
+}
