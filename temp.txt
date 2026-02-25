@@ -1,5 +1,4 @@
-    def calc_diff(a, b):
-        abs_diff = torch.abs(a - b)
-        max_diff = abs_diff.max().item()
-        rel_diff = (abs_diff / (1e-4 + torch.abs(a))).mean().item()
-        return max_diff, rel_diff
+root@tjzj-inf-sci-k8s-bzz2-0205:/home/users/chenquanlin/workspace/operator/FlashMLA# python /home/users/chenquanlin/workspace/operator/FlashMLA/tests/test_flash_mla_sparse_bwd.py
+s_q=4096, s_kv=8192, topk_length=False
+  dQ  max_diff=2.343750e-02, rel_diff=5.004883e-03
+  dKV max_diff=4.609375e-01, rel_diff=1.582031e-01
