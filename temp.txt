@@ -1,4 +1,11 @@
-root@tjzj-inf-sci-k8s-bzz2-0205:/home/users/chenquanlin/workspace/operator/FlashMLA# python /home/users/chenquanlin/workspace/operator/FlashMLA/tests/test_flash_mla_sparse_bwd.py
-s_q=4096, s_kv=8192, topk_length=False
-  dQ  max_diff=2.343750e-02, rel_diff=5.004883e-03
-  dKV max_diff=4.609375e-01, rel_diff=1.582031e-01
+Random normal:
+  dQ       max_diff=1.600000e+01, rel_diff=3.623962e-05
+  dKV      max_diff=2.173145e+01, rel_diff=2.500427e-04
+  dQ_flash [0:256]   max_diff=1.600000e+01, rel_diff=3.695488e-05
+  dKV_flash[0:256]   max_diff=1.564795e+01, rel_diff=8.046182e-04
+  dQ_flash [256:512] max_diff=1.600000e+01, rel_diff=3.790855e-05
+  dKV_flash[256:512] max_diff=1.643332e+03, rel_diff=5.359057e-01
+  dQ_flash [512:576] max_diff=8.000000e+00, rel_diff=4.601479e-05
+  dKV_flash[512:576] max_diff=1.527686e+01, rel_diff=7.896448e-04
+  dQ_flash [full]    max_diff=1.600000e+01, rel_diff=3.838539e-05
+  dKV_flash[full]    max_diff=1.643332e+03, rel_diff=2.386256e-01
