@@ -1,11 +1,112 @@
-Random normal:
-  dQ       max_diff=1.600000e+01, rel_diff=2.360344e-05
-  dKV      max_diff=9.117645e+00, rel_diff=4.817973e-05
-  dQ_flash [0:256]   max_diff=2.000000e+00, rel_diff=2.360344e-05
-  dKV_flash[0:256]   max_diff=2.208000e+03, rel_diff=2.304000e+05
-  dQ_flash [256:512] max_diff=2.000000e+00, rel_diff=2.551079e-05
-  dKV_flash[256:512] max_diff=4.000000e+00, rel_diff=3.218651e-05
-  dQ_flash [512:576] max_diff=2.000000e+00, rel_diff=2.682209e-05
-  dKV_flash[512:576] max_diff=4.000000e+00, rel_diff=1.323223e-05
-  dQ_flash [full]    max_diff=2.000000e+00, rel_diff=2.479553e-05
-  dKV_flash[full]    max_diff=2.208000e+03, rel_diff=1.024000e+05
+Using pip 25.1.1 from /usr/local/lib/python3.12/dist-packages/pip (python 3.12)
+Looking in indexes: http://mirrors.baidubce.com/pypi/simple/
+Processing /home/users/chenquanlin/workspace/operator/FlashMLA
+  Preparing metadata (setup.py): started
+  Running command python setup.py egg_info
+  Compiling using NVCC 12.9
+  running egg_info
+  creating /tmp/pip-pip-egg-info-6w_f8esu/flash_mla.egg-info
+  writing /tmp/pip-pip-egg-info-6w_f8esu/flash_mla.egg-info/PKG-INFO
+  writing dependency_links to /tmp/pip-pip-egg-info-6w_f8esu/flash_mla.egg-info/dependency_links.txt
+  writing top-level names to /tmp/pip-pip-egg-info-6w_f8esu/flash_mla.egg-info/top_level.txt
+  writing manifest file '/tmp/pip-pip-egg-info-6w_f8esu/flash_mla.egg-info/SOURCES.txt'
+  reading manifest file '/tmp/pip-pip-egg-info-6w_f8esu/flash_mla.egg-info/SOURCES.txt'
+  adding license file 'LICENSE'
+  writing manifest file '/tmp/pip-pip-egg-info-6w_f8esu/flash_mla.egg-info/SOURCES.txt'
+  Preparing metadata (setup.py): finished with status 'done'
+Building wheels for collected packages: flash_mla
+  DEPRECATION: Building 'flash_mla' using the legacy setup.py bdist_wheel mechanism, which will be removed in a future version. pip 25.3 will enforce this behaviour change. A possible replacement is to use the standardized build interface by setting the `--use-pep517` option, (possibly combined with `--no-build-isolation`), or adding a `pyproject.toml` file to the source tree of 'flash_mla'. Discussion can be found at https://github.com/pypa/pip/issues/6334
+  Building wheel for flash_mla (setup.py): started
+  Running command python setup.py bdist_wheel
+  Compiling using NVCC 12.9
+  running bdist_wheel
+  running build
+  running build_py
+  copying flash_mla/__init__.py -> build/lib.linux-x86_64-cpython-312/flash_mla
+  copying flash_mla/flash_mla_interface.py -> build/lib.linux-x86_64-cpython-312/flash_mla
+  running build_ext
+  building 'flash_mla.cuda' extension
+  Emitting ninja build file /home/users/chenquanlin/workspace/operator/FlashMLA/build/temp.linux-x86_64-cpython-312/build.ninja...
+  Compiling objects...
+  Allowing ninja to set a default number of workers... (overridable by setting the environment variable MAX_JOBS=N)
+  [1/1] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output /home/users/chenquanlin/workspace/operator/FlashMLA/build/temp.linux-x86_64-cpython-312/csrc/sm100/prefill/sparse/bwd/head128/instantiations/phase1_k576.o.d -I/home/users/chenquanlin/workspace/operator/FlashMLA/csrc -I/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/kerutils/include -I/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/sm90 -I/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/cutlass/include -I/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/cutlass/tools/util/include -I/usr/local/lib/python3.12/dist-packages/torch/include -I/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/cuda/include -I/usr/include/python3.12 -c -c /home/users/chenquanlin/workspace/operator/FlashMLA/csrc/sm100/prefill/sparse/bwd/head128/instantiations/phase1_k576.cu -o /home/users/chenquanlin/workspace/operator/FlashMLA/build/temp.linux-x86_64-cpython-312/csrc/sm100/prefill/sparse/bwd/head128/instantiations/phase1_k576.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++20 -DNDEBUG -D_USE_MATH_DEFINES -Wno-deprecated-declarations -U__CUDA_NO_HALF_OPERATORS__ -U__CUDA_NO_HALF_CONVERSIONS__ -U__CUDA_NO_HALF2_OPERATORS__ -U__CUDA_NO_BFLOAT16_CONVERSIONS__ --expt-relaxed-constexpr --expt-extended-lambda --use_fast_math --ptxas-options=-v,--register-usage-level=10,--warn-on-spills,--warn-on-local-memory-usage,--warn-on-double-precision-use -lineinfo --source-in-ptx -gencode arch=compute_100f,code=sm_100f -gencode arch=compute_90a,code=sm_90a --threads 32 -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1016"' -DTORCH_EXTENSION_NAME=cuda
+  ptxas info    : 43 bytes gmem
+  ptxas info    : Compiling entry function '_ZN5sm1003bwd7head12823preprocess_delta_kernelILi576EEEv19SparseAttnBwdParams' for 'sm_90a'
+  ptxas info    : Function properties for _ZN5sm1003bwd7head12823preprocess_delta_kernelILi576EEEv19SparseAttnBwdParams
+      0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+  ptxas info    : Used 24 registers, used 0 barriers
+  ptxas info    : Compile time = 2.604 ms
+  ptxas info    : Compiling entry function '_ZN5sm1003bwd7head12819test_mla_bwd_kernelINS1_9TmaParamsIN4cute5tupleIJiiiEEENS4_9TiledCopyINS4_9Copy_AtomIJNS4_11Copy_TraitsINS4_26SM100_TMA_2SM_LOAD_NOSPLITEJNS4_1CILi65536EEENS4_12AuxTmaParamsINS5_IJNS4_11ScaledBasisINSB_ILi1EEEJLi1EEEENSE_ISF_JLi0EEEENSE_ISF_JLi2EEEEEEERKNS4_6LayoutINS5_IJNSB_ILi64EEESL_SF_EEESJ_EERKNS4_7SwizzleILi3ELi4ELi3EEEEEEEEN7cutlass10bfloat16_tEEEENSK_INS5_IJSF_NS5_IJNS5_IJNS5_IJSL_SL_EEENSB_ILi8EEEEEEEEEEEENS5_IJNSB_ILi0EEENS5_IJNS5_IJNS5_IJSL_SF_EEENSB_ILi4096EEEEEEEEEEEEEENS5_IJSL_NSB_ILi512EEEEEEEES6_NS7_ISY_NSK_INS5_IJSF_NS5_IJNS5_IJSZ_SF_EEEEEEEEENS5_IJS14_NS5_IJNS5_IJS15_S14_EEEEEEEEEEESZ_EENS5_IJiiEEENS7_INS8_IJNS9_ISA_JNSB_ILi32768EEENSD_INS5_IJSG_SH_EEERKNSK_INS5_IJSL_NSB_ILi32EEEEEES1O_EEST_EEEEESX_EEENSK_INS5_IJSF_NS5_IJNS5_IJS1Q_NSB_ILi9EEEEEEEEEEEENS5_IJS14_NS5_IJNS5_IJNS5_IJS1P_SF_EEENSB_ILi2048EEEEEEEEEEEEEENS5_IJS1P_NSB_ILi576EEEEEEEES6_S1D_S6_NS7_INS8_IJNS9_INS4_14SM90_TMA_STOREEJSC_SU_EEESX_EEENSK_INS5_IJSF_NS5_IJNS5_IJSZ_S1X_EEEEEEEEES19_EENS5_IJSL_S27_EEEEEEEEEv19SparseAttnBwdParamsT_' for 'sm_90a'
+  ptxas info    : Function properties for _ZN5sm1003bwd7head12819test_mla_bwd_kernelINS1_9TmaParamsIN4cute5tupleIJiiiEEENS4_9TiledCopyINS4_9Copy_AtomIJNS4_11Copy_TraitsINS4_26SM100_TMA_2SM_LOAD_NOSPLITEJNS4_1CILi65536EEENS4_12AuxTmaParamsINS5_IJNS4_11ScaledBasisINSB_ILi1EEEJLi1EEEENSE_ISF_JLi0EEEENSE_ISF_JLi2EEEEEEERKNS4_6LayoutINS5_IJNSB_ILi64EEESL_SF_EEESJ_EERKNS4_7SwizzleILi3ELi4ELi3EEEEEEEEN7cutlass10bfloat16_tEEEENSK_INS5_IJSF_NS5_IJNS5_IJNS5_IJSL_SL_EEENSB_ILi8EEEEEEEEEEEENS5_IJNSB_ILi0EEENS5_IJNS5_IJNS5_IJSL_SF_EEENSB_ILi4096EEEEEEEEEEEEEENS5_IJSL_NSB_ILi512EEEEEEEES6_NS7_ISY_NSK_INS5_IJSF_NS5_IJNS5_IJSZ_SF_EEEEEEEEENS5_IJS14_NS5_IJNS5_IJS15_S14_EEEEEEEEEEESZ_EENS5_IJiiEEENS7_INS8_IJNS9_ISA_JNSB_ILi32768EEENSD_INS5_IJSG_SH_EEERKNSK_INS5_IJSL_NSB_ILi32EEEEEES1O_EEST_EEEEESX_EEENSK_INS5_IJSF_NS5_IJNS5_IJS1Q_NSB_ILi9EEEEEEEEEEEENS5_IJS14_NS5_IJNS5_IJNS5_IJS1P_SF_EEENSB_ILi2048EEEEEEEEEEEEEENS5_IJS1P_NSB_ILi576EEEEEEEES6_S1D_S6_NS7_INS8_IJNS9_INS4_14SM90_TMA_STOREEJSC_SU_EEESX_EEENSK_INS5_IJSF_NS5_IJNS5_IJSZ_S1X_EEEEEEEEES19_EENS5_IJSL_S27_EEEEEEEEEv19SparseAttnBwdParamsT_
+      0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+  ptxas info    : Used 4 registers, used 0 barriers
+  ptxas info    : Compile time = 0.570 ms
+  ptxas warning : Local memory used for function '_ZN5sm1003bwd7head12819test_mla_bwd_kernelINS1_9TmaParamsIN4cute5tupleIJiiiEEENS4_9TiledCopyINS4_9Copy_AtomIJNS4_11Copy_TraitsINS4_26SM100_TMA_2SM_LOAD_NOSPLITEJNS4_1CILi65536EEENS4_12AuxTmaParamsINS5_IJNS4_11ScaledBasisINSB_ILi1EEEJLi1EEEENSE_ISF_JLi0EEEENSE_ISF_JLi2EEEEEEERKNS4_6LayoutINS5_IJNSB_ILi64EEESL_SF_EEESJ_EERKNS4_7SwizzleILi3ELi4ELi3EEEEEEEEN7cutlass10bfloat16_tEEEENSK_INS5_IJSF_NS5_IJNS5_IJNS5_IJSL_SL_EEENSB_ILi8EEEEEEEEEEEENS5_IJNSB_ILi0EEENS5_IJNS5_IJNS5_IJSL_SF_EEENSB_ILi4096EEEEEEEEEEEEEENS5_IJSL_NSB_ILi512EEEEEEEES6_NS7_ISY_NSK_INS5_IJSF_NS5_IJNS5_IJSZ_SF_EEEEEEEEENS5_IJS14_NS5_IJNS5_IJS15_S14_EEEEEEEEEEESZ_EENS5_IJiiEEENS7_INS8_IJNS9_ISA_JNSB_ILi32768EEENSD_INS5_IJSG_SH_EEERKNSK_INS5_IJSL_NSB_ILi32EEEEEES1O_EEST_EEEEESX_EEENSK_INS5_IJSF_NS5_IJNS5_IJS1Q_NSB_ILi9EEEEEEEEEEEENS5_IJS14_NS5_IJNS5_IJNS5_IJS1P_SF_EEENSB_ILi2048EEEEEEEEEEEEEENS5_IJS1P_NSB_ILi576EEEEEEEES6_S1D_S6_NS7_INS8_IJNS9_INS4_14SM90_TMA_STOREEJSC_SU_EEESX_EEENSK_INS5_IJSF_NS5_IJNS5_IJSZ_S1X_EEEEEEEEES19_EENS5_IJSL_S27_EEEEEEEEEv19SparseAttnBwdParamsT_', size of stack frame: 72 bytes
+  ptxas warning : Registers are spilled to local memory in function '_ZN5sm1003bwd7head12819test_mla_bwd_kernelINS1_9TmaParamsIN4cute5tupleIJiiiEEENS4_9TiledCopyINS4_9Copy_AtomIJNS4_11Copy_TraitsINS4_26SM100_TMA_2SM_LOAD_NOSPLITEJNS4_1CILi65536EEENS4_12AuxTmaParamsINS5_IJNS4_11ScaledBasisINSB_ILi1EEEJLi1EEEENSE_ISF_JLi0EEEENSE_ISF_JLi2EEEEEEERKNS4_6LayoutINS5_IJNSB_ILi64EEESL_SF_EEESJ_EERKNS4_7SwizzleILi3ELi4ELi3EEEEEEEEN7cutlass10bfloat16_tEEEENSK_INS5_IJSF_NS5_IJNS5_IJNS5_IJSL_SL_EEENSB_ILi8EEEEEEEEEEEENS5_IJNSB_ILi0EEENS5_IJNS5_IJNS5_IJSL_SF_EEENSB_ILi4096EEEEEEEEEEEEEENS5_IJSL_NSB_ILi512EEEEEEEES6_NS7_ISY_NSK_INS5_IJSF_NS5_IJNS5_IJSZ_SF_EEEEEEEEENS5_IJS14_NS5_IJNS5_IJS15_S14_EEEEEEEEEEESZ_EENS5_IJiiEEENS7_INS8_IJNS9_ISA_JNSB_ILi32768EEENSD_INS5_IJSG_SH_EEERKNSK_INS5_IJSL_NSB_ILi32EEEEEES1O_EEST_EEEEESX_EEENSK_INS5_IJSF_NS5_IJNS5_IJS1Q_NSB_ILi9EEEEEEEEEEEENS5_IJS14_NS5_IJNS5_IJNS5_IJS1P_SF_EEENSB_ILi2048EEEEEEEEEEEEEENS5_IJS1P_NSB_ILi576EEEEEEEES6_S1D_S6_NS7_INS8_IJNS9_INS4_14SM90_TMA_STOREEJSC_SU_EEESX_EEENSK_INS5_IJSF_NS5_IJNS5_IJSZ_S1X_EEEEEEEEES19_EENS5_IJSL_S27_EEEEEEEEEv19SparseAttnBwdParamsT_', 64 bytes spill stores, 64 bytes spill loads
+  ptxas info    : 11 bytes gmem
+  ptxas info    : Compiling entry function '_ZN5sm1003bwd7head12823preprocess_delta_kernelILi576EEEv19SparseAttnBwdParams' for 'sm_100f'
+  ptxas info    : Function properties for _ZN5sm1003bwd7head12823preprocess_delta_kernelILi576EEEv19SparseAttnBwdParams
+      0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+  ptxas info    : Used 34 registers, used 0 barriers
+  ptxas info    : Compile time = 59.040 ms
+  ptxas info    : Compiling entry function '_ZN5sm1003bwd7head12819test_mla_bwd_kernelINS1_9TmaParamsIN4cute5tupleIJiiiEEENS4_9TiledCopyINS4_9Copy_AtomIJNS4_11Copy_TraitsINS4_26SM100_TMA_2SM_LOAD_NOSPLITEJNS4_1CILi65536EEENS4_12AuxTmaParamsINS5_IJNS4_11ScaledBasisINSB_ILi1EEEJLi1EEEENSE_ISF_JLi0EEEENSE_ISF_JLi2EEEEEEERKNS4_6LayoutINS5_IJNSB_ILi64EEESL_SF_EEESJ_EERKNS4_7SwizzleILi3ELi4ELi3EEEEEEEEN7cutlass10bfloat16_tEEEENSK_INS5_IJSF_NS5_IJNS5_IJNS5_IJSL_SL_EEENSB_ILi8EEEEEEEEEEEENS5_IJNSB_ILi0EEENS5_IJNS5_IJNS5_IJSL_SF_EEENSB_ILi4096EEEEEEEEEEEEEENS5_IJSL_NSB_ILi512EEEEEEEES6_NS7_ISY_NSK_INS5_IJSF_NS5_IJNS5_IJSZ_SF_EEEEEEEEENS5_IJS14_NS5_IJNS5_IJS15_S14_EEEEEEEEEEESZ_EENS5_IJiiEEENS7_INS8_IJNS9_ISA_JNSB_ILi32768EEENSD_INS5_IJSG_SH_EEERKNSK_INS5_IJSL_NSB_ILi32EEEEEES1O_EEST_EEEEESX_EEENSK_INS5_IJSF_NS5_IJNS5_IJS1Q_NSB_ILi9EEEEEEEEEEEENS5_IJS14_NS5_IJNS5_IJNS5_IJS1P_SF_EEENSB_ILi2048EEEEEEEEEEEEEENS5_IJS1P_NSB_ILi576EEEEEEEES6_S1D_S6_NS7_INS8_IJNS9_INS4_14SM90_TMA_STOREEJSC_SU_EEESX_EEENSK_INS5_IJSF_NS5_IJNS5_IJSZ_S1X_EEEEEEEEES19_EENS5_IJSL_S27_EEEEEEEEEv19SparseAttnBwdParamsT_' for 'sm_100f'
+  ptxas info    : Function properties for _ZN5sm1003bwd7head12819test_mla_bwd_kernelINS1_9TmaParamsIN4cute5tupleIJiiiEEENS4_9TiledCopyINS4_9Copy_AtomIJNS4_11Copy_TraitsINS4_26SM100_TMA_2SM_LOAD_NOSPLITEJNS4_1CILi65536EEENS4_12AuxTmaParamsINS5_IJNS4_11ScaledBasisINSB_ILi1EEEJLi1EEEENSE_ISF_JLi0EEEENSE_ISF_JLi2EEEEEEERKNS4_6LayoutINS5_IJNSB_ILi64EEESL_SF_EEESJ_EERKNS4_7SwizzleILi3ELi4ELi3EEEEEEEEN7cutlass10bfloat16_tEEEENSK_INS5_IJSF_NS5_IJNS5_IJNS5_IJSL_SL_EEENSB_ILi8EEEEEEEEEEEENS5_IJNSB_ILi0EEENS5_IJNS5_IJNS5_IJSL_SF_EEENSB_ILi4096EEEEEEEEEEEEEENS5_IJSL_NSB_ILi512EEEEEEEES6_NS7_ISY_NSK_INS5_IJSF_NS5_IJNS5_IJSZ_SF_EEEEEEEEENS5_IJS14_NS5_IJNS5_IJS15_S14_EEEEEEEEEEESZ_EENS5_IJiiEEENS7_INS8_IJNS9_ISA_JNSB_ILi32768EEENSD_INS5_IJSG_SH_EEERKNSK_INS5_IJSL_NSB_ILi32EEEEEES1O_EEST_EEEEESX_EEENSK_INS5_IJSF_NS5_IJNS5_IJS1Q_NSB_ILi9EEEEEEEEEEEENS5_IJS14_NS5_IJNS5_IJNS5_IJS1P_SF_EEENSB_ILi2048EEEEEEEEEEEEEENS5_IJS1P_NSB_ILi576EEEEEEEES6_S1D_S6_NS7_INS8_IJNS9_INS4_14SM90_TMA_STOREEJSC_SU_EEESX_EEENSK_INS5_IJSF_NS5_IJNS5_IJSZ_S1X_EEEEEEEEES19_EENS5_IJSL_S27_EEEEEEEEEv19SparseAttnBwdParamsT_
+      72 bytes stack frame, 64 bytes spill stores, 64 bytes spill loads
+  ptxas info    : Used 128 registers, used 9 barriers, 72 bytes cumulative stack size
+  ptxas info    : Compile time = 352.072 ms
+  x86_64-linux-gnu-g++ -fno-strict-overflow -Wsign-compare -DNDEBUG -g -O2 -Wall -shared -Wl,-O1 -Wl,-Bsymbolic-functions /home/users/chenquanlin/workspace/operator/FlashMLA/build/temp.linux-x86_64-cpython-312/csrc/api/api.o /home/users/chenquanlin/workspace/operator/FlashMLA/build/temp.linux-x86_64-cpython-312/csrc/sm100/decode/head64/instantiations/model1.o /home/users/chenquanlin/workspace/operator/FlashMLA/build/temp.linux-x86_64-cpython-312/csrc/sm100/decode/head64/instantiations/v32.o /home/users/chenquanlin/workspace/operator/FlashMLA/build/temp.linux-x86_64-cpython-312/csrc/sm100/prefill/dense/fmha_cutlass_bwd_sm100.o /home/users/chenquanlin/workspace/operator/FlashMLA/build/temp.linux-x86_64-cpython-312/csrc/sm100/prefill/dense/fmha_cutlass_fwd_sm100.o /home/users/chenquanlin/workspace/operator/FlashMLA/build/temp.linux-x86_64-cpython-312/csrc/sm100/prefill/sparse/bwd/head128/instantiations/phase1_k576.o /home/users/chenquanlin/workspace/operator/FlashMLA/build/temp.linux-x86_64-cpython-312/csrc/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k512.o /home/users/chenquanlin/workspace/operator/FlashMLA/build/temp.linux-x86_64-cpython-312/csrc/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k576.o /home/users/chenquanlin/workspace/operator/FlashMLA/build/temp.linux-x86_64-cpython-312/csrc/sm100/prefill/sparse/fwd/head64/instantiations/phase1_k512.o /home/users/chenquanlin/workspace/operator/FlashMLA/build/temp.linux-x86_64-cpython-312/csrc/sm100/prefill/sparse/fwd/head64/instantiations/phase1_k576.o /home/users/chenquanlin/workspace/operator/FlashMLA/build/temp.linux-x86_64-cpython-312/csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512.o /home/users/chenquanlin/workspace/operator/FlashMLA/build/temp.linux-x86_64-cpython-312/csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_prefill_k512.o /home/users/chenquanlin/workspace/operator/FlashMLA/build/temp.linux-x86_64-cpython-312/csrc/sm90/decode/dense/instantiations/bf16.o /home/users/chenquanlin/workspace/operator/FlashMLA/build/temp.linux-x86_64-cpython-312/csrc/sm90/decode/dense/instantiations/fp16.o /home/users/chenquanlin/workspace/operator/FlashMLA/build/temp.linux-x86_64-cpython-312/csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h128.o /home/users/chenquanlin/workspace/operator/FlashMLA/build/temp.linux-x86_64-cpython-312/csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h64.o /home/users/chenquanlin/workspace/operator/FlashMLA/build/temp.linux-x86_64-cpython-312/csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h128.o /home/users/chenquanlin/workspace/operator/FlashMLA/build/temp.linux-x86_64-cpython-312/csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h64.o /home/users/chenquanlin/workspace/operator/FlashMLA/build/temp.linux-x86_64-cpython-312/csrc/sm90/prefill/sparse/fwd.o /home/users/chenquanlin/workspace/operator/FlashMLA/build/temp.linux-x86_64-cpython-312/csrc/sm90/prefill/sparse/instantiations/phase1_k512.o /home/users/chenquanlin/workspace/operator/FlashMLA/build/temp.linux-x86_64-cpython-312/csrc/sm90/prefill/sparse/instantiations/phase1_k512_topklen.o /home/users/chenquanlin/workspace/operator/FlashMLA/build/temp.linux-x86_64-cpython-312/csrc/sm90/prefill/sparse/instantiations/phase1_k576.o /home/users/chenquanlin/workspace/operator/FlashMLA/build/temp.linux-x86_64-cpython-312/csrc/sm90/prefill/sparse/instantiations/phase1_k576_topklen.o /home/users/chenquanlin/workspace/operator/FlashMLA/build/temp.linux-x86_64-cpython-312/csrc/smxx/decode/combine/combine.o /home/users/chenquanlin/workspace/operator/FlashMLA/build/temp.linux-x86_64-cpython-312/csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.o -L/usr/local/lib/python3.12/dist-packages/torch/lib -L/usr/local/cuda/lib64 -L/usr/lib/x86_64-linux-gnu -lc10 -ltorch -ltorch_cpu -ltorch_python -lcudart -lc10_cuda -ltorch_cuda -o build/lib.linux-x86_64-cpython-312/flash_mla/cuda.cpython-312-x86_64-linux-gnu.so
+  /usr/local/lib/python3.12/dist-packages/setuptools/_distutils/cmd.py:90: SetuptoolsDeprecationWarning: setup.py install is deprecated.
+  !!
+
+          ********************************************************************************
+          Please avoid running ``setup.py`` directly.
+          Instead, use pypa/build, pypa/installer or other
+          standards-based tools.
+
+          See https://blog.ganssle.io/articles/2021/10/setup-py-deprecated.html for details.
+          ********************************************************************************
+
+  !!
+    self.initialize_options()
+  installing to build/bdist.linux-x86_64/wheel
+  running install
+  running install_lib
+  creating build/bdist.linux-x86_64/wheel
+  creating build/bdist.linux-x86_64/wheel/flash_mla
+  copying build/lib.linux-x86_64-cpython-312/flash_mla/cuda.cpython-312-x86_64-linux-gnu.so -> build/bdist.linux-x86_64/wheel/./flash_mla
+  copying build/lib.linux-x86_64-cpython-312/flash_mla/__init__.py -> build/bdist.linux-x86_64/wheel/./flash_mla
+  copying build/lib.linux-x86_64-cpython-312/flash_mla/flash_mla_interface.py -> build/bdist.linux-x86_64/wheel/./flash_mla
+  running install_egg_info
+  running egg_info
+  writing flash_mla.egg-info/PKG-INFO
+  writing dependency_links to flash_mla.egg-info/dependency_links.txt
+  writing top-level names to flash_mla.egg-info/top_level.txt
+  reading manifest file 'flash_mla.egg-info/SOURCES.txt'
+  adding license file 'LICENSE'
+  writing manifest file 'flash_mla.egg-info/SOURCES.txt'
+  Copying flash_mla.egg-info to build/bdist.linux-x86_64/wheel/./flash_mla-1.0.0+5e2fa64-py3.12.egg-info
+  running install_scripts
+  creating build/bdist.linux-x86_64/wheel/flash_mla-1.0.0+5e2fa64.dist-info/WHEEL
+  creating '/tmp/pip-wheel-zea53ss6/flash_mla-1.0.0+5e2fa64-cp312-cp312-linux_x86_64.whl' and adding 'build/bdist.linux-x86_64/wheel' to it
+  adding 'flash_mla/__init__.py'
+  adding 'flash_mla/cuda.cpython-312-x86_64-linux-gnu.so'
+  adding 'flash_mla/flash_mla_interface.py'
+  adding 'flash_mla-1.0.0+5e2fa64.dist-info/licenses/LICENSE'
+  adding 'flash_mla-1.0.0+5e2fa64.dist-info/METADATA'
+  adding 'flash_mla-1.0.0+5e2fa64.dist-info/WHEEL'
+  adding 'flash_mla-1.0.0+5e2fa64.dist-info/top_level.txt'
+  adding 'flash_mla-1.0.0+5e2fa64.dist-info/RECORD'
+  removing build/bdist.linux-x86_64/wheel
+  Building wheel for flash_mla (setup.py): finished with status 'done'
+  Created wheel for flash_mla: filename=flash_mla-1.0.0+5e2fa64-cp312-cp312-linux_x86_64.whl size=9159907 sha256=cb39b864104109f8f71377ff5032875a51044a6c4d27e641c84d870a959946c9
+  Stored in directory: /tmp/pip-ephem-wheel-cache-ys2f4_gh/wheels/0b/cc/56/a8f6d8e1244862b57e26686654d51c1ec87384e547643a9f0d
+Successfully built flash_mla
+Installing collected packages: flash_mla
+  Attempting uninstall: flash_mla
+    Found existing installation: flash_mla 1.0.0+5e2fa64
+    Uninstalling flash_mla-1.0.0+5e2fa64:
+      Removing file or directory /usr/local/lib/python3.12/dist-packages/flash_mla-1.0.0+5e2fa64.dist-info/
+      Removing file or directory /usr/local/lib/python3.12/dist-packages/flash_mla/
+      Successfully uninstalled flash_mla-1.0.0+5e2fa64
+Successfully installed flash_mla-1.0.0+5e2fa64
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
