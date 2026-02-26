@@ -1,780 +1,483 @@
-#pragma once
-#include "phase1.h"
+from typing import Optional, Tuple
+import dataclasses
 
-#include <math_constants.h>
-#include <cute/tensor.hpp>
-#include <cutlass/cluster_launch.hpp>
-#include <cutlass/arch/reg_reconfig.h>
-#include <cutlass/arch/arch.h>
-#include <cutlass/cuda_host_adapter.hpp>
+import torch
 
-#include "params.h"
-#include "utils.h"
-#include "sm100/helpers.h"
+import flash_mla.cuda as flash_mla_cuda
 
-#include "config.h"
+@dataclasses.dataclass
+class FlashMLASchedMeta:
+    """
+    A class that stores the tile scheduler metadata of FlashMLA
+    """
 
-namespace sm100::fwd::head128 {
+    @dataclasses.dataclass
+    class Config:
+        b: int
+        s_q: int
+        h_q: int
+        page_block_size: int
+        h_k: int
 
-using namespace cute;
+        causal: bool
+        is_fp8_kvcache: bool
+        topk: Optional[int]
 
-CUTE_DEVICE int32x8_t ldg_256_indices(void* src_ptr) {
-    int32x8_t val;
-    asm volatile("ld.global.nc.L1::evict_normal.L2::evict_normal.L2::256B.v8.s32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-        : "=r"(val.a0), "=r"(val.a1), "=r"(val.a2), "=r"(val.a3),
-          "=r"(val.a4), "=r"(val.a5), "=r"(val.a6), "=r"(val.a7)
-        : "l"(src_ptr)
-    );
-    return val;
-}
+        extra_page_block_size: Optional[int]
+        extra_topk: Optional[int]
 
-/*
-Pipeline Overview:
+    have_initialized: bool = False
 
-| Copy |    MMA    |   Scale & Exp   |
+    config: Optional[Config] = None
 
-K0
-V0
-        P0 = QK0^T
-K1                  S0 = exp(P0)
-                    scale(O) w.r.t P0
-        P1 = QK1^T
-K2                  S1 = exp(P1)
-        O += S0V0
-V1                  scale(O) w.r.t P1
-        P2 = QK2^T
-K3                  S2 = exp(P2)
-        O += S1V1
-V2                  scale(O) w.r.t P2
-        P3 = QK3^T
-K4                  S3 = exp(P3)
-        O += S2V2
-V3                  scale(O) w.r.t P3
-
-...
-
-        O += S(n-3)V(n-3)
-V(n-2)              scale(O) w.r.t P(n-2)
-        P(n-1) = QK(n-1)^T
-                   S(n-1) = exp(P(n-1))
-        O += S(n-2)V(n-2)
-V(n-1)             scale(O) w.r.t P(n-1)
-        O += S(n-1)V(n-1)
-*/
-
-template<int D_QK>
-template<typename TmaParams>
-__device__ void
-KernelTemplate<D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnFwdParams &params, const TmaParams &tma_params) {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000 && __CUDA_ARCH__ < 1200)) || (defined(__CLION_IDE__) || defined(__VSCODE_IDE__))
-    const int cta_idx = blockIdx.x % 2;
-    const int s_q_idx = blockIdx.x / 2;
-    const int max_kv_i = params.q_start_index_s + s_q_idx;
-    const int warp_idx = cutlass::canonical_warp_idx_sync();
-    const int lane_idx = threadIdx.x % 32;
-    const int topk_length = params.topk_length != nullptr ? __ldg(params.topk_length + s_q_idx) : params.topk;
-    const int num_k_blocks = max(cute::ceil_div(topk_length, (int)B_TOPK), 1);  // num_k_blocks always >= 1
-    const int warpgroup_idx = __shfl_sync(0xffffffff, threadIdx.x / 128, 0);
-    const int idx_in_warpgroup = threadIdx.x % 128;
-
-    // Prefetch TMA descriptors
-    if (threadIdx.x == 0) {
-        cute::prefetch_tma_descriptor(tma_params.tma_Q.get_tma_descriptor());
-        cute::prefetch_tma_descriptor(tma_params.tma_O.get_tma_descriptor());
-        cute::prefetch_tma_descriptor(&(tma_params.tensor_map_kv));
-        if (params.p_out != nullptr) {
-            cute::prefetch_tma_descriptor(tma_params.tma_P.get_tma_descriptor());
-        }
-    }
-
-    // Define shared tensors
-    extern __shared__ char wksp_buf[];
-    SharedMemoryPlan &plan = *reinterpret_cast<SharedMemoryPlan*>(wksp_buf);
-    Tensor sQ_full = make_tensor(make_smem_ptr(plan.u.q_full.data()), SmemLayoutQTiles<D_Q/64>{});
-
-    int* gIndices = params.indices + s_q_idx*params.stride_indices_s_q; // [topk]
-
-    // Allocate tmem tensors
-    TiledMMA tiled_mma_P_tQ = TiledMMA_P_tQ{};
-    TiledMMA tiled_mma_P_sQ = TiledMMA_P_sQ{};
-    TiledMMA tiled_mma_O = TiledMMA_O{};
-    Tensor tP = partition_fragment_C(tiled_mma_P_tQ, Shape<Int<B_H/2>, Int<B_TOPK>>{});
-    Tensor tQr = tiled_mma_P_tQ.get_slice(_0{}).make_fragment_A(
-        partition_shape_A(tiled_mma_P_tQ, Shape<Int<B_H/2>, Int<D_tQ>>{})
-    );
-    Tensor tO = partition_fragment_C(tiled_mma_O, Shape<Int<B_H/2>, Int<D_V>>{});
-    tP.data().get() = tmem_cols::p;
-    tQr.data().get() = tmem_cols::q;
-    tO.data().get() = tmem_cols::o;
-
-    if (warp_idx == 0) {
-        if (elect_one_sync()) {
-            // Initialize barriers
-            plan.bar_prologue_q.init(1);
-            plan.bar_prologue_utccp.init(1);
-            CUTE_UNROLL
-            for (int i = 0; i < NUM_BUFS; ++i) {
-                plan.bar_qk_part_done[i].init(1);
-                plan.bar_qk_done[i].init(1);
-                plan.bar_sv_part_done[i].init(1);
-                plan.bar_sv_done[i].init(1);
-                plan.bar_k_part0_ready[i].init(1);
-                plan.bar_k_part1_ready[i].init(1);
-                plan.bar_v_part0_ready[i].init(1);
-                plan.bar_v_part1_ready[i].init(1);
-                plan.bar_p_free[i].init(128*2);
-                plan.bar_so_ready[i].init(128*2);
-                plan.bar_k_valid_ready[i].init(16);
-                plan.bar_k_valid_free[i].init(128);
-            }
-            fence_barrier_init();
-        }
-    }
-
-    cute::cluster_sync();   // We must add a cluster_sync() here, or TMA from CTA1 may launch before barrier initialization in CTA0
-
-    if (warp_idx == 0) {
-        if (elect_one_sync()) {
-            // Copy Q
-            Tensor gQ = flat_divide(
-                tma_params.tma_Q.get_tma_tensor(tma_params.shape_Q)(_, _, s_q_idx),
-                Tile<Int<B_H/2>>{}
-            )(_, cta_idx, _);
-            ku::launch_tma_copy(tma_params.tma_Q, gQ, sQ_full, plan.bar_prologue_q, TMA::CacheHintSm90::EVICT_FIRST);
-        }
-
-        // Initialize TMEM
-        cute::TMEM::Allocator2Sm().allocate(512, plan.tmem_start_addr.data());
-        TRAP_ONLY_DEVICE_ASSERT(plan.tmem_start_addr.data()[0] == 0);
-        cute::TMEM::Allocator2Sm().release_allocation_lock();
-    }
-
-    __syncthreads();    // Wait for TMEM allocation
-
-    if (warpgroup_idx == 0) {
-        cutlass::arch::warpgroup_reg_alloc<144>();
-        // Scale & Exp warps
-
-        // The following three numbers are 
-        // - mi: max_logits used to scale Pi (i.e. O := exp2(Pi*scale - mi) @ V)
-        // - li: sumexp, i.e. li := sum(exp(Pi*scale - mi))
-        // - real_mi: real max logits, i.e. real_mi := max(Pi*scale)
-        // where Pi is the i-th row of P, P := QK^T
-        // mi and real_mi are always consistent within the two threads that
-        // controls one row (i.e. thread 0+64, 1+65, 2+66, ...) after every update
-        float mi = MAX_INIT_VAL;
-        float li = 0.0f;
-        float real_mi = -CUDART_INF_F;
-
-        const float2 scale = float2 {params.sm_scale_div_log2, params.sm_scale_div_log2};
-        uint128_t* sS_base = (uint128_t*)plan.s.data() + idx_in_warpgroup%64 + 64*((idx_in_warpgroup/64)*8);
-        float* sP_base = plan.p + idx_in_warpgroup%64*4 + (idx_in_warpgroup/64)*((B_H/2)*(B_TOPK/2));
-
-        CUTE_NO_UNROLL
-        for (int k = 0; k < num_k_blocks; ++k) {
-            // Wait for P
-            plan.bar_qk_done[k%NUM_BUFS].wait((k/NUM_BUFS)&1);
-            ku::tcgen05_after_thread_sync();
-
-            // Load P
-            float2 p[(B_TOPK/2)/2];
-            ku::tmem_ld_32dp32bNx<B_TOPK/2>(tmem_cols::p, p);
-            cutlass::arch::fence_view_async_tmem_load();
-            ku::tcgen05_before_thread_sync();
-            plan.bar_p_free[k%NUM_BUFS].arrive(0u);
-
-            // Mask
-            plan.bar_k_valid_ready[k%NUM_BUFS].wait((k/NUM_BUFS)&1);
-            // The following code enables NVCC to use R2P instruction
-            // Although we perform 2x LDS.32 instructions here, don't worry, NVCC will
-            // convert them to one LDS.64 instruction. However, if we write LDS.64
-            // here, NVCC won't use R2P.
-            uint32_t is_k_valid_lo = *(uint32_t*)(plan.is_k_valid[k%NUM_BUFS] + (idx_in_warpgroup>=64?B_TOPK/8/2:0));
-            uint32_t is_k_valid_hi = *(uint32_t*)(plan.is_k_valid[k%NUM_BUFS] + (idx_in_warpgroup>=64?B_TOPK/8/2:0) + 4);
-            float* p_float = (float*)p;
-            CUTE_UNROLL
-            for (int i = 0; i < (B_TOPK/2)/2; i += 1) {
-                if (!(is_k_valid_lo >> i & 1))
-                    p_float[i] = -CUDART_INF_F;
-            }
-            CUTE_UNROLL
-            for (int i = 0; i < (B_TOPK/2)/2; i += 1) {
-                if (!(is_k_valid_hi >> i & 1))
-                    p_float[i+(B_TOPK/2)/2] = -CUDART_INF_F;
-            }
-
-            // Output P matrix (after mask) via shared memory + TMA
-            if (params.p_out != nullptr) {
-                if (k > 0) {
-                    if (warp_idx == 0 && elect_one_sync()) {
-                        cute::tma_store_wait<0>();
-                    }
-                    NamedBarrier::arrive_and_wait(128, 1);
-                }
-
-                int smem_h = idx_in_warpgroup % 64;  // head index in shared memory
-                int smem_t_base = (idx_in_warpgroup < 64) ? 0 : 64;  // topk offset
-                float* sP_row = plan.p + smem_h * B_TOPK + smem_t_base;
-
-                CUTE_UNROLL
-                for (int i = 0; i < (B_TOPK/2); i += 4) {
-                    cutlass::Array<float, 4> p_vec;
-                    CUTE_UNROLL
-                    for (int j = 0; j < 4; ++j) {
-                        p_vec[j] = p_float[i + j];
-                    }
-                    // 128-bit store to shared memory
-                    *reinterpret_cast<cutlass::Array<float, 4>*>(sP_row + i) = p_vec;
-                }
-
-                fence_view_async_shared();
-                NamedBarrier::arrive_and_wait(128, 1);
-
-                if (warp_idx == 0 && elect_one_sync()) {
-                    Tensor sP = make_tensor(make_smem_ptr(plan.p), SmemLayoutP{});
-                    Tensor tma_gP = flat_divide(
-                        tma_params.tma_P.get_tma_tensor(tma_params.shape_P)(_, _, s_q_idx),
-                        Shape<Int<B_H/2>, Int<B_TOPK>>{}
-                    )(_, _, cta_idx, _);
-                    Tensor sP_divided = flat_divide(
-                        sP,
-                        Shape<Int<B_H/2>, Int<B_TOPK>>{}
-                    )(_, _, _0{}, _);
-                    auto thr_tma_P = tma_params.tma_P.get_slice(_0{});
-
-                    cute::copy(
-                        tma_params.tma_P,
-                        thr_tma_P.partition_S(sP_divided(_, _, k)),
-                        thr_tma_P.partition_D(tma_gP(_, _, k))
-                    );
-                    cute::tma_store_arrive();
-                }
-            }
-
-            // Get rowwise max of Pi
-            float cur_pi_max = -CUDART_INF_F;
-            CUTE_UNROLL
-            for (int i = 0; i < (B_TOPK/2); i += 1) {
-                cur_pi_max = max(cur_pi_max, p_float[i]);
-            }
-            cur_pi_max *= params.sm_scale_div_log2;
-
-            plan.bar_k_valid_free[k%NUM_BUFS].arrive();
-
-            NamedBarrier::arrive_and_wait(128, 0);  // Wait for rowwise_max_buf and sP to be ready
-            plan.rowwise_max_buf[idx_in_warpgroup] = cur_pi_max;
-            NamedBarrier::arrive_and_wait(128, 0);  // TODO Name these barriers
-            cur_pi_max = max(cur_pi_max, plan.rowwise_max_buf[idx_in_warpgroup^64]);
-            real_mi = max(real_mi, cur_pi_max);
-            bool should_scale_o = __any_sync(0xffffffff, cur_pi_max - mi > 6.0f);
-            // By this point:
-            // - cur_pi_max, real_mi, and mi is identical within each row (i.e. thread 0+64, 1+65, ...)
-            // - should_scale_o is identical among threads 0~31+64~95; and is identical among threads 32~63+96~127
+    tile_scheduler_metadata: Optional[torch.Tensor] = None   # (num_sm_parts, TileSchedulerMetaDataSize), dtype torch.int32.
+    num_splits: Optional[torch.Tensor] = None                # (1), dtype torch.int32.
 
 
-            // Calc scale factor, and scale li
-            float new_max, scale_for_old;
-            if (!should_scale_o) {
-                // Don't scale O
-                scale_for_old = 1.0f;
-                new_max = mi;
-            } else {
-                new_max = max(cur_pi_max, mi);
-                scale_for_old = exp2f(mi - new_max);
-            }
-            mi = new_max;   // mi is still identical within each row
-            li *= scale_for_old;
+def get_mla_metadata(
+    *args,
+    **kwargs
+) -> Tuple[FlashMLASchedMeta, None]:
+    """
+    Returns an empty instance of FlashMLASchedMeta. The actual scheduling metadata will be generated during the first invocation of flash_mla_with_kvcache.
 
-            // Calculate S
-            __nv_bfloat162 s[(B_TOPK/2)/2];
-            float2 neg_new_max = float2 {-new_max, -new_max};
-            CUTE_UNROLL
-            for (int i = 0; i < (B_TOPK/2)/2; i += 1) {
-                float2 d = ku::float2_fma(p[i], scale, neg_new_max);
-                d.x = exp2f(d.x);
-                d.y = exp2f(d.y);
-                li += d.x + d.y;    // NOTE: Theoretically we could use FFMA2 here but actually this is faster...
-                s[i] = __float22bfloat162_rn(d);
-            }
+    Arguments:
+        This function does not need any arguments, but we keep *args and **kwargs to be compatible with the old interface.
 
-            // Wait for last SV gemm, write S
-            if (k > 0) {
-                plan.bar_sv_done[(k-1)%NUM_BUFS].wait(((k-1)/NUM_BUFS)&1);
-            }
-            CUTE_UNROLL
-            for (int i = 0; i < B_TOPK/2/8; i += 1) {
-                sS_base[64*i] = *(uint128_t*)(s + i*4);
-            }
+    Return:
+        A tuple. Due to historical reasons, we return a tuple of (FlashMLASchedMeta, None) now. Only the first element is useful.
+    """
+    return FlashMLASchedMeta(), None
 
-            // Scale O
-            if (k > 0 && should_scale_o) {
-                float2 scale_for_old_float2 = float2 {scale_for_old, scale_for_old}; 
-                // plan.bar_sv_done[(k-1)%NUM_BUFS].wait(((k-1)/NUM_BUFS)&1);   // NOTE: We have waited for last SV gemm before
-                ku::tcgen05_after_thread_sync();
 
-                static constexpr int CHUNK_SIZE = 32;
-                float2 o[CHUNK_SIZE/2];
-                CUTE_UNROLL
-                for (int chunk_idx = 0; chunk_idx < (D_V/2)/CHUNK_SIZE; ++chunk_idx) {
-                    // Load O
-                    ku::tmem_ld_32dp32bNx<CHUNK_SIZE>(tmem_cols::o + chunk_idx*CHUNK_SIZE, o);
-                    cutlass::arch::fence_view_async_tmem_load();
+def flash_mla_with_kvcache(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    block_table: Optional[torch.Tensor],
+    cache_seqlens: Optional[torch.Tensor],
+    head_dim_v: int,
+    tile_scheduler_metadata: FlashMLASchedMeta,
+    num_splits: None = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    is_fp8_kvcache: bool = False,
+    indices: Optional[torch.Tensor] = None,
+    attn_sink: Optional[torch.Tensor] = None,
+    extra_k_cache: Optional[torch.Tensor] = None,
+    extra_indices_in_kvcache: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+    extra_topk_length: Optional[torch.Tensor] = None
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Arguments:
+        q: (batch_size, seq_len_q, num_heads_q, head_dim).
+        k_cache: (num_blocks, page_block_size, num_heads_k, head_dim).
+                Different modes (including fp8/bf16, sparsity, and model version (i.e. V3.2 or MODEL1)) has different KV cache layouts. See comments below for details.
+                The KV cache must be contiguously valid for sparse attention on sm100. Here "contiguously valid" means that every byte, from the very beginning of the KV cache, till the last byte in the KV cache, is valid memory address to visit (i.e. won't IMA). In other words, the KV cache could be a slice of a larger array, but cannot be a list of disjoint memory blocks.
+                Besides, some kernels also have their own requirements on the layout of k cache, including:
+                    - For sparse fp8 decoding kernel on F3, k_cache.stride(0) must be a multiple of 656B (for V32) or 576B (for MODEL1). Padding is needed sometimes.
+        block_table: (batch_size, max_num_blocks_per_seq), torch.int32. Can be None when sparse attention is used.
+        cache_seqlens: (batch_size), torch.int32. Can be None when sparse attention is used.
+        head_dim_v: Head_dim of v. Must be 512
+        sched_meta: FlashMLASchedMeta, return by get_mla_metadata. You may reuse the same sched_meta across different invocations, but only when the tensor shapes and the values of cache_seqlens, topk_length, and extra_topk_length remain the same.
+        num_splits_placeholder: must be "None" (to be compatible with the old interface).
+        softmax_scale: float. The scaling of QK^T before applying softmax. Default to 1 / sqrt(head_dim_k).
+        causal: bool. Whether to apply causal attention mask. Only valid for dense attention
+        is_fp8_kvcache: bool.
+        indices: (batch_size, seq_len_q, topk). KV indices when sparse attention is enabled.
+                    Pay attention that indices_in_kvcache[i][j][k] = (the index of the page block where token t resides) * block_size + (the offset of token t among the page block),
+                    where t is the k-th token of the j-th q-sequence in the i-th batch.
+        attn_sink: Optional[torch.Tensor], (num_heads_q, ), torch.float32. If presented, the final output will be scaled by exp(lse) / (exp(lse) + exp(attn_sink)). Have no affect on the returned softmax_lse. +inf will cause the result to become 0.
+        extra_k_cache and extra_indices_in_kvcache: If provided, will attend to these extra tokens in addition to those in k_cache and indices_in_kvcache. This is used to support MODEL1. Their format requirements are the same as k_cache and indices_in_kvcache respectively.
+        topk_length/extra_topk_length: (batch_size, ), torch.int32. If provided, only the leftmost topk_length indices will be processed. Useful when the actual topk for different queries are different so that we can save some computation, compared to masking.
+    
+    For DeepSeek V3, DeepSeek V3.1, and DeepSeek V3.2:
+        head_dim should be 576 while head_dim_v should be 512.
+        In FP8+sparse mode, each token's KV cache is 656 Bytes, structured as:
+            - The shape of the tensor `k_cache` is (num_blocks, page_block_size, num_heads_k, head_dim), and num_heads_k must be 1.
+            - First 512 bytes: The "quantized NoPE" part, containing 512 float8_e4m3 values.
+            - Next 16 bytes: Scale factors, containing 4 float32 values. The first float32 is the scale for the first 128 float8_e4m3 values, the second for the next 128, and so on.
+            - Last 128 bytes: The "RoPE" part, containing 64 bfloat16 values. This part is not quantized for accuracy.
 
-                    // Mult
-                    for (int i = 0; i < CHUNK_SIZE/2; ++i) {
-                        o[i] = ku::float2_mul(o[i], scale_for_old_float2);
-                    }
+    For DeepSeek MODEL1:
+        head_dim should be 512 while head_dim_v is also 512.
 
-                    // Store O
-                    ku::tmem_st_32dp32bNx<CHUNK_SIZE>(tmem_cols::o + chunk_idx*CHUNK_SIZE, o);
-                    cutlass::arch::fence_view_async_tmem_store();
-                }
-                ku::tcgen05_before_thread_sync();
-            }
+        In FP8+sparse mode, every block can be divided into two parts. The first parts stores NoPE0, RoPE0, NoPE1, RoPE1, ... while the second part stores scale factors: 7xue8m0, 1Bpad, 7xue8m0, 1Bpad, ...
+
+    Return:
+        out: (batch_size, seq_len_q, num_heads_q, head_dim_v).
+        softmax_lse: (batch_size, num_heads_q, seq_len_q), torch.float32.
+    """
+    sched_meta = tile_scheduler_metadata
+    indices_in_kvcache = indices
+    assert isinstance(sched_meta, FlashMLASchedMeta), "tile_scheduler_metadata must be of type FlashMLASchedMeta"
+    assert num_splits is None, "num_splits must be None"
+
+    topk = indices_in_kvcache.shape[-1] if indices_in_kvcache is not None else None
+    extra_k_page_block_size = extra_k_cache.shape[1] if extra_k_cache is not None else None
+    extra_topk = extra_indices_in_kvcache.shape[-1] if extra_indices_in_kvcache is not None else None
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+
+    if not sched_meta.have_initialized:
+        # Sanity check. We only perform sanity check during the first invocation to save CPU time.
+        if indices_in_kvcache is not None:
+            assert not causal, "causal must be False when indices_in_kvcache is not None (i.e. sparse attention is enabled)"
             
-            fence_view_async_shared();
-            plan.bar_so_ready[k%NUM_BUFS].arrive(0u);
-        }
+        # Initialize the tile scheduler metadata during the first invocation.
+        sched_meta.have_initialized = True
+        sched_meta.config = FlashMLASchedMeta.Config(
+            q.shape[0],
+            q.shape[1],
+            q.shape[2],
+            k_cache.shape[1],
+            k_cache.shape[2],
 
-        if (params.p_out != nullptr) {
-            if (warp_idx == 0 && elect_one_sync()) {
-                cute::tma_store_wait<0>();
-            }
-            NamedBarrier::arrive_and_wait(128, 1);
-        }
+            causal,
+            is_fp8_kvcache,
+            topk,
 
-        // Epilogue
+            extra_k_page_block_size,
+            extra_topk,
+        )
+    else:
+        # Check whether the input arguments are consistent with sched_meta
+        helper_msg = " Your input arguments are inconsistent with sched_meta. Please make sure the input arguments are consistent across different invocations of flash_mla_with_kvcache on the same sched_meta."
+        assert sched_meta.config is not None
+        assert sched_meta.config.b == q.shape[0], "sched_meta.config.b must be equal to batch_size." + helper_msg
+        assert sched_meta.config.s_q == q.shape[1], "sched_meta.config.s_q must be equal to seq_len_q." + helper_msg
+        assert sched_meta.config.h_q == q.shape[2], "sched_meta.config.h_q must be equal to num_heads_q." + helper_msg
+        assert sched_meta.config.page_block_size == k_cache.shape[1], "sched_meta.config.page_block_size must be equal to page_block_size." + helper_msg
+        assert sched_meta.config.h_k == k_cache.shape[2], "sched_meta.config.h_k must be equal to num_heads_k." + helper_msg
+        assert sched_meta.config.causal == causal, "sched_meta.config.causal must be equal to causal." + helper_msg
+        assert sched_meta.config.is_fp8_kvcache == is_fp8_kvcache, "sched_meta.config.is_fp8_kvcache must be equal to is_fp8_kvcache." + helper_msg
+        assert sched_meta.config.topk == topk, "sched_meta.config.topk must be equal to the last dim of indices_in_kvcache." + helper_msg
+        assert sched_meta.config.extra_page_block_size == extra_k_page_block_size, "sched_meta.config.extra_page_block_size must be equal to the page_block_size of extra_k_cache." + helper_msg
+        assert sched_meta.config.extra_topk == extra_topk, "sched_meta.config.extra_topk must be equal to the last dim of extra_indices_in_kvcache." + helper_msg
 
-        if (real_mi == -CUDART_INF_F) {
-            // real_mi == -CUDART_INF_F <=> No valid TopK indices
-            // We set li to 0 to fit the definition that li := exp(x[i] - mi)
-            li = 0.0f;
-            mi = -CUDART_INF_F;
-        }
-        
-        // Exchange li
-        plan.rowwise_li_buf[idx_in_warpgroup] = li;
-        NamedBarrier::arrive_and_wait(128, 0);
-        li += plan.rowwise_li_buf[idx_in_warpgroup^64];
-
-        // Store mi and li
-        if (idx_in_warpgroup < 64) {
-            int global_index = s_q_idx*params.h_q + cta_idx*(B_H/2) + idx_in_warpgroup;
-            float cur_lse = logf(li) + mi*CUDART_LN2_F;
-            cur_lse = cur_lse == -CUDART_INF_F ? +CUDART_INF_F : cur_lse;
-            params.max_logits[global_index] = real_mi*CUDART_LN2_F;
-            params.lse[global_index] = cur_lse;
-        }
-
-        // Wait for the last GEMM
-        plan.bar_sv_done[(num_k_blocks-1)%NUM_BUFS].wait(((num_k_blocks-1)/NUM_BUFS)&1);
-        ku::tcgen05_after_thread_sync();
-
-        // Store O
-        float attn_sink = params.attn_sink == nullptr ? -CUDART_INF_F : __ldg(params.attn_sink + cta_idx*B_H/2 + (idx_in_warpgroup%64))*CUDART_L2E_F;
-        float output_scale = __fdividef(1.0f, li + exp2f(attn_sink - mi));
-        Tensor sO = make_tensor(make_smem_ptr(plan.u.o.data()), SmemLayoutO{});
-        constexpr int B_EPI = 64;
-        Tensor tma_gO = flat_divide(
-            tma_params.tma_O.get_tma_tensor(tma_params.shape_O)(_, _, s_q_idx),
-            Shape<Int<B_H/2>, Int<B_EPI>>{}
-        )(_, _, cta_idx, _);
-        Tensor sO_divided = flat_divide(
-            sO,
-            Shape<Int<B_H/2>, Int<B_EPI>>{}
-        )(_, _, _0{}, _);
-        auto thr_tma = tma_params.tma_O.get_slice(_0{});
-
-        float2 o[B_EPI/2];
-        bool have_valid_indices = __any_sync(0xffffffff, li != 0);  // Prevent some threads' li == 0 and some threads' li != 0 which lead to deadlock during ku::tmem_ld
-        if (!have_valid_indices) {
-            // If there are no valid indices, we set o[i] to 0 and don't load from TMEM
-            CUTE_UNROLL
-            for (int i = 0; i < B_EPI/2; ++i)
-                o[i].x = o[i].y = 0.0f;
-            output_scale = 1.0f;
-        }
-
-        float2 output_scale_float2 = make_float2(output_scale, output_scale);
-
-        CUTE_UNROLL
-        for (int k = 0; k < (D_V/2)/B_EPI; ++k) {
-            // Load O from tO
-            if (have_valid_indices) {
-                ku::tmem_ld_32dp32bNx<B_EPI>(tmem_cols::o + k*B_EPI, o);
-                cutlass::arch::fence_view_async_tmem_load();
-            }
-
-            // Convert and store
-            CUTE_UNROLL
-            for (int i = 0; i < B_EPI/8; ++i) {
-                __nv_bfloat162 o_bf16[4];
-                CUTE_UNROLL
-                for (int j = 0; j < 4; ++j) {
-                    float2 d = ku::float2_mul(o[i*4+j], output_scale_float2);
-                    o_bf16[j] = __float22bfloat162_rn(d);
-                }
-                int smem_row = idx_in_warpgroup % 64;
-                int smem_col = (idx_in_warpgroup/64)*(D_V/2) + k*B_EPI + i*8;
-                *(uint128_t*)(&sO(smem_row, smem_col)) = *(uint128_t*)(o_bf16);
-            }
-
-            // Sync
-            fence_view_async_shared();
-            NamedBarrier::arrive_and_wait(128, 0);
-            
-            if (warp_idx == 0 && elect_one_sync()) {
-                cute::copy(
-                    tma_params.tma_O,
-                    thr_tma.partition_S(sO_divided(_, _, k)),
-                    thr_tma.partition_D(tma_gO(_, _, k))
-                );
-            }
-            if (warp_idx == 1 && elect_one_sync()) {
-                int k2 = k + (D_V/B_EPI/2);
-                cute::copy(
-                    tma_params.tma_O,
-                    thr_tma.partition_S(sO_divided(_, _, k2)),
-                    thr_tma.partition_D(tma_gO(_, _, k2))
-                );
-            }
-        }
-
-        if (warp_idx == 0) {
-            cute::TMEM::Allocator2Sm().free(0, 512);
-        }
-    } else if (warpgroup_idx == 1) {
-        // Producer warp for K
-        cutlass::arch::warpgroup_reg_dealloc<96>();
-        int warp_idx = cutlass::canonical_warp_idx_sync() - 4;
-        constexpr int NUM_WARPS = 4, NUM_LOCAL_ROWS_PER_WARP = (B_TOPK/2)/4/NUM_WARPS;
-        if (elect_one_sync()) {
-            bf16* sK_base = plan.u.s.k.data() + warp_idx*4*64;
-
-            CUTE_NO_UNROLL
-            for (int k = 0; k < num_k_blocks; ++k) {
-                int4 indices[NUM_LOCAL_ROWS_PER_WARP];
-                int max_indices = -1, min_indices = params.s_kv;
-                CUTE_UNROLL
-                for (int local_row = 0; local_row < NUM_LOCAL_ROWS_PER_WARP; ++local_row) {
-                    indices[local_row] = __ldg((int4*)(gIndices + k*B_TOPK + cta_idx*(B_TOPK/2)) + local_row*NUM_WARPS + warp_idx);
-                    max_indices = max(max_indices, int4_max(indices[local_row]));
-                    min_indices = min(min_indices, int4_min(indices[local_row]));
-                }
-                bool is_all_rows_invalid = min_indices == params.s_kv || max_indices == -1;
-                bool should_skip_tma = is_all_rows_invalid && k >= NUM_BUFS;
-                    
-                auto load_part_ki = [&](transac_bar_t &bar, int local_col_start, int local_col_end) {
-                    CUTE_UNROLL
-                    for (int local_row = 0; local_row < NUM_LOCAL_ROWS_PER_WARP; ++local_row) {
-                        CUTE_UNROLL
-                        for (int local_col = local_col_start; local_col < local_col_end; ++local_col)
-                            ku::tma_gather4_cta_group_2<true>(
-                                &(tma_params.tensor_map_kv),
-                                bar,
-                                sK_base + local_row*(4*NUM_WARPS)*64 + local_col*((B_TOPK/2)*64),
-                                local_col*64,
-                                indices[local_row],
-                                (int64_t)TMA::CacheHintSm90::EVICT_LAST
-                            );
-                    }
-                };
-
-                int cur_buf = k%NUM_BUFS;
-                if (k > 0) {
-                    plan.bar_qk_part_done[(k-1)%NUM_BUFS].wait(((k-1)/NUM_BUFS)&1);
-                }
-                if (!should_skip_tma) {
-                    load_part_ki(plan.bar_k_part0_ready[cur_buf], 0, D_sQ/64);
-                } else {
-                    // NOTE: TMA has performance issues when all indices are the same (even if those indices are invalid), so we detect whether all indices in our block are invalid (by inspecting their MIN and MAX, for performance reasons), and skip the copy if all indices are invalid.
-                    // NOTE: We can also skip the initial zero-fill procedure (which prevents NaN from appearing in K/V buf if the first TMA copy is skipped) by disabling skipping on the first NUM_BUFS TMAs.
-                    // NOTE: We only do this for K to save some checking overhead, since after doing this for K, cases where topk indices are all invalid are faster than the other cases
-                    plan.bar_k_part0_ready[cur_buf].complete_transaction(0u, NUM_LOCAL_ROWS_PER_WARP*4*D_sQ*sizeof(bf16), 1u);
-                }
-
-                if (k > 0) {
-                    plan.bar_qk_done[(k-1)%NUM_BUFS].wait(((k-1)/NUM_BUFS)&1);
-                }
-                if (!should_skip_tma) {
-                    load_part_ki(plan.bar_k_part1_ready[cur_buf], D_sQ/64, D_K/64);
-                } else {
-                    plan.bar_k_part1_ready[cur_buf].complete_transaction(0u, NUM_LOCAL_ROWS_PER_WARP*4*D_tQ*sizeof(bf16), 1u);
-                }
-            }
-        }
-    } else if (warpgroup_idx == 2) {
-        // Producer warps for V
-        cutlass::arch::warpgroup_reg_dealloc<96>();
-        int warp_idx = cutlass::canonical_warp_idx_sync() - 8;
-        constexpr int NUM_WARPS = 4;
-
-        if (elect_one_sync()) {
-            // Wait for UTCCP
-            plan.bar_prologue_utccp.wait(0);
-
-            bf16* sV_base = plan.u.s.v.data() + warp_idx*4*64;
-
-            CUTE_NO_UNROLL
-            for (int k = 0; k < num_k_blocks; ++k) {
-                auto load_part_vi = [&](transac_bar_t &bar, int local_row_start, int local_row_end) {
-                    CUTE_UNROLL
-                    for (int local_row = local_row_start; local_row < local_row_end; ++local_row) {
-                        int4 token_idxs = __ldg((int4*)(gIndices + k*B_TOPK) + local_row*NUM_WARPS + warp_idx);
-                        CUTE_UNROLL
-                        for (int local_col = 0; local_col < (D_V/2)/64; ++local_col)
-                            ku::tma_gather4_cta_group_2<true>(
-                                &(tma_params.tensor_map_kv),
-                                bar,
-                                sV_base + local_row*(4*NUM_WARPS)*64 + local_col*(B_TOPK*64),
-                                local_col*64 + (cta_idx?256:0),
-                                token_idxs,
-                                (int64_t)TMA::CacheHintSm90::EVICT_LAST
-                            );
-                    }
-                };
-
-                int cur_buf = k%NUM_BUFS;
-                if (k > 0) {
-                    plan.bar_sv_part_done[(k-1)%NUM_BUFS].wait(((k-1)/NUM_BUFS)&1);
-                }
-                load_part_vi(plan.bar_v_part0_ready[cur_buf], 0, (B_TOPK/2)/4/NUM_WARPS);
-
-                if (k > 0) {
-                    plan.bar_sv_done[(k-1)%NUM_BUFS].wait(((k-1)/NUM_BUFS)&1);
-                }
-                load_part_vi(plan.bar_v_part1_ready[cur_buf], (B_TOPK/2)/4/NUM_WARPS, B_TOPK/4/NUM_WARPS);
-            }
-        }
-    } else {
-        cutlass::arch::warpgroup_reg_alloc<168>();
-        
-        // MMA warp
-        if (cta_idx == 0 && warp_idx == 12 && elect_one_sync()) {
-            // S -> T copy for Q
-            UMMA::SmemDescriptor sQ_desc = UMMA::make_umma_desc<UMMA::Major::K>(
-                make_tensor(
-                    make_smem_ptr(plan.u.q_full.data() + (B_H/2)*D_sQ),
-                    tile_to_shape(
-                        UMMA::Layout_K_SW128_Atom<bf16>{},
-                        Shape<Int<B_H/2>, Int<64>>{}
-                    )
-                )
-            );
-            plan.bar_prologue_q.arrive_and_expect_tx(B_H*D_K*sizeof(bf16));
-            plan.bar_prologue_q.wait(0);
-            ku::tcgen05_after_thread_sync();
-            CUTE_UNROLL
-            for (int tile_idx = 0; tile_idx < NUM_tQ_TILES; ++tile_idx) {
-                // A tile is 64 rows * 64 cols (128B)
-                CUTE_UNROLL
-                for (int subtile_idx = 0; subtile_idx < 8; ++subtile_idx) {
-                    // A subtile is 64 rows * 8 cols (128b)
-                    SM100_UTCCP_2x64dp128bitlw0213_2cta::copy(
-                        sQ_desc + tile_idx*((B_H/2)*128/16) + subtile_idx*(16/16),   // Remember that 4 LSBs are not included
-                        tmem_cols::q + tile_idx*32 + subtile_idx*4
-                    );
-                }
-            }
-            ku::umma_arrive_multicast_2x1SM_noelect(plan.bar_prologue_utccp, 1|2);
-
-            CUTE_NO_UNROLL
-            for (int k = 0; k < num_k_blocks+1; ++k) {
-                if (k < num_k_blocks) {
-                    // Pi = QKi^T
-                    int cur_buf = k%NUM_BUFS;
-                    Tensor sQl = make_tensor(make_smem_ptr(plan.u.s.sq.data()), SmemLayoutQTiles<NUM_sQ_TILES>{});
-                    Tensor sKl = make_tensor(make_smem_ptr(plan.u.s.k.data()), SmemLayoutKTiles<NUM_sQ_TILES>{});
-                    Tensor sKr = make_tensor(make_smem_ptr(plan.u.s.k.data()+64*D_sQ), SmemLayoutKTiles<NUM_tQ_TILES>{});
-
-                    // Wait for K (part0)
-                    plan.bar_k_part0_ready[cur_buf].arrive_and_expect_tx(B_TOPK*D_sQ*sizeof(bf16));
-                    plan.bar_k_part0_ready[cur_buf].wait((k/NUM_BUFS)&1);
-                    if (k > 0) {
-                        plan.bar_p_free[(k-1)%NUM_BUFS].wait(((k-1)/NUM_BUFS)&1);
-                    }
-                    ku::tcgen05_after_thread_sync();
-
-                    ku::utcmma_ss(tiled_mma_P_sQ, sQl, sKl, tP, true);
-                    ku::umma_arrive_multicast_2x1SM_noelect(plan.bar_qk_part_done[cur_buf], 1|2);
-
-                    // Wait for K (part1)
-                    plan.bar_k_part1_ready[cur_buf].arrive_and_expect_tx(B_TOPK*(D_K-D_sQ)*sizeof(bf16));
-                    plan.bar_k_part1_ready[cur_buf].wait((k/NUM_BUFS)&1);
-                    ku::tcgen05_after_thread_sync();
-
-                    ku::utcmma_ts(tiled_mma_P_tQ, tQr, sKr, tP, false);
-                    ku::umma_arrive_multicast_2x1SM_noelect(plan.bar_qk_done[cur_buf], 1|2);
-                }
-                if (k > 0) {
-                    // O += S(i-1)V(i-1)
-                    int cur_buf = (k-1)%NUM_BUFS;
-
-                    Tensor sS = make_tensor(make_smem_ptr(plan.s.data()), SmemLayoutSTiles<2>{});
-                    Tensor sV = make_tensor(make_smem_ptr(plan.u.s.v.data()), SmemLayoutV{});
-                    Tensor sS_divided = flat_divide(sS, Tile<Int<B_H/2>, _64>{})(_, _, _0{}, _);    // (B_H/2, 64, 2)
-                    Tensor sV_divided = flat_divide(sV, Tile<Int<D_V/2>, _64>{})(_, _, _0{}, _);  // (D_V/2, 64, 2)
-
-                    // Wait for S(i-1) and O to be scaled
-                    plan.bar_so_ready[cur_buf].wait(((k-1)/NUM_BUFS)&1);
-
-                    // Wait for V (part0), and issue O += sS @ sV
-                    plan.bar_v_part0_ready[cur_buf].arrive_and_expect_tx((B_TOPK/2)*D_V*sizeof(bf16));
-                    plan.bar_v_part0_ready[cur_buf].wait(((k-1)/NUM_BUFS)&1);
-                    ku::tcgen05_after_thread_sync();
-
-                    ku::utcmma_ss(tiled_mma_O, sS_divided(_, _, _0{}), sV_divided(_, _, _0{}), tO, k == 1);
-                    ku::umma_arrive_multicast_2x1SM_noelect(plan.bar_sv_part_done[cur_buf], 1|2);
-
-                    // Wait for V (part1), and issue O += sS @ sV
-                    plan.bar_v_part1_ready[cur_buf].arrive_and_expect_tx((B_TOPK/2)*D_V*sizeof(bf16));
-                    plan.bar_v_part1_ready[cur_buf].wait(((k-1)/NUM_BUFS)&1);
-                    ku::tcgen05_after_thread_sync();
-                    ku::utcmma_ss(tiled_mma_O, sS_divided(_, _, _1{}), sV_divided(_, _, _1{}), tO, false);
-                    ku::umma_arrive_multicast_2x1SM_noelect(plan.bar_sv_done[cur_buf], 1|2);
-                }
-            }
-        } else if (warp_idx == 13) {
-            // KV valid loading warp
-            static_assert(B_TOPK == 128);
-            if (lane_idx < 16) {
-                CUTE_NO_UNROLL
-                for (int k = 0; k < num_k_blocks; ++k) {
-                    int cur_buf = k%NUM_BUFS;
-                    int32x8_t indices = ldg_256_indices(gIndices + k*B_TOPK + lane_idx*8);
-                    auto is_valid = [&](int rel_pos_in_lane, int index) -> char {
-                        int abs_pos = k*B_TOPK + lane_idx*8 + rel_pos_in_lane;
-                        return index >= 0 && index < params.s_kv && index <= max_kv_i && abs_pos < topk_length;
-                    };
-                    char is_ks_valid_mask = \
-                        is_valid(7, indices.a7) << 7 | 
-                        is_valid(6, indices.a6) << 6 | 
-                        is_valid(5, indices.a5) << 5 |
-                        is_valid(4, indices.a4) << 4 |
-                        is_valid(3, indices.a3) << 3 |
-                        is_valid(2, indices.a2) << 2 |
-                        is_valid(1, indices.a1) << 1 |
-                        is_valid(0, indices.a0) << 0;
-
-                    plan.bar_k_valid_free[cur_buf].wait((k/NUM_BUFS)&1^1);
-                    plan.is_k_valid[cur_buf][lane_idx] = is_ks_valid_mask;
-                    plan.bar_k_valid_ready[cur_buf].arrive();
-                }
-            }
-        }
-    }
+    if topk is not None:
+        # Sparse attention
+        assert not causal, "causal must be False when sparse attention is enabled"
+        assert is_fp8_kvcache, "is_fp8_kvcache must be True when sparse attention is enabled"
+        out, lse, new_tile_scheduler_metadata, new_num_splits = flash_mla_cuda.sparse_decode_fwd(
+            q, k_cache, indices_in_kvcache, topk_length, attn_sink,
+            sched_meta.tile_scheduler_metadata, sched_meta.num_splits,
+            extra_k_cache, extra_indices_in_kvcache, extra_topk_length,
+            head_dim_v, softmax_scale
+        )
+    else:
+        # Dense attention
+        assert indices_in_kvcache is None and attn_sink is None and extra_k_cache is None and extra_indices_in_kvcache is None and topk_length is None and extra_topk_length is None, "indices_in_kvcache, attn_sink, extra_k_cache, extra_indices_in_kvcache, topk_length and extra_topk_length must be None when dense attention is used."
+        assert block_table is not None and cache_seqlens is not None, "block_table and cache_seqlens must be provided when dense attention is used."
+        out, lse, new_tile_scheduler_metadata, new_num_splits = flash_mla_cuda.dense_decode_fwd(
+            q, k_cache, head_dim_v,
+            cache_seqlens, block_table,
+            softmax_scale, causal,
+            sched_meta.tile_scheduler_metadata, sched_meta.num_splits
+        )
+    sched_meta.tile_scheduler_metadata = new_tile_scheduler_metadata
+    sched_meta.num_splits = new_num_splits
+    return (out, lse)
 
 
-#else
-    if (cute::thread0()) {
-        CUTE_INVALID_CONTROL_PATH("This kernel only supports sm100");
-    }
-#endif
-}
+def flash_mla_sparse_fwd(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+    d_v: int = 512,
+    attn_sink: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+    q_start_index_s: int = 0,
+    write_p_out: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """
+    Sparse attention prefill kernel
 
-template<typename Kernel, typename TmaParams>
-__global__ void __launch_bounds__(Kernel::NUM_THREADS, 1, 2)
-sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __grid_constant__ const TmaParams tma_params) {
-    Kernel::sparse_attn_fwd_kernel_devfunc(params, tma_params);
-}
+    Args:
+        q: [s_q, h_q, d_qk], bfloat16
+        kv: [s_kv, h_kv, d_qk], bfloat16
+        indices: [s_q, h_kv, topk], int32. Invalid indices should be set to -1 or numbers >= s_kv
+        sm_scale: float
+        d_v: The dimension of value vectors. Can only be 512
+        attn_sink: optional, [h_q], float32.
+            If attn_sink is provided, when computing output, output will be additionally multiplied by exp(lse) / (exp(lse) + exp(attn_sink)).
+            +-inf in attn_sink will be handled normally (i.e., -inf has no effect, +inf will make corresponding output all zeros).
+            This argument has no effect on lse and max_logits.
+        topk_length: optional, [s_q], int32. If provided, the i-th q token will only attend to k tokens specified by indices[i, :, :topk_length[i]], ignoring later k/v tokens (even if provided in indices).
+            In extremely rare cases (topk_length provided, there is a valid topk index between topk_length[i] ~ s_kv, and that topk index points to a k token containing NaN), operator output will contain NaN, so please avoid this situation.
+        q_start_index_s: The starting position of the current chunk in the global sequence (used for causal masking)
+        write_p_out: bool. Whether to write p_out to global memory.
 
-template<int D_QK>
-void run_fwd_phase1_kernel(const SparseAttnFwdParams& params) {
-    static_assert(D_QK == 576 || D_QK == 512);
-    using Kernel = KernelTemplate<D_QK>;
+    Returns:
+        (output, max_logits, lse, p_out)
+        Please refer to tests/ref.py for the precise definitions of these parameters.
+        - output: [s_q, h_q, d_v], bfloat16
+        - max_logits:  [s_q, h_q], float
+        - lse: [s_q, h_q], float, log-sum-exp of attention scores
+        - p_out: [s_q, h_q, topk], float32 probability (None when write_p_out=False)
+    """
+    results = flash_mla_cuda.sparse_prefill_fwd(
+        q, kv, indices, sm_scale, d_v, q_start_index_s, write_p_out, attn_sink, topk_length
+    )
+    return results
 
-    KU_ASSERT(params.h_kv == 1);
-    KU_ASSERT(params.topk % Kernel::B_TOPK == 0);   // To save some boundry checkings
-    KU_ASSERT(params.h_q == Kernel::B_H);  // To save some calculation
-    KU_ASSERT(params.d_qk == D_QK);
 
-    auto shape_Q = make_shape(params.h_q, params.d_qk, params.s_q);
-    auto tma_Q = cute::make_tma_copy(
-        SM100_TMA_2SM_LOAD_NOSPLIT{},
-        make_tensor(
-            make_gmem_ptr((bf16*)params.q),
-            make_layout(
-                shape_Q,
-                make_stride(params.stride_q_h_q, _1{}, params.stride_q_s_q)
-            )
-        ),
-        (typename Kernel::template SmemLayoutQTiles<D_QK/64>){}
-    );
+def flash_mla_sparse_bwd(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    o: torch.Tensor,
+    dO: torch.Tensor,
+    indices: torch.Tensor,
+    lse: torch.Tensor,
+    sm_scale: float,
+    d_v: int = 512,
+    topk_length: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Sparse attention backward kernel
 
-    auto shape_O = make_shape(params.h_q, params.d_v, params.s_q);
-    auto tma_O = cute::make_tma_copy(
-        SM90_TMA_STORE{},
-        make_tensor(
-            make_gmem_ptr((bf16*)params.out),
-            make_layout(
-                shape_O,
-                make_stride(params.d_v, _1{}, params.h_q*params.d_v)
-            )
-        ),
-        (typename Kernel::template SmemLayoutOTiles<1>){}
-    );
+    Args:
+        q: [s_q, h_q, d_qk], bfloat16 - Query tensor
+        kv: [s_kv, h_kv, d_qk], bfloat16 - Key/Value tensor
+        o: [s_q, h_q, d_v], bfloat16 - Forward output
+        dO: [s_q, h_q, d_v], bfloat16 - Output gradient
+        indices: [s_q, h_kv, topk], int32 - TopK indices
+        lse: [s_q, h_q], float32 - Log-Sum-Exp (from forward)
+        sm_scale: float - Softmax scaling factor
+        d_v: int - Value dimension, must be 512
+        topk_length: optional, [s_q], int32 - Optional TopK length
 
-    auto shape_P = make_shape(params.h_q, params.topk, params.s_q);
-    auto tma_P = cute::make_tma_copy(
-        SM90_TMA_STORE{},
-        make_tensor(
-            make_gmem_ptr((float*)params.p_out),
-            make_layout(
-                shape_P,
-                make_stride(params.topk, _1{}, params.h_q*params.topk)
-            )
-        ),
-        Layout<Shape<Int<Kernel::B_H/2>, Int<Kernel::B_TOPK>>, Stride<Int<Kernel::B_TOPK>, _1>>{}
-    );
+    Returns:
+        (dQ, dKV)
+        - dQ: [s_q, h_q, d_qk], bfloat16 - Query gradient
+        - dKV: [s_kv, h_kv, d_qk], bfloat16 - KV gradient
+    """
+    results = flash_mla_cuda.sparse_prefill_bwd(
+        q, kv, o, dO, indices, lse, sm_scale, d_v, topk_length
+    )
+    return results
 
-    CUtensorMap tensor_map_kv;
-    {
-        uint64_t size[2] = {D_QK, (unsigned long)params.s_kv};
-        uint64_t stride[1] = {params.stride_kv_s_kv*sizeof(bf16)};
-        uint32_t box_size[2] = {64, 1};
-        uint32_t elem_stride[2] = {1, 1};
-        CUresult res = CUTLASS_CUDA_DRIVER_WRAPPER_CALL(cuTensorMapEncodeTiled)(
-            &tensor_map_kv,
-            CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
-            2,
-            params.kv,
-            size,
-            stride,
-            box_size,
-            elem_stride,
-            CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
-            CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
-            CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
-            CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
-        );
-        KU_ASSERT(res == CUresult::CUDA_SUCCESS);
-    }
 
-    TmaParams<
-        decltype(shape_Q), decltype(tma_Q),
-        decltype(shape_O), decltype(tma_O),
-        decltype(shape_P), decltype(tma_P)
-    > tma_params = {
-        shape_Q, tma_Q,
-        shape_O, tma_O,
-        shape_P, tma_P,
-        tensor_map_kv
-    };
-    auto kernel = &sparse_attn_fwd_kernel<Kernel, decltype(tma_params)>;
+def _flash_attn_varlen_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_qo: torch.Tensor,
+    cu_seqlens_kv: torch.Tensor,
+    max_seqlen_qo: int,
+    max_seqlen_kv: int,
+    out: Optional[torch.Tensor] = None,
+    lse: Optional[torch.Tensor] = None,
+    causal: bool = False,
+    softmax_scale: Optional[float] = None,
+    is_varlen: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    qo_total_len, num_qo_heads, head_dim_qk = q.shape
+    kv_total_len, num_kv_heads, head_dim_vo = v.shape
 
-    constexpr size_t smem_size = sizeof(typename Kernel::SharedMemoryPlan);
-    KU_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    mask_mode_code = 1 if causal else 0
+    if softmax_scale is None:
+        softmax_scale = head_dim_qk ** (-0.5)
 
-    cutlass::ClusterLaunchParams launch_params = {
-        dim3(2*params.s_q, 1, 1),
-        dim3(Kernel::NUM_THREADS, 1, 1),
-        dim3(2, 1, 1),
-        smem_size,
-        params.stream
-    };
-    KU_CUTLASS_CHECK(cutlass::launch_kernel_on_cluster(
-        launch_params, (void*)kernel, params, tma_params
-    ));
-}
+    if out is None:
+        out = torch.empty(qo_total_len, num_qo_heads, head_dim_vo, device=q.device, dtype=q.dtype)
+    if lse is None:
+        # Make lse contiguous on seqlen dim
+        lse = torch.empty(num_qo_heads, qo_total_len, device=q.device, dtype=torch.float32).T
 
-}
+    workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.uint8, device=q.device)
+    flash_mla_cuda.dense_prefill_fwd(
+        workspace_buffer,
+        q,
+        k,
+        v,
+        cu_seqlens_qo,
+        cu_seqlens_kv,
+        out,
+        lse,
+        mask_mode_code,
+        softmax_scale,
+        max_seqlen_qo,
+        max_seqlen_kv,
+        is_varlen,
+    )
+
+    return out, lse
+
+
+def _flash_attn_varlen_backward(
+    do: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    cu_seqlens_qo: torch.Tensor,
+    cu_seqlens_kv: torch.Tensor,
+    max_seqlen_qo: int,
+    max_seqlen_kv: int,
+    dq: Optional[torch.Tensor] = None,
+    dk: Optional[torch.Tensor] = None,
+    dv: Optional[torch.Tensor] = None,
+    causal: bool = False,
+    softmax_scale: Optional[float] = None,
+    is_varlen: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    qo_total_len, num_qo_heads, head_dim_qk = q.shape
+    kv_total_len, num_kv_heads, head_dim_vo = v.shape
+
+    # TODO: fix bwd GQA
+    if num_qo_heads != num_kv_heads:
+        raise ValueError(f"SM100 bwd doesn't support GQA now. num_qo_heads: {num_qo_heads}, num_kv_heads: {num_kv_heads}.")
+
+    mask_mode_code = 1 if causal else 0
+    if softmax_scale is None:
+        softmax_scale = head_dim_qk ** (-0.5)
+
+    if dq is None:
+        dq = torch.empty(qo_total_len, num_qo_heads, head_dim_qk, device=q.device, dtype=q.dtype)
+    if dk is None:
+        dk = torch.empty(kv_total_len, num_kv_heads, head_dim_qk, device=q.device, dtype=q.dtype)
+    if dv is None:
+        dv = torch.empty(kv_total_len, num_kv_heads, head_dim_vo, device=q.device, dtype=q.dtype)
+
+    max_seqlen_qo_aligned = (max_seqlen_qo + 7) // 8 * 8
+    bs = cu_seqlens_qo.shape[0] - 1
+    workspace_bytes = 0
+    workspace_bytes += 4 * bs * max_seqlen_qo_aligned * num_qo_heads * head_dim_qk  # dQ_acc
+    workspace_bytes += 4 * max_seqlen_qo_aligned * bs * num_qo_heads * 2  # sum_OdO and scaled_lse
+    if num_qo_heads != num_kv_heads:
+        workspace_bytes += 2 * kv_total_len * num_qo_heads * (head_dim_qk + head_dim_vo)  # dKV_acc
+    workspace_buffer = torch.empty(workspace_bytes, dtype=torch.uint8, device=q.device)
+    flash_mla_cuda.dense_prefill_bwd(
+        workspace_buffer,
+        do,
+        q,
+        k,
+        v,
+        out,
+        lse,
+        cu_seqlens_qo,
+        cu_seqlens_kv,
+        dq,
+        dk,
+        dv,
+        mask_mode_code,
+        softmax_scale,
+        max_seqlen_qo,
+        max_seqlen_kv,
+        is_varlen,
+    )
+
+    return dq, dk, dv
+
+
+class FlashAttnVarlenFunc(torch.autograd.Function):
+    def forward(
+        ctx,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens_qo: torch.Tensor,
+        cu_seqlens_kv: torch.Tensor,
+        max_seqlen_qo: int,
+        max_seqlen_kv: int,
+        causal: bool = False,
+        softmax_scale: Optional[float] = None,
+        is_varlen: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        out, lse = _flash_attn_varlen_forward(
+            q, k, v,
+            cu_seqlens_qo, cu_seqlens_kv, max_seqlen_qo, max_seqlen_kv,
+            causal=causal, softmax_scale=softmax_scale,
+            is_varlen=is_varlen,
+        )
+        ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_qo, cu_seqlens_kv)
+        ctx.max_seqlen_qo = max_seqlen_qo
+        ctx.max_seqlen_kv = max_seqlen_kv
+        ctx.causal = causal
+        ctx.softmax_scale = softmax_scale
+        ctx.is_varlen = is_varlen
+        return out, lse
+
+    def backward(
+        ctx,
+        do: torch.Tensor,
+        dlse: torch.Tensor,
+    ):
+        del dlse  # LSE doesn't support backward currently
+        q, k, v, out, lse, cu_seqlens_qo, cu_seqlens_kv = ctx.saved_tensors
+        dq, dk, dv = _flash_attn_varlen_backward(
+            do, q, k, v, out, lse,
+            cu_seqlens_qo, cu_seqlens_kv, ctx.max_seqlen_qo, ctx.max_seqlen_kv,
+            causal=ctx.causal, softmax_scale=ctx.softmax_scale,
+            is_varlen=ctx.is_varlen,
+        )
+        return dq, dk, dv, None, None, None, None, None, None, None
+
+
+def flash_attn_varlen_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_qo: torch.Tensor,
+    cu_seqlens_kv: torch.Tensor,
+    max_seqlen_qo: int,
+    max_seqlen_kv: int,
+    dropout_p: float = 0.0,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    deterministic: bool = False,
+    is_varlen: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert dropout_p == 0.0
+    assert not deterministic
+    return FlashAttnVarlenFunc.apply(
+        q, k, v,
+        cu_seqlens_qo, cu_seqlens_kv, max_seqlen_qo, max_seqlen_kv,
+        causal, softmax_scale, is_varlen,
+    )
+
+
+def flash_attn_varlen_qkvpacked_func(
+    qkv: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    max_seqlen: int,
+    head_dim_qk: int,
+    dropout_p: float = 0.0,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    deterministic: bool = False,
+    is_varlen: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert dropout_p == 0.0
+    assert not deterministic
+    return FlashAttnVarlenFunc.apply(
+        qkv[:, :, :head_dim_qk], qkv[:, :, head_dim_qk:head_dim_qk * 2], qkv[:, :, head_dim_qk * 2:],
+        cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
+        causal, softmax_scale, is_varlen,
+    )
+
+
+def flash_attn_varlen_kvpacked_func(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    cu_seqlens_qo: torch.Tensor,
+    cu_seqlens_kv: torch.Tensor,
+    max_seqlen_qo: int,
+    max_seqlen_kv: int,
+    head_dim_qk: int,
+    dropout_p: float = 0.0,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    deterministic: bool = False,
+    is_varlen: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert dropout_p == 0.0
+    assert not deterministic
+    return FlashAttnVarlenFunc.apply(
+        q, kv[:, :, :head_dim_qk], kv[:, :, head_dim_qk:],
+        cu_seqlens_qo, cu_seqlens_kv, max_seqlen_qo, max_seqlen_kv,
+        causal, softmax_scale, is_varlen,
+    )
