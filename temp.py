@@ -1,257 +1,253 @@
-#!/usr/bin/env python3
-"""
-Test script for mla_bwd kernel.
-Validates dQ and dKV precision against a PyTorch reference for sequence length > 1.
-"""
+#pragma once
 
-import torch
-import mla_bwd_cuda
-import flash_mla
+#include "common.h"
 
+#include "params.h"
 
-def calc_diff(a: torch.Tensor, b: torch.Tensor):
-    abs_diff = torch.abs(a - b)
-    max_diff = abs_diff.max().item()
-    rel_diff = (abs_diff / (1e-4 + torch.abs(a))).mean().item()
-    return max_diff, rel_diff
+#include "sm90/prefill/sparse/phase1.h"
+#include "sm100/prefill/sparse/fwd/head128/phase1.h"
+#include "sm100/prefill/sparse/fwd/head64/phase1.h"
+#include "sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.h"
 
+enum class FwdFeatures : int {
+    HEAD_64,
+    HEAD_128,
 
-def build_reference(
-    q: torch.Tensor,        # [S, B_H, D_Q]
-    kv: torch.Tensor,       # [S_KV, D_K]
-    dO: torch.Tensor,       # [S, B_H, D_V]
-    lse: torch.Tensor,      # [S, B_H]
-    O: torch.Tensor,        # [S, B_H, D_V]
-    indices: torch.Tensor,  # [S, B_TOPK]
-    chunk_s: int = 8,
-):
-    S, B_H, D_Q = q.shape
-    S_KV, D_K = kv.shape
-    B_TOPK = indices.shape[1]
-    D_V = dO.shape[2]
-    D_ROPE = D_Q - D_V
+    HEAD_DIM_576,
+    HEAD_DIM_512,
 
-    all_k = kv.float()
-    all_v = kv[:, :D_V].float()
-    safe_indices = indices.clamp(0, S_KV - 1).to(torch.long)
-    in_range_mask = (indices >= 0) & (indices < S_KV)
+    ATTN_SINK,
+    SINK_LSE,
+    TOPK_LENGTH
+};
 
-    sm_scale = 1.0 / (D_Q ** 0.5)
-    scale_log2e = sm_scale * 1.44269504
-    neg_inf = torch.tensor(float("-inf"), device=q.device, dtype=torch.float32)
+class FwdImplBase : public ImplBase<
+    SparseAttnFwdParams,
+    FwdFeatures
+> {};
 
-    dQ_ref = torch.empty((S, B_H, D_Q), device=q.device, dtype=torch.float32)
-    dKV_ref = torch.zeros((S_KV, D_K), device=q.device, dtype=torch.float32)
-
-    for s0 in range(0, S, chunk_s):
-        s1 = min(s0 + chunk_s, S)
-        cs = s1 - s0
-
-        q_chunk = q[s0:s1].float()
-        dO_chunk = dO[s0:s1].float()
-        O_chunk = O[s0:s1].float()
-        lse_chunk = lse[s0:s1]
-        indices_chunk = safe_indices[s0:s1]
-        in_range_chunk = in_range_mask[s0:s1]
-        q_pos = torch.arange(s0, s1, device=q.device, dtype=torch.int32).unsqueeze(1)
-        causal_chunk = indices[s0:s1] <= q_pos
-        valid_chunk = in_range_chunk & causal_chunk
-
-        gather_idx = indices_chunk.reshape(-1)
-        k = all_k.index_select(0, gather_idx).view(cs, B_TOPK, D_K)
-        v = all_v.index_select(0, gather_idx).view(cs, B_TOPK, D_V)
-
-        P_ref = torch.matmul(q_chunk, k.transpose(-2, -1))
-        P_ref = torch.where(valid_chunk.unsqueeze(1), P_ref, neg_inf)
-        dP_ref = torch.matmul(dO_chunk, v.transpose(-2, -1))
-        delta_ref = (O_chunk * dO_chunk).sum(dim=-1)
-
-        s_ref = torch.exp2(P_ref * scale_log2e - lse_chunk.unsqueeze(-1))
-        ds_ref = s_ref * (dP_ref - delta_ref.unsqueeze(-1)) * sm_scale
-        ds_bf16 = ds_ref.to(torch.bfloat16)
-
-        dQ_ref[s0:s1] = torch.matmul(ds_bf16.float(), k)
-
-        dV_ref = torch.matmul(s_ref.to(torch.bfloat16).float().transpose(-2, -1), dO_chunk)
-        dK_nope_ref = torch.matmul(ds_bf16.float().transpose(-2, -1), q_chunk[:, :, :D_V])
-        dK_rope_ref = torch.matmul(ds_bf16.float().transpose(-2, -1), q_chunk[:, :, D_V:])
-        dKV_topk_ref = torch.cat([dV_ref + dK_nope_ref, dK_rope_ref], dim=-1)
-
-        if valid_chunk.all():
-            dKV_ref.index_add_(0, indices_chunk.reshape(-1), dKV_topk_ref.reshape(-1, D_K))
-        else:
-            valid_indices = indices_chunk[valid_chunk]
-            valid_dkv = dKV_topk_ref[valid_chunk]
-            if valid_indices.numel() > 0:
-                dKV_ref.index_add_(0, valid_indices, valid_dkv)
-
-    assert dQ_ref.shape == (S, B_H, D_Q)
-    assert dKV_ref.shape == (S_KV, D_K)
-    assert D_ROPE == 64
-    return dQ_ref, dKV_ref
-
-
-def run_one_case(
-    name: str,
-    q: torch.Tensor,
-    kv: torch.Tensor,
-    dO: torch.Tensor,
-    lse: torch.Tensor,
-    O: torch.Tensor,
-    indices: torch.Tensor,
-):
-    dQ_ref, dKV_ref = build_reference(q, kv, dO, lse, O, indices)
-    dQ_cuda, dKV_cuda = mla_bwd_cuda.mla_bwd(q, kv, dO, lse, O, indices)
-
-    D_Q = q.shape[2]
-    sm_scale = 1.0 / (D_Q ** 0.5)
-    # flash_mla.flash_mla_sparse_bwd expects:
-    #   kv: [s_kv, h_kv, d_qk] (3D)
-    #   indices: [s_q, h_kv, topk] (3D)
-    kv_3d = kv.unsqueeze(1)  # [S_KV, D_K] -> [S_KV, 1, D_K]
-    indices_3d = indices.unsqueeze(1)  # [S, B_TOPK] -> [S, 1, B_TOPK]
-    dQ_cuda_flash, dKV_cuda_3d_flash = flash_mla.flash_mla_sparse_bwd(
-        q, kv_3d, O, dO, indices_3d, lse / 1.44269504,
-        # q, kv_3d, O, dO, indices_3d, lse,
-        sm_scale=sm_scale,
-    )
-    dKV_cuda_flash = dKV_cuda_3d_flash.squeeze(1)  # [S_KV, 1, D_K] -> [S_KV, D_K]
-    torch.cuda.synchronize()
-
-    dQ_max_diff, dQ_rel_diff = calc_diff(dQ_cuda, dQ_ref.bfloat16())
-    dKV_max_diff, dKV_rel_diff = calc_diff(dKV_cuda, dKV_ref)
-
-    # Compare flash_mla results with reference (by dimension ranges)
-    # Range 0-256
-    dQ_flash_max_diff_0_256, dQ_flash_rel_diff_0_256 = calc_diff(dQ_cuda_flash[:, :, :256], dQ_ref[:, :, :256].bfloat16())
-    dKV_flash_max_diff_0_256, dKV_flash_rel_diff_0_256 = calc_diff(dKV_cuda_flash[:, :256], dKV_ref[:, :256].bfloat16())
-    # Range 256-512
-    dQ_flash_max_diff_256_512, dQ_flash_rel_diff_256_512 = calc_diff(dQ_cuda_flash[:, :, 256:512], dQ_ref[:, :, 256:512].bfloat16())
-    dKV_flash_max_diff_256_512, dKV_flash_rel_diff_256_512 = calc_diff(dKV_cuda_flash[:, 256:512], dKV_ref[:, 256:512].bfloat16())
-    # Range 512-576
-    dQ_flash_max_diff_512_576, dQ_flash_rel_diff_512_576 = calc_diff(dQ_cuda_flash[:, :, 512:576], dQ_ref[:, :, 512:576].bfloat16())
-    dKV_flash_max_diff_512_576, dKV_flash_rel_diff_512_576 = calc_diff(dKV_cuda_flash[:, 512:576], dKV_ref[:, 512:576].bfloat16())
-    # Full range
-    dQ_flash_max_diff, dQ_flash_rel_diff = calc_diff(dQ_cuda_flash, dQ_ref.bfloat16())
-    dKV_flash_max_diff, dKV_flash_rel_diff = calc_diff(dKV_cuda_flash, dKV_ref.bfloat16())
-
-    print(f"{name}:")
-    print(f"  dQ       max_diff={dQ_max_diff:.6e}, rel_diff={dQ_rel_diff:.6e}")
-    print(f"  dKV      max_diff={dKV_max_diff:.6e}, rel_diff={dKV_rel_diff:.6e}")
-    print(f"  dQ_flash [0:256]   max_diff={dQ_flash_max_diff_0_256:.6e}, rel_diff={dQ_flash_rel_diff_0_256:.6e}")
-    print(f"  dKV_flash[0:256]   max_diff={dKV_flash_max_diff_0_256:.6e}, rel_diff={dKV_flash_rel_diff_0_256:.6e}")
-    print(f"  dQ_flash [256:512] max_diff={dQ_flash_max_diff_256_512:.6e}, rel_diff={dQ_flash_rel_diff_256_512:.6e}")
-    print(f"  dKV_flash[256:512] max_diff={dKV_flash_max_diff_256_512:.6e}, rel_diff={dKV_flash_rel_diff_256_512:.6e}")
-    print(f"  dQ_flash [512:576] max_diff={dQ_flash_max_diff_512_576:.6e}, rel_diff={dQ_flash_rel_diff_512_576:.6e}")
-    print(f"  dKV_flash[512:576] max_diff={dKV_flash_max_diff_512_576:.6e}, rel_diff={dKV_flash_rel_diff_512_576:.6e}")
-    print(f"  dQ_flash [full]    max_diff={dQ_flash_max_diff:.6e}, rel_diff={dQ_flash_rel_diff:.6e}")
-    print(f"  dKV_flash[full]    max_diff={dKV_flash_max_diff:.6e}, rel_diff={dKV_flash_rel_diff:.6e}")
-    return dQ_max_diff, dQ_rel_diff, dKV_max_diff, dKV_rel_diff
-
-
-def bench_cuda_kernel_tflops(
-    q: torch.Tensor,
-    kv: torch.Tensor,
-    dO: torch.Tensor,
-    lse: torch.Tensor,
-    O: torch.Tensor,
-    indices: torch.Tensor,
-):
-    # Reference: tilelang/examples/deepseek_v32/sparse_mla_bwd.py per_token_flop
-    S, H, D_Q = q.shape
-    topk = indices.shape[1]
-    D_V = dO.shape[2]
-    per_token_flop = 2 * sum(
-        [
-            H * D_V * topk,
-            H * D_Q * topk,
-            H * D_Q * topk,
-            H * D_Q * topk,
-            H * D_V * topk,
-        ]
+class Fwd_Sm90_Impl : public FwdImplBase {
+    DECLARE_SUPPORTED_FEATURES(
+        FwdFeatures::HEAD_64,
+        FwdFeatures::HEAD_128,
+        FwdFeatures::HEAD_DIM_512,
+        FwdFeatures::HEAD_DIM_576,
+        FwdFeatures::ATTN_SINK,
+        FwdFeatures::SINK_LSE,
+        FwdFeatures::TOPK_LENGTH
     )
 
-    from tilelang.profiler import do_bench
+protected:
+    void run_(const SparseAttnFwdParams &params, const std::vector<FeatureT> &required_features) override {
+        DISPATCH_HEAD_DIM(params.d_qk, HEAD_DIM_QK, [&]() {
+            DISPATCH_BOOLEAN_FLAG(params.topk_length != nullptr, HAVE_TOPK_LENGTH, [&]() {
+                sm90::fwd::run_fwd_phase1_kernel<HEAD_DIM_QK, HAVE_TOPK_LENGTH>(params);
+            });
+        });
+    }
+};
 
-    def fn():
-        mla_bwd_cuda.mla_bwd(q, kv, dO, lse, O, indices)
-
-    ms = do_bench(fn, rep=50, warmup=10)
-    tflops = per_token_flop * S / (ms * 1e-3) / 1e12
-    print(f"cuda_kernel average time: {ms:.3f} ms")
-    print(f"cuda_kernel bwd tflops: {tflops:.3f}")
-    return ms, tflops
-
-
-def test_mla_bwd():
-    print("=" * 60)
-    print("Testing mla_bwd kernel (dQ/dKV, sequence length > 1)")
-    print("=" * 60)
-
-    S = 4096
-    B_H = 128
-    D_Q = 576
-    S_KV = 8192
-    B_TOPK = 2048
-    D_K = 576
-    D_V = 512
-
-    print(f"q shape: [{S}, {B_H}, {D_Q}]")
-    print(f"kv shape: [{S_KV}, {D_K}]")
-    print(f"dO shape: [{S}, {B_H}, {D_V}]")
-    print(f"lse shape: [{S}, {B_H}]")
-    print(f"O shape: [{S}, {B_H}, {D_V}]")
-    print(f"indices shape: [{S}, {B_TOPK}]")
-    print(f"dQ shape: [{S}, {B_H}, {D_Q}]")
-    print(f"dKV shape: [{S_KV}, {D_K}]")
-    print()
-
-    torch.manual_seed(42)
-    q = torch.randn(S, B_H, D_Q, dtype=torch.bfloat16, device="cuda")
-    kv = torch.randn(S_KV, D_K, dtype=torch.bfloat16, device="cuda")
-    dO = torch.randn(S, B_H, D_V, dtype=torch.bfloat16, device="cuda")
-    lse = torch.randn(S, B_H, dtype=torch.float32, device="cuda") * 2.0 + 5.0
-    O = torch.randn(S, B_H, D_V, dtype=torch.bfloat16, device="cuda")
-
-    # Match tilelang sparse_mla_bwd.py style: valid causal prefix + SKV sentinel invalid tail.
-    indices = torch.full((S, B_TOPK), S_KV, dtype=torch.int32, device="cuda")
-    for t in range(S):
-        n_valid = min(t + 1, B_TOPK)
-        if n_valid > 0:
-            idx = torch.randperm(t + 1, device="cuda")[:n_valid].to(torch.int32)
-            indices[t, :n_valid] = idx
-
-    dQ_max_diff, dQ_rel_diff, dKV_max_diff, dKV_rel_diff = run_one_case(
-        "Random normal", q, kv, dO, lse, O, indices
+class Fwd_Sm100_Head64_Impl : public FwdImplBase {
+    DECLARE_SUPPORTED_FEATURES(
+        FwdFeatures::HEAD_64,
+        FwdFeatures::HEAD_DIM_512,
+        FwdFeatures::HEAD_DIM_576,
+        FwdFeatures::ATTN_SINK,
+        FwdFeatures::SINK_LSE,
+        FwdFeatures::TOPK_LENGTH
     )
 
-    rel_diff_threshold = 0.01
-    ok_dQ = dQ_rel_diff < rel_diff_threshold
-    ok_dKV = dKV_rel_diff < rel_diff_threshold
+protected:
+    void run_(const SparseAttnFwdParams &params, const std::vector<FeatureT> &required_features) override {
+        DISPATCH_HEAD_DIM(params.d_qk, HEAD_DIM_QK, [&]() {
+            sm100::fwd::head64::run_fwd_phase1_kernel<HEAD_DIM_QK>(params);
+        });
+    }
+};
 
-    print("=" * 60)
-    print("Precision Validation (dQ/dKV)")
-    print("=" * 60)
-    print(f"{'PASS' if ok_dQ else 'FAIL'} dQ  rel_diff={dQ_rel_diff:.6e}, threshold={rel_diff_threshold:.2e}")
-    print(f"{'PASS' if ok_dKV else 'FAIL'} dKV rel_diff={dKV_rel_diff:.6e}, threshold={rel_diff_threshold:.2e}")
-    print(f"dQ  max_diff={dQ_max_diff:.6e}")
-    print(f"dKV max_diff={dKV_max_diff:.6e}")
+class Fwd_Sm100_Head128_Impl : public FwdImplBase {
+    DECLARE_SUPPORTED_FEATURES(
+        FwdFeatures::HEAD_128,
+        FwdFeatures::HEAD_DIM_512,
+        FwdFeatures::HEAD_DIM_576,
+        FwdFeatures::ATTN_SINK,
+        FwdFeatures::SINK_LSE,
+        FwdFeatures::TOPK_LENGTH
+    )
 
-    print("=" * 60)
-    print("CUDA Kernel Benchmark")
-    print("=" * 60)
-    bench_cuda_kernel_tflops(q, kv, dO, lse, O, indices)
-    return ok_dQ and ok_dKV
+protected:
+    void run_(const SparseAttnFwdParams &params, const std::vector<FeatureT> &required_features) override {
+        DISPATCH_HEAD_DIM(params.d_qk, HEAD_DIM_QK, [&]() {
+            sm100::fwd::head128::run_fwd_phase1_kernel<HEAD_DIM_QK>(params);
+        });
+    }
+};
 
+class Fwd_Sm100_Head128_Small_TopK_Impl : public FwdImplBase {
+    DECLARE_SUPPORTED_FEATURES(
+        FwdFeatures::HEAD_128,
+        FwdFeatures::HEAD_DIM_512,
+        FwdFeatures::ATTN_SINK,
+        FwdFeatures::SINK_LSE,
+        FwdFeatures::TOPK_LENGTH
+    )
 
-if __name__ == "__main__":
-    print("CUDA Device:", torch.cuda.get_device_name())
-    print("CUDA Capability:", torch.cuda.get_device_capability())
-    print()
+protected:
+    void run_(const SparseAttnFwdParams &params, const std::vector<FeatureT> &required_features) override {
+        sm100::fwd_for_small_topk::head128::run_fwd_for_small_topk_phase1_kernel<SparseAttnFwdMode::Prefill, 512>(params);
+    }
+};
 
-    passed = test_mla_bwd()
+static std::vector<at::Tensor> sparse_attn_prefill_interface(
+    const at::Tensor &q,
+    const at::Tensor &kv,
+    const at::Tensor &indices,
+    float sm_scale,
+    int d_v,
+    int q_start_index_s,
+    bool write_p_out,
+    const std::optional<at::Tensor> &attn_sink,
+    const std::optional<at::Tensor> &topk_length
+) {
+    using bf16 = cutlass::bfloat16_t;
+    
+    Arch arch = Arch();
+    bool is_sm90a = arch.is_sm90a();
+    bool is_sm100f = arch.is_sm100f();
+    TORCH_CHECK(is_sm90a || is_sm100f, "Sparse Attention Forward Kernel is only supported on SM90a and SM100f architectures.");
 
-    print("\n" + "=" * 60)
-    print("All tests PASSED!" if passed else "Some tests FAILED!")
-    print("=" * 60)
-    raise SystemExit(0 if passed else 1)
+    KU_CHECK_NDIM(q, 3);
+    KU_CHECK_NDIM(kv, 3);
+    KU_CHECK_NDIM(indices, 3);
+    KU_CHECK_NDIM(attn_sink, 1);
+    KU_CHECK_NDIM(topk_length, 1);
+
+    int s_q = q.size(0);
+    int s_kv = kv.size(0);
+    int h_q = q.size(1);
+    int h_kv = kv.size(1);
+    int d_qk = q.size(2);
+    int topk = indices.size(2);
+    bool have_topk_length = topk_length.has_value();
+
+    TORCH_CHECK(d_qk == 576 || d_qk == 512, "Invalid d_qk: ", d_qk);
+    TORCH_CHECK(d_v == 512, "Invalid d_v", d_v);
+    TORCH_CHECK(q_start_index_s >= 0, "q_start_index_s must be >= 0");
+    
+    KU_CHECK_DEVICE(q);
+    KU_CHECK_DEVICE(kv);
+    KU_CHECK_DEVICE(indices);
+    KU_CHECK_DEVICE(attn_sink);
+    KU_CHECK_DEVICE(topk_length);
+    
+    KU_CHECK_DTYPE(q, torch::kBFloat16);
+    KU_CHECK_DTYPE(kv, torch::kBFloat16);
+    KU_CHECK_DTYPE(indices, torch::kInt32);
+    KU_CHECK_DTYPE(attn_sink, torch::kFloat32);
+    KU_CHECK_DTYPE(topk_length, torch::kInt32);
+    
+    KU_CHECK_SHAPE(q, s_q, h_q, d_qk);
+    KU_CHECK_SHAPE(kv, s_kv, h_kv, d_qk);
+    KU_CHECK_SHAPE(indices, s_q, h_kv, topk);
+    KU_CHECK_SHAPE(attn_sink, h_q);
+    KU_CHECK_SHAPE(topk_length, s_q);
+    
+    KU_CHECK_LAST_DIM_CONTIGUOUS(q);
+    KU_CHECK_LAST_DIM_CONTIGUOUS(kv);
+    KU_CHECK_LAST_DIM_CONTIGUOUS(indices);
+    KU_CHECK_LAST_DIM_CONTIGUOUS(attn_sink);
+    KU_CHECK_LAST_DIM_CONTIGUOUS(topk_length);
+    
+    // Allocate results and buffers
+    at::cuda::CUDAGuard device_guard{(char)q.get_device()};
+    auto opts = q.options();
+    
+    at::Tensor out = torch::empty({s_q, h_q, d_v}, opts);
+    at::Tensor lse = torch::empty({s_q, h_q}, opts.dtype(torch::kFloat));
+    at::Tensor max_logits = torch::empty({s_q, h_q}, opts.dtype(torch::kFloat));
+    at::Tensor p_out;
+    if (write_p_out) {
+        p_out = torch::empty({s_q, h_q, topk}, opts.dtype(torch::kFloat));
+    }
+    KU_CHECK_CONTIGUOUS(out);
+    KU_CHECK_CONTIGUOUS(lse);
+    KU_CHECK_CONTIGUOUS(max_logits);
+    if (write_p_out) KU_CHECK_CONTIGUOUS(p_out);
+
+    SparseAttnFwdParams params = {
+        s_q, s_kv, h_q, h_kv, d_qk, d_v, topk,
+        q_start_index_s,
+        sm_scale, sm_scale * LOG_2_E,
+
+        (bf16*)q.data_ptr(),
+        (bf16*)kv.data_ptr(),
+        (int*)indices.data_ptr(),
+        ku::get_optional_tensor_ptr<float>(attn_sink),
+        ku::get_optional_tensor_ptr<int>(topk_length),
+
+        int64_stride_to_int(q.stride(0)), int64_stride_to_int(q.stride(1)),
+        int64_stride_to_int(kv.stride(0)), int64_stride_to_int(kv.stride(1)),
+        int64_stride_to_int(indices.stride(0)), int64_stride_to_int(indices.stride(1)),
+
+        (bf16*)out.data_ptr(),
+        (float*)max_logits.data_ptr(),
+        (float*)lse.data_ptr(),
+        write_p_out ? (float*)p_out.data_ptr() : nullptr,
+
+        arch.num_sms,
+        at::cuda::getCurrentCUDAStream().stream()
+    };
+
+    std::vector<FwdFeatures> required_features;
+    if (h_q == 64) {
+        required_features.push_back(FwdFeatures::HEAD_64);
+    } else if (h_q == 128) {
+        required_features.push_back(FwdFeatures::HEAD_128);
+    } else {
+        TORCH_CHECK(false, "Unsupported h_q: ", h_q);
+    }
+    if (d_qk == 576) {
+        required_features.push_back(FwdFeatures::HEAD_DIM_576);
+    } else if (d_qk == 512) {
+        required_features.push_back(FwdFeatures::HEAD_DIM_512);
+    } else {
+        TORCH_CHECK(false, "Unsupported d_qk: ", d_qk);
+    }
+    if (attn_sink.has_value()) {
+        required_features.push_back(FwdFeatures::ATTN_SINK);
+    }
+    if (have_topk_length) {
+        required_features.push_back(FwdFeatures::TOPK_LENGTH);
+    }
+
+    if (is_sm90a) {
+        Fwd_Sm90_Impl fwd_impl;
+        fwd_impl.run(params, required_features);
+    } else if (is_sm100f) {
+        if (h_q == 64) {
+            Fwd_Sm100_Head64_Impl fwd_impl;
+            fwd_impl.run(params, required_features);
+        } else if (h_q == 128) {
+            Fwd_Sm100_Head128_Small_TopK_Impl small_topk_impl;
+            Fwd_Sm100_Head128_Impl regular_impl;
+            bool use_small_topk_impl = false;
+            if (
+                (topk <= 1280 && small_topk_impl.check_if_all_features_are_supported(required_features)) ||
+                !regular_impl.check_if_all_features_are_supported(required_features)
+            ) {
+                use_small_topk_impl = true;
+            }
+            if (use_small_topk_impl) {
+                small_topk_impl.run(params, required_features);
+            } else {
+                regular_impl.run(params, required_features);
+            }
+        } else {
+            TORCH_CHECK(false, "Unsupported h_q: ", h_q);
+        }
+    } else {
+        TORCH_CHECK(false, "Unsupported architecture");
+    }
+
+    return {out, max_logits, lse, p_out};
+}
