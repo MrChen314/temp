@@ -1,3 +1,22 @@
-一步一步来，先删除 test_dq_2sm_mma.cu中所有debug打印
-在tma_gather4传输到smem后， test_dq_2sm_mma.cu 添加代码：寄存器读取k_calc_dq_nope和k_calc_dq_rope，然后直接输出到全局内存，kernel为k_calc_dq_nope和k_calc_dq_rope分别添加输出tensor：cuda_smem_k_nope和cuda_smem_k_rope，然后在 test_dq_2sm_mma.py 中对比cuda_smem_k_nope和cuda_smem_k_rope的精度对不对
-先确定tma_gather4没问题
+root@tjzj-inf-sci-k8s-bzz2-0205:/home/users/chenquanlin/workspace/operator/test_operator/unit_tests/dq_2sm_mma# python test_dq_2sm_mma.py 
+CUDA Device: CF-NG-BZZ2-O
+CUDA Capability: (10, 0)
+[random] smem_k_nope max_diff=6.343750e+00, rel_diff=3.973528e+03
+[random] smem_k_rope max_diff=4.921875e+00, rel_diff=5.627466e+03
+[random] indices[0:8]=[37, 121, 46, 147, 116, 146, 248, 110]
+[random] row0 smem_k_nope cuda=[-0.66796875, 0.51953125, -1.1328125, 0.341796875, 1.140625, 1.5407439555097887e-33, 0.0, 0.0]
+[random] row0 smem_k_nope ref =[-0.66796875, -1.21875, 0.259765625, -0.3203125, 1.0, 2.046875, -1.015625, 0.5625]
+[random] row0 smem_k_rope cuda=[0.87890625, 0.251953125, -2.34375, -0.1787109375, 0.0, 0.0, 0.0, 0.0]
+[random] row0 smem_k_rope ref =[0.87890625, -0.71875, -0.447265625, 2.015625, -0.50390625, 0.66015625, 0.1591796875, -1.6484375]
+[random] worst_nope_rows=[56, 42, 59, 27] row_max_diff=[6.34375, 5.546875, 5.0859375, 4.984375]
+[random] worst_rope_rows=[30, 15, 2, 23] row_max_diff=[4.921875, 4.7734375, 4.75390625, 4.15625]
+[structured_kv] smem_k_nope max_diff=2.796875e+00, rel_diff=6.464433e+03
+[structured_kv] smem_k_rope max_diff=3.078125e+00, rel_diff=1.155610e+04
+[structured_kv] indices[0:8]=[68, 27, 182, 85, 62, 158, 228, 254]
+[structured_kv] row0 smem_k_nope cuda=[0.6796875, 0.26953125, 1.8203125, 0.8515625, 0.5234375, 1.5407439555097887e-33, 0.0, 0.0]
+[structured_kv] row0 smem_k_nope ref =[0.6796875, 0.6796875, 0.68359375, 0.68359375, 0.80859375, 0.80859375, 0.93359375, 0.93359375]
+[structured_kv] row0 smem_k_rope cuda=[1.1953125, 0.78125, 2.328125, 2.09375, 0.0, 0.0, 0.0, 0.0]
+[structured_kv] row0 smem_k_rope ref =[1.1953125, 1.1953125, 1.1953125, 1.1953125, 1.21875, 1.21875, 1.21875, 1.2265625]
+[structured_kv] worst_nope_rows=[7, 42, 27, 61] row_max_diff=[2.796875, 2.71875, 2.6875, 2.68408203125]
+[structured_kv] worst_rope_rows=[7, 42, 27, 21] row_max_diff=[3.078125, 3.015625, 2.96875, 2.90625]
+Final: FAIL
