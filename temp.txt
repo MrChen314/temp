@@ -1,14 +1,14 @@
-root@tjzj-inf-sci-k8s-bzz2-0000:/home/users/chenquanlin/workspace/operator/FlashMLA# python /home/users/chenquanlin/workspace/operator/FlashMLA/tests/test_flash_mla_sparse_bwd.py
-sm_scale=0.041666666666666664
-[ref vs flash] dQ  max_diff=0.003906, rel_diff=0.005981
-[ref vs flash] dKV max_diff=0.031250, rel_diff=0.009460
-Average time: 1.179 ms
-bwd io bandwidth =  1.0244830054968421
-bwd tflops =  313.2641367919233
-root@tjzj-inf-sci-k8s-bzz2-0000:/home/users/chenquanlin/workspace/operator/FlashMLA# python /home/users/chenquanlin/workspace/operator/FlashMLA/tests/test_flash_mla_sparse_bwd.py
-sm_scale=100
-[ref vs flash] dQ  max_diff=64.000000, rel_diff=0.683594
-[ref vs flash] dKV max_diff=41.750000, rel_diff=0.376953
-Average time: 1.172 ms
-bwd io bandwidth =  1.0307069327405243
-bwd tflops =  315.167275433547
+root@tjzj-inf-sci-k8s-bzz2-0000:/home/users/chenquanlin/workspace/operator/test_smla# python test.py 
+=== flash vs tilelang ===
+1.3515625
+0.08642578125
+dq_max_diff: 1.351562, dq_rel_diff: 0.155273
+dk_max_diff: 0.086426, dk_rel_diff: 0.236328
+
+=== flash vs ref ===
+dq_max_diff: 1.351562, dq_rel_diff: 1.757812
+dk_max_diff: 0.086426, dk_rel_diff: 11.375000
+
+=== tilelang vs ref ===
+dq_max_diff: 0.000008, dq_rel_diff: 0.000196
+dk_max_diff: 0.000122, dk_rel_diff: 0.000075
