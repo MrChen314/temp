@@ -1,14 +1,43 @@
-root@tjzj-inf-sci-k8s-bzz2-0000:/home/users/chenquanlin/workspace/operator/test_smla# python test.py 
-=== flash vs tilelang ===
-1.3515625
-0.08642578125
-dq_max_diff: 1.351562, dq_rel_diff: 0.155273
-dk_max_diff: 0.086426, dk_rel_diff: 0.236328
+root@tjzj-inf-sci-k8s-bzz2-0000:/home/users/chenquanlin/workspace/operator/FlashMLA# git checkout 088e0dc42ee64cdf9c6fb793b92647ffbe5dc7d7
+Note: switching to '088e0dc42ee64cdf9c6fb793b92647ffbe5dc7d7'.
 
-=== flash vs ref ===
-dq_max_diff: 1.351562, dq_rel_diff: 1.757812
-dk_max_diff: 0.086426, dk_rel_diff: 11.375000
+You are in 'detached HEAD' state. You can look around, make experimental
+changes and commit them, and you can discard any commits you make in this
+state without impacting any branches by switching back to a branch.
 
-=== tilelang vs ref ===
-dq_max_diff: 0.000008, dq_rel_diff: 0.000196
-dk_max_diff: 0.000122, dk_rel_diff: 0.000075
+If you want to create a new branch to retain commits you create, you may
+do so (now or later) by using -c with the switch command. Example:
+
+  git switch -c <new-branch-name>
+
+Or undo this operation with:
+
+  git switch -
+
+Turn off this advice by setting config variable advice.detachedHead to false
+
+HEAD is now at 088e0dc 【性能优化】preprocess_delta新增线程协作&写-delta
+root@tjzj-inf-sci-k8s-bzz2-0000:/home/users/chenquanlin/workspace/operator/FlashMLA# pip install . -v &> ../install.log
+root@tjzj-inf-sci-k8s-bzz2-0000:/home/users/chenquanlin/workspace/operator/FlashMLA# python /home/users/chenquanlin/workspace/operator/FlashMLA/tests/test_flash_mla_sparse_bwd.py
+[ref vs flash] dQ  max_diff=0.001953, rel_diff=0.004486
+[ref vs flash] dKV max_diff=0.058594, rel_diff=0.007019
+Average time: 39.182 ms
+bwd io bandwidth =  0.4932721355776196
+bwd tflops =  150.83165745662325
+root@tjzj-inf-sci-k8s-bzz2-0000:/home/users/chenquanlin/workspace/operator/FlashMLA# export CUDA_VISIBLE_DEVICES=7
+root@tjzj-inf-sci-k8s-bzz2-0000:/home/users/chenquanlin/workspace/operator/FlashMLA# python /home/users/chenquanlin/workspace/operator/FlashMLA/tests/test_flash_mla_sparse_bwd.py
+[ref vs flash] dQ  max_diff=0.003906, rel_diff=0.004486
+[ref vs flash] dKV max_diff=0.015625, rel_diff=0.006897
+Average time: 15.653 ms
+bwd io bandwidth =  1.2347361591915849
+bwd tflops =  377.5548788994713
+root@tjzj-inf-sci-k8s-bzz2-0000:/home/users/chenquanlin/workspace/operator/FlashMLA# git checkout 64daee0334475278d49674e91fa796392f6c13a4
+Previous HEAD position was 088e0dc 【性能优化】preprocess_delta新增线程协作&写-delta
+HEAD is now at 64daee0 【性能优化】S/dS向量化写入
+root@tjzj-inf-sci-k8s-bzz2-0000:/home/users/chenquanlin/workspace/operator/FlashMLA# pip install . -v &> ../install.log
+root@tjzj-inf-sci-k8s-bzz2-0000:/home/users/chenquanlin/workspace/operator/FlashMLA# python /home/users/chenquanlin/workspace/operator/FlashMLA/tests/test_flash_mla_sparse_bwd.py
+[ref vs flash] dQ  max_diff=0.625000, rel_diff=5.906250
+[ref vs flash] dKV max_diff=4.250000, rel_diff=3.984375
+Average time: 19.470 ms
+bwd io bandwidth =  0.9926730837313298
+bwd tflops =  303.5373696031799
