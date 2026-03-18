@@ -1,28 +1,39 @@
-root@tjzj-inf-sci-k8s-bzz2-0000:/home/users/chenquanlin/workspace/operator/FlashMLA# CUDA_LAUNCH_BLOCKING=1 python /home/users/chenquanlin/workspace/operator/FlashMLA/tests/test_flash_mla_sparse_bwd_head128_2kernels_dq.py
-==== dq dbg enter block=0 cta=0 s_q=0 topk_len=2048 num_k_blocks=32 ====
-==== dq dbg enter block=1 cta=1 s_q=0 topk_len=2048 num_k_blocks=32 ====
-==== dq dbg finish init barriers block=1 cta=1 ====
-==== dq dbg finish init barriers block=0 cta=0 ====
-==== dq dbg finish cluster_sync block=1 cta=1 ====
-==== dq dbg finish cluster_sync block=0 cta=0 ====
-==== dq dbg warp0 enter prologue_tma block=1 cta=1 ====
-==== dq dbg warp0 enter prologue_tma block=0 cta=0 ====
-==== dq dbg warp0 finish q_nope tma block=1 cta=1 ====
-==== dq dbg warp0 finish q_nope tma block=0 cta=0 ====
-==== dq dbg warp0 finish q_rope tma block=1 cta=1 ====
-==== dq dbg warp0 finish q_rope tma block=0 cta=0 ====
-==== dq dbg warp0 finish dO tma block=1 cta=1 ====
-==== dq dbg warp0 finish dO tma block=0 cta=0 ====
-==== dq dbg warp0 before tmem alloc block=1 cta=1 cols=352 ====
-==== dq dbg warp0 before tmem alloc block=0 cta=0 cols=352 ====
-CUDA error (/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/sm100/prefill/sparse/bwd/head128_2kernels/instantiations/../dq_phase.cuh:821): an illegal instruction was encountered
+root@tjzj-inf-sci-k8s-bzz2-0000:/home/users/chenquanlin/workspace/operator/FlashMLA# python /home/users/chenquanlin/workspace/operator/FlashMLA/tests/test_flash_mla_sparse_bwd_head128_2kernels_dq.py
+TMA Desc Addr:   0x7fff51a54740
+format         9
+dim            3
+gmem_address   0x7f2420000000
+globalDim      (128,2048,4096,1,1)
+globalStrides  (4096,2,524288,0,0)
+boxDim         (8,64,1,1,1)
+elementStrides (1,1,1,1,1)
+interleave     0
+swizzle        0
+l2Promotion    2
+oobFill        0
+Error: Failed to initialize the TMA descriptor 1
+TMA Desc Addr:   0x7fff51a540c0
+format         9
+dim            3
+gmem_address   0x7f23a0000000
+globalDim      (128,2048,4096,1,1)
+globalStrides  (4096,2,524288,0,0)
+boxDim         (8,64,1,1,1)
+elementStrides (1,1,1,1,1)
+interleave     0
+swizzle        0
+l2Promotion    2
+oobFill        0
+Error: Failed to initialize the TMA descriptor 1
 Traceback (most recent call last):
-  File "/home/users/chenquanlin/workspace/operator/FlashMLA/tests/test_flash_mla_sparse_bwd_head128_2kernels_dq.py", line 132, in <module>
+  File "/home/users/chenquanlin/workspace/operator/FlashMLA/tests/test_flash_mla_sparse_bwd_head128_2kernels_dq.py", line 256, in <module>
     test_sparse_mla_bwd_head128_2kernels_dq(
-  File "/home/users/chenquanlin/workspace/operator/FlashMLA/tests/test_flash_mla_sparse_bwd_head128_2kernels_dq.py", line 106, in test_sparse_mla_bwd_head128_2kernels_dq
-    flash_dq = flash_mla.flash_mla_sparse_bwd_head128_2kernels_dq(
-               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/local/lib/python3.12/dist-packages/flash_mla/flash_mla_interface.py", line 300, in flash_mla_sparse_bwd_head128_2kernels_dq
-    return flash_mla_cuda.sparse_prefill_bwd_head128_2kernels_dq(
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-RuntimeError: CUDA error (/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/sm100/prefill/sparse/bwd/head128_2kernels/instantiations/../dq_phase.cuh:821): CUDA error: an illegal instruction was encountered
+  File "/home/users/chenquanlin/workspace/operator/FlashMLA/tests/test_flash_mla_sparse_bwd_head128_2kernels_dq.py", line 173, in test_sparse_mla_bwd_head128_2kernels_dq
+    torch.cuda.synchronize()
+  File "/usr/local/lib/python3.12/dist-packages/torch/cuda/__init__.py", line 1040, in synchronize
+    return torch._C._cuda_synchronize()
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: CUDA error: an illegal instruction was encountered
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
