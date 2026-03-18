@@ -1,9 +1,8 @@
-root@tjzj-inf-sci-k8s-bzz2-0000:/home/users/chenquanlin/workspace/operator/FlashMLA# CUDA_LAUNCH_BLOCKING=1 python /home
-/users/chenquanlin/workspace/operator/FlashMLA/tests/test_flash_mla_sparse_bwd_head128_2kernels_dkv.py
-TMA Desc Addr:   0x7ffd23b45ec0
+root@tjzj-inf-sci-k8s-bzz2-0000:/home/users/chenquanlin/workspace/operator/FlashMLA# CUDA_LAUNCH_BLOCKING=1 python /home/users/chenquanlin/workspace/operator/FlashMLA/tests/test_flash_mla_sparse_bwd_head128_2kernels_dkv.py
+TMA Desc Addr:   0x7ffd76831fc0
 format         9
 dim            3
-gmem_address   0x7f9a22000000
+gmem_address   0x7f2ad2000000
 globalDim      (128,512,4096,1,1)
 globalStrides  (1152,2,147456,0,0)
 boxDim         (64,256,1,1,1)
@@ -13,10 +12,10 @@ swizzle        3
 l2Promotion    2
 oobFill        0
 Error: Failed to initialize the TMA descriptor 1
-TMA Desc Addr:   0x7ffd23b45ec0
+TMA Desc Addr:   0x7ffd76831fc0
 format         9
 dim            3
-gmem_address   0x7f9a22000400
+gmem_address   0x7f2ad2000400
 globalDim      (128,64,4096,1,1)
 globalStrides  (1152,2,147456,0,0)
 boxDim         (64,32,1,1,1)
@@ -26,10 +25,10 @@ swizzle        3
 l2Promotion    2
 oobFill        0
 Error: Failed to initialize the TMA descriptor 1
-TMA Desc Addr:   0x7ffd23b45ec0
+TMA Desc Addr:   0x7ffd76831fc0
 format         9
 dim            3
-gmem_address   0x7f9a46000000
+gmem_address   0x7f2af6000000
 globalDim      (128,512,4096,1,1)
 globalStrides  (1024,2,131072,0,0)
 boxDim         (64,256,1,1,1)
@@ -39,10 +38,10 @@ swizzle        3
 l2Promotion    2
 oobFill        0
 Error: Failed to initialize the TMA descriptor 1
-TMA Desc Addr:   0x7ffd23b45ec0
+TMA Desc Addr:   0x7ffd76831fc0
 format         9
 dim            3
-gmem_address   0x7f9860000000
+gmem_address   0x7f2920000000
 globalDim      (128,2048,4096,1,1)
 globalStrides  (4096,2,524288,0,0)
 boxDim         (8,64,1,1,1)
@@ -52,10 +51,10 @@ swizzle        0
 l2Promotion    2
 oobFill        0
 Error: Failed to initialize the TMA descriptor 1
-TMA Desc Addr:   0x7ffd23b459c0
+TMA Desc Addr:   0x7ffd76831ac0
 format         9
 dim            3
-gmem_address   0x7f98e0000000
+gmem_address   0x7f29a0000000
 globalDim      (128,2048,4096,1,1)
 globalStrides  (4096,2,524288,0,0)
 boxDim         (8,64,1,1,1)
@@ -65,7 +64,7 @@ swizzle        0
 l2Promotion    2
 oobFill        0
 Error: Failed to initialize the TMA descriptor 1
-CUDA error (/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/sm100/prefill/sparse/bwd/head128_2kernels/instantiations/../dkv_phase.cuh:378): an illegal instruction was encountered
+CUDA error (/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/sm100/prefill/sparse/bwd/head128_2kernels/instantiations/../dkv_phase.cuh:377): an illegal instruction was encountered
 Traceback (most recent call last):
   File "/home/users/chenquanlin/workspace/operator/FlashMLA/tests/test_flash_mla_sparse_bwd_head128_2kernels_dkv.py", line 181, in <module>
     test_sparse_mla_bwd_head128_2kernels_dkv(
@@ -75,4 +74,4 @@ Traceback (most recent call last):
   File "/usr/local/lib/python3.12/dist-packages/flash_mla/flash_mla_interface.py", line 337, in flash_mla_sparse_bwd_head128_2kernels_dkv
     return flash_mla_cuda.sparse_prefill_bwd_head128_2kernels_dkv(
            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-RuntimeError: CUDA error (/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/sm100/prefill/sparse/bwd/head128_2kernels/instantiations/../dkv_phase.cuh:378): CUDA error: an illegal instruction was encountered
+RuntimeError: CUDA error (/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/sm100/prefill/sparse/bwd/head128_2kernels/instantiations/../dkv_phase.cuh:377): CUDA error: an illegal instruction was encountered
