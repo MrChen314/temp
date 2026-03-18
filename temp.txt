@@ -1,13 +1,13 @@
-root@tjzj-inf-sci-k8s-bzz2-0000:/home/users/chenquanlin/workspace/operator/FlashMLA# python /home/users/chenquanlin/workspace/operator/FlashMLA/tests/test_flash_mla_sparse_bwd_head128_2kernels_dq.py
+root@tjzj-inf-sci-k8s-bzz2-0000:/home/users/chenquanlin/workspace/operator/FlashMLA# CUDA_LAUNCH_BLOCKING=1 python /home/users/che
+nquanlin/workspace/operator/FlashMLA/tests/test_flash_mla_sparse_bwd_head128_2kernels_dq.py
+CUDA error (/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/sm100/prefill/sparse/bwd/head128_2kernels/instantiations/../dq_phase.cuh:701): an illegal instruction was encountered
 Traceback (most recent call last):
   File "/home/users/chenquanlin/workspace/operator/FlashMLA/tests/test_flash_mla_sparse_bwd_head128_2kernels_dq.py", line 132, in <module>
     test_sparse_mla_bwd_head128_2kernels_dq(
-  File "/home/users/chenquanlin/workspace/operator/FlashMLA/tests/test_flash_mla_sparse_bwd_head128_2kernels_dq.py", line 111, in test_sparse_mla_bwd_head128_2kernels_dq
-    torch.cuda.synchronize()
-  File "/usr/local/lib/python3.12/dist-packages/torch/cuda/__init__.py", line 1040, in synchronize
-    return torch._C._cuda_synchronize()
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-RuntimeError: CUDA error: an illegal instruction was encountered
-CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
-For debugging consider passing CUDA_LAUNCH_BLOCKING=1
-Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+  File "/home/users/chenquanlin/workspace/operator/FlashMLA/tests/test_flash_mla_sparse_bwd_head128_2kernels_dq.py", line 106, in test_sparse_mla_bwd_head128_2kernels_dq
+    flash_dq = flash_mla.flash_mla_sparse_bwd_head128_2kernels_dq(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/flash_mla/flash_mla_interface.py", line 300, in flash_mla_sparse_bwd_head128_2kernels_dq
+    return flash_mla_cuda.sparse_prefill_bwd_head128_2kernels_dq(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: CUDA error (/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/sm100/prefill/sparse/bwd/head128_2kernels/instantiations/../dq_phase.cuh:701): CUDA error: an illegal instruction was encountered
