@@ -1,8 +1,8 @@
 root@tjzj-inf-sci-k8s-bzz2-0000:/home/users/chenquanlin/workspace/operator/FlashMLA# CUDA_LAUNCH_BLOCKING=1 python /home/users/chenquanlin/workspace/operator/FlashMLA/tests/test_flash_mla_sparse_bwd_head128_2kernels_dkv.py
-TMA Desc Addr:   0x7ffd76831fc0
+TMA Desc Addr:   0x7fffdac4d5c0
 format         9
 dim            3
-gmem_address   0x7f2ad2000000
+gmem_address   0x7f9164000000
 globalDim      (128,512,4096,1,1)
 globalStrides  (1152,2,147456,0,0)
 boxDim         (64,256,1,1,1)
@@ -12,10 +12,10 @@ swizzle        3
 l2Promotion    2
 oobFill        0
 Error: Failed to initialize the TMA descriptor 1
-TMA Desc Addr:   0x7ffd76831fc0
+TMA Desc Addr:   0x7fffdac4d5c0
 format         9
 dim            3
-gmem_address   0x7f2ad2000400
+gmem_address   0x7f9164000400
 globalDim      (128,64,4096,1,1)
 globalStrides  (1152,2,147456,0,0)
 boxDim         (64,32,1,1,1)
@@ -25,10 +25,10 @@ swizzle        3
 l2Promotion    2
 oobFill        0
 Error: Failed to initialize the TMA descriptor 1
-TMA Desc Addr:   0x7ffd76831fc0
+TMA Desc Addr:   0x7fffdac4d5c0
 format         9
 dim            3
-gmem_address   0x7f2af6000000
+gmem_address   0x7f9188000000
 globalDim      (128,512,4096,1,1)
 globalStrides  (1024,2,131072,0,0)
 boxDim         (64,256,1,1,1)
@@ -38,10 +38,10 @@ swizzle        3
 l2Promotion    2
 oobFill        0
 Error: Failed to initialize the TMA descriptor 1
-TMA Desc Addr:   0x7ffd76831fc0
+TMA Desc Addr:   0x7fffdac4d5c0
 format         9
 dim            3
-gmem_address   0x7f2920000000
+gmem_address   0x7f8fa0000000
 globalDim      (128,2048,4096,1,1)
 globalStrides  (4096,2,524288,0,0)
 boxDim         (8,64,1,1,1)
@@ -51,10 +51,10 @@ swizzle        0
 l2Promotion    2
 oobFill        0
 Error: Failed to initialize the TMA descriptor 1
-TMA Desc Addr:   0x7ffd76831ac0
+TMA Desc Addr:   0x7fffdac4d0c0
 format         9
 dim            3
-gmem_address   0x7f29a0000000
+gmem_address   0x7f9020000000
 globalDim      (128,2048,4096,1,1)
 globalStrides  (4096,2,524288,0,0)
 boxDim         (8,64,1,1,1)
