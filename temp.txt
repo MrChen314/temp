@@ -1,6 +1,11 @@
-root@tjzj-inf-sci-k8s-bzz2-0000:/home/users/chenquanlin/workspace/operator/FlashMLA# CUDA_LAUNCH_BLOCKING=1 python /home/users/che
-nquanlin/workspace/operator/FlashMLA/tests/test_flash_mla_sparse_bwd_head128_2kernels_dq.py
-CUDA error (/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/sm100/prefill/sparse/bwd/head128_2kernels/instantiations/../dq_phase.cuh:701): an illegal instruction was encountered
+root@tjzj-inf-sci-k8s-bzz2-0000:/home/users/chenquanlin/workspace/operator/FlashMLA# CUDA_LAUNCH_BLOCKING=1 python /home/users/chenquanlin/workspace/operator/FlashMLA/tests/test_flash_mla_sparse_bwd_head128_2kernels_dq.py
+==== dq dbg enter block=0 cta=0 s_q=0 topk_len=2048 num_k_blocks=32 ====
+==== dq dbg enter block=1 cta=1 s_q=0 topk_len=2048 num_k_blocks=32 ====
+==== dq dbg finish init barriers block=1 cta=1 ====
+==== dq dbg finish init barriers block=0 cta=0 ====
+==== dq dbg finish cluster_sync block=1 cta=1 ====
+==== dq dbg finish cluster_sync block=0 cta=0 ====
+CUDA error (/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/sm100/prefill/sparse/bwd/head128_2kernels/instantiations/../dq_phase.cuh:801): an illegal instruction was encountered
 Traceback (most recent call last):
   File "/home/users/chenquanlin/workspace/operator/FlashMLA/tests/test_flash_mla_sparse_bwd_head128_2kernels_dq.py", line 132, in <module>
     test_sparse_mla_bwd_head128_2kernels_dq(
@@ -10,4 +15,4 @@ Traceback (most recent call last):
   File "/usr/local/lib/python3.12/dist-packages/flash_mla/flash_mla_interface.py", line 300, in flash_mla_sparse_bwd_head128_2kernels_dq
     return flash_mla_cuda.sparse_prefill_bwd_head128_2kernels_dq(
            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-RuntimeError: CUDA error (/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/sm100/prefill/sparse/bwd/head128_2kernels/instantiations/../dq_phase.cuh:701): CUDA error: an illegal instruction was encountered
+RuntimeError: CUDA error (/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/sm100/prefill/sparse/bwd/head128_2kernels/instantiations/../dq_phase.cuh:801): CUDA error: an illegal instruction was encountered
