@@ -3,5 +3,13 @@ root@tjzj-inf-sci-k8s-bzz2-0000:/home/users/chenquanlin/workspace/operator/Flash
 [dkv dbg] enter block=1 cta=1 s_q=0 topk=2048 topk_length=1068 num_k_pairs=16
 [dkv dbg] before init cluster_sync block=0 cta=0
 [dkv dbg] before init cluster_sync block=1 cta=1
-[dkv dbg] after init cluster_sync block=1 cta=1
 [dkv dbg] after init cluster_sync block=0 cta=0
+[dkv dbg] after init cluster_sync block=1 cta=1
+[dkv dbg] prologue tma launch done cta=0
+[dkv dbg] prologue tma launch done cta=1
+[dkv dbg] prologue allocate begin cta=0 warp=0
+[dkv dbg] prologue allocate begin cta=1 warp=0
+[dkv dbg] prologue allocate done cta=0 warp=0 tmem_base=0
+[dkv dbg] prologue allocate done cta=1 warp=0 tmem_base=0
+[dkv dbg] prologue wait done cta=0 tmem_base=0
+[dkv dbg] before prologue cluster_sync block=0 cta=0
