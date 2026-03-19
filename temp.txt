@@ -1,7 +1,14 @@
 root@tjzj-inf-sci-k8s-bzz2-0000:/home/users/chenquanlin/workspace/operator/FlashMLA# CUDA_LAUNCH_BLOCKING=1 python /home/users/chenquanlin/workspace/operator/FlashMLA/tests/test_flash_mla_sparse_bwd_head128_2kernels_dkv.py
+[dkv host] start s_q=4096 topk=2048 stride_q_h=576 stride_dO_h=512 stride_s_h=2048 stride_ds_h=2048
+[dkv host] build tma_Q
+[dkv host] build tma_Q_rope
+[dkv host] build tma_dO
+[dkv host] build tma_S
+[dkv host] build tma_dS
+[dkv host] launch kernel grid_x=8192 block_x=512 smem=172160
 [dkv] enter cta=0 topk_length=1068 num_k_blocks=9 stride_q_h=576 stride_dO_h=512 stride_s_h=2048 stride_ds_h=2048 stride_dKV=576
 [dkv] enter cta=1 topk_length=1068 num_k_blocks=9 stride_q_h=576 stride_dO_h=512 stride_s_h=2048 stride_ds_h=2048 stride_dKV=576
-CUDA error (/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/sm100/prefill/sparse/bwd/head128_2kernels/instantiations/../dkv_phase.cuh:440): unspecified launch failure
+CUDA error (/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/sm100/prefill/sparse/bwd/head128_2kernels/instantiations/../dkv_phase.cuh:500): unspecified launch failure
 Traceback (most recent call last):
   File "/home/users/chenquanlin/workspace/operator/FlashMLA/tests/test_flash_mla_sparse_bwd_head128_2kernels_dkv.py", line 181, in <module>
     test_sparse_mla_bwd_head128_2kernels_dkv(
@@ -11,4 +18,4 @@ Traceback (most recent call last):
   File "/usr/local/lib/python3.12/dist-packages/flash_mla/flash_mla_interface.py", line 337, in flash_mla_sparse_bwd_head128_2kernels_dkv
     return flash_mla_cuda.sparse_prefill_bwd_head128_2kernels_dkv(
            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-RuntimeError: CUDA error (/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/sm100/prefill/sparse/bwd/head128_2kernels/instantiations/../dkv_phase.cuh:440): CUDA error: unspecified launch failure
+RuntimeError: CUDA error (/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/sm100/prefill/sparse/bwd/head128_2kernels/instantiations/../dkv_phase.cuh:500): CUDA error: unspecified launch failure
