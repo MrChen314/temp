@@ -1,13 +1,46 @@
-root@tjzj-inf-sci-k8s-bzz2-0000:/home/users/chenquanlin/workspace/operator/FlashMLA# CUDA_LAUNCH_BLOCKING=1 python /home/users/chenquanlin/workspace/operator/FlashMLA/tests/test_f
-lash_mla_sparse_bwd_head128_2kernels_dq.py
-CUDA error (/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/sm100/prefill/sparse/bwd/head128_2kernels/instantiations/../dq_phase.cuh:785): misaligned address
-Traceback (most recent call last):
-  File "/home/users/chenquanlin/workspace/operator/FlashMLA/tests/test_flash_mla_sparse_bwd_head128_2kernels_dq.py", line 256, in <module>
-    test_sparse_mla_bwd_head128_2kernels_dq(
-  File "/home/users/chenquanlin/workspace/operator/FlashMLA/tests/test_flash_mla_sparse_bwd_head128_2kernels_dq.py", line 168, in test_sparse_mla_bwd_head128_2kernels_dq
-    flash_dq, flash_s, flash_ds = flash_mla.flash_mla_sparse_bwd_head128_2kernels_dq(
-                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/local/lib/python3.12/dist-packages/flash_mla/flash_mla_interface.py", line 303, in flash_mla_sparse_bwd_head128_2kernels_dq
-    dQ, s, ds = flash_mla_cuda.sparse_prefill_bwd_head128_2kernels_dq(
-                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-RuntimeError: CUDA error (/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/sm100/prefill/sparse/bwd/head128_2kernels/instantiations/../dq_phase.cuh:785): CUDA error: misaligned address
+root@tjzj-inf-sci-k8s-bzz2-0000:/home/users/chenquanlin/workspace/operator/FlashMLA# python /home/users/chenquanlin/workspace/operator/FlashMLA/tests/test_flash_mla_sparse_bwd_head128_2kernels_dkv.py
+[DBG][DKV][SQ0 CTA0 PROD] before init cluster_sync topk=1068 pairs=16
+[DBG][DKV][SQ0 CTA1 PROD] before init cluster_sync topk=1068 pairs=16
+[DBG][DKV][SQ0 CTA0 PROD] after init cluster_sync
+[DBG][DKV][SQ0 CTA1 PROD] after init cluster_sync
+[DBG][DKV][SQ0 CTA0 PROD] loop_start
+[DBG][DKV][SQ0 CTA1 PROD] loop_start
+[DBG][DKV][SQ0 CTA0 MMA] wait q/dO prologue
+[DBG][DKV][SQ0 CTA0 DRN2] k=0 wait nope phase=0 row_global=0 valid=1
+[DBG][DKV][SQ0 CTA1 DRN2] k=0 wait nope phase=0 row_global=64 valid=1
+[DBG][DKV][SQ0 CTA1 DRN1] k=0 wait nope phase=0 row_global=64 valid=1
+[DBG][DKV][SQ0 CTA0 DRN1] k=0 wait nope phase=0 row_global=0 valid=1
+[DBG][DKV][SQ0 CTA0 PROD] k=0 launched S/dS buf=0
+[DBG][DKV][SQ0 CTA1 PROD] k=0 launched S/dS buf=0
+[DBG][DKV][SQ0 CTA0 MMA] done q/dO prologue
+[DBG][DKV][SQ0 CTA1 PROD] k=1 launched S/dS buf=1
+[DBG][DKV][SQ0 CTA0 PROD] k=1 launched S/dS buf=1
+[DBG][DKV][SQ0 CTA0 MMA] k=0 wait S/dS buf=0 phase=0
+[DBG][DKV][SQ0 CTA1 PROD] k=2 wait bar_dkv_rope_ready phase=0 buf=0
+[DBG][DKV][SQ0 CTA0 PROD] k=2 wait bar_dkv_rope_ready phase=0 buf=0
+[DBG][DKV][SQ0 CTA0 MMA] k=0 done S/dS wait
+[DBG][DKV][SQ0 CTA0 MMA] k=0 arrived nope
+[DBG][DKV][SQ0 CTA0 DRN2] k=0 done nope wait
+[DBG][DKV][SQ0 CTA0 DRN1] k=0 done nope wait
+[DBG][DKV][SQ0 CTA1 DRN2] k=0 done nope wait
+[DBG][DKV][SQ0 CTA1 DRN1] k=0 done nope wait
+[DBG][DKV][SQ0 CTA0 MMA] k=0 arrived rope
+[DBG][DKV][SQ0 CTA1 PROD] k=2 done bar_dkv_rope_ready
+[DBG][DKV][SQ0 CTA0 PROD] k=2 done bar_dkv_rope_ready
+[DBG][DKV][SQ0 CTA1 DRN2] k=0 wait rope phase=0
+[DBG][DKV][SQ0 CTA0 DRN1] k=0 arrived dkv_free
+[DBG][DKV][SQ0 CTA0 DRN2] k=0 wait rope phase=0
+[DBG][DKV][SQ0 CTA1 DRN1] k=0 arrived dkv_free
+[DBG][DKV][SQ0 CTA0 MMA] k=1 wait bar_dkv_free phase=0
+[DBG][DKV][SQ0 CTA1 PROD] k=2 launched S/dS buf=0
+[DBG][DKV][SQ0 CTA1 DRN2] k=0 done rope wait
+[DBG][DKV][SQ0 CTA0 DRN2] k=0 done rope wait
+[DBG][DKV][SQ0 CTA0 DRN1] k=1 wait nope phase=1 row_global=128 valid=1
+[DBG][DKV][SQ0 CTA0 PROD] k=2 launched S/dS buf=0
+[DBG][DKV][SQ0 CTA1 DRN1] k=1 wait nope phase=1 row_global=192 valid=1
+[DBG][DKV][SQ0 CTA1 DRN2] k=0 arrived dkv_free
+[DBG][DKV][SQ0 CTA0 DRN2] k=0 arrived dkv_free
+[DBG][DKV][SQ0 CTA1 PROD] k=3 wait bar_dkv_rope_ready phase=1 buf=1
+[DBG][DKV][SQ0 CTA0 PROD] k=3 wait bar_dkv_rope_ready phase=1 buf=1
+[DBG][DKV][SQ0 CTA1 DRN2] k=1 wait nope phase=1 row_global=192 valid=1
+[DBG][DKV][SQ0 CTA0 DRN2] k=1 wait nope phase=1 row_global=128 valid=1
