@@ -1,49 +1,23 @@
-[DBG][DKV][SQ0 CTA1 DRN2] k=14 done nope wait
-[DBG][DKV][SQ0 CTA0 DRN1] k=14 done nope wait
-[DBG][DKV][SQ0 CTA1 DRN1] k=14 done nope wait
-[DBG][DKV][SQ0 CTA0 DRN2] k=14 done nope wait
-[DBG][DKV][SQ0 CTA0 MMA] k=14 arrived rope
-[DBG][DKV][SQ0 CTA0 DRN2] k=14 wait rope phase=0
-[DBG][DKV][SQ0 CTA0 DRN1] k=14 arrived dkv_free
-[DBG][DKV][SQ0 CTA1 DRN2] k=14 wait rope phase=0
-[DBG][DKV][SQ0 CTA1 DRN1] k=14 arrived dkv_free
-[DBG][DKV][SQ0 CTA0 MMA] k=15 wait bar_dkv_free phase=0
-[DBG][DKV][SQ0 CTA0 DRN2] k=14 done rope wait
-[DBG][DKV][SQ0 CTA1 DRN2] k=14 done rope wait
-[DBG][DKV][SQ0 CTA1 DRN1] k=15 wait nope phase=1 row_global=1984 valid=0
-[DBG][DKV][SQ0 CTA0 DRN1] k=15 wait nope phase=1 row_global=1920 valid=0
-[DBG][DKV][SQ0 CTA1 DRN2] k=14 arrived dkv_free
-[DBG][DKV][SQ0 CTA0 MMA] k=15 done bar_dkv_free
-[DBG][DKV][SQ0 CTA0 DRN2] k=14 arrived dkv_free
-[DBG][DKV][SQ0 CTA1 DRN2] k=15 wait nope phase=1 row_global=1984 valid=0
-[DBG][DKV][SQ0 CTA0 MMA] k=15 wait S/dS buf=1 phase=1
-[DBG][DKV][SQ0 CTA0 DRN2] k=15 wait nope phase=1 row_global=1920 valid=0
-[DBG][DKV][SQ0 CTA0 MMA] k=15 done S/dS wait
-[DBG][DKV][SQ0 CTA0 MMA] k=15 arrived nope
-[DBG][DKV][SQ0 CTA0 DRN1] k=15 done nope wait
-[DBG][DKV][SQ0 CTA1 DRN2] k=15 done nope wait
-[DBG][DKV][SQ0 CTA1 DRN1] k=15 done nope wait
-[DBG][DKV][SQ0 CTA0 DRN2] k=15 done nope wait
-[DBG][DKV][SQ0 CTA0 MMA] k=15 arrived rope
-[DBG][DKV][SQ0 CTA1 DRN2] k=15 wait rope phase=1
-[DBG][DKV][SQ0 CTA1 DRN1] k=15 arrived dkv_free
-[DBG][DKV][SQ0 CTA0 DRN1] k=15 arrived dkv_free
-[DBG][DKV][SQ0 CTA0 DRN2] k=15 wait rope phase=1
-[DBG][DKV][SQ0 CTA1 DRN2] k=15 done rope wait
-[DBG][DKV][SQ0 CTA1 DRN1] k=15 arrived dkv_final_done
-[DBG][DKV][SQ0 CTA0 DRN1] k=15 arrived dkv_final_done
-[DBG][DKV][SQ0 CTA0 DRN2] k=15 done rope wait
-[DBG][DKV][SQ0 CTA1 DRN2] k=15 arrived dkv_free
-[DBG][DKV][SQ0 CTA0 DRN2] k=15 arrived dkv_free
-[DBG][DKV][SQ0 CTA1 DRN2] k=15 arrived dkv_final_done
-[DBG][DKV][SQ0 CTA1 PROD] done final bar_dkv_final_done
-[DBG][DKV][SQ0 CTA0 PROD] done final bar_dkv_final_done
-[DBG][DKV][SQ0 CTA0 DRN2] k=15 arrived dkv_final_done
-[DBG][DKV][SQ0 CTA1 PROD] before epilogue __syncthreads
-[DBG][DKV][SQ0 CTA0 PROD] before epilogue __syncthreads
-[DBG][DKV][SQ0 CTA1 PROD] after epilogue __syncthreads
-[DBG][DKV][SQ0 CTA0 PROD] after epilogue __syncthreads
-[DBG][DKV][SQ0 CTA1 PROD] free TMEM base=0
-[DBG][DKV][SQ0 CTA0 PROD] free TMEM base=0
-[DBG][DKV][SQ0 CTA1 PROD] done free TMEM base=0
-[DBG][DKV][SQ0 CTA0 PROD] done free TMEM base=0
+root@tjzj-inf-sci-k8s-bzz2-0000:/home/users/chenquanlin/workspace/operator/FlashMLA# CUDA_VISIBLE_DEVICES=2 python /home/users/chenquanlin/workspace/operator/FlashMLA/tests/test_flash_mla_sparse_bwd_head128_2kernels_dq.py 
+Average time: 4.416 ms
+bwd io bandwidth =  4.1334823338958415
+bwd tflops =  809.1899533650211
+root@tjzj-inf-sci-k8s-bzz2-0000:/home/users/chenquanlin/workspace/operator/FlashMLA# CUDA_VISIBLE_DEVICES=2 python /home/users/chenquanlin/workspace/operator/FlashMLA/tests/test_flash_mla_sparse_bwd_head128_2kernels_dq.py 
+/home/users/chenquanlin/workspace/operator/FlashMLA/tests/test_flash_mla_sparse_bwd_head128_2kernels_dq.py:10: UserWarning: Converting a tensor with requires_grad=True to a scalar may lead to unexpected behavior.
+Consider using tensor.detach() first. (Triggered internally at /opt/pytorch/pytorch/aten/src/ATen/native/Scalar.cpp:22.)
+  max_diff = abs_diff.max().item()
+[ref vs flash] dQ  max_diff=0.187500, rel_diff=0.208008
+[ref vs flash] s   max_diff=0.000244, rel_diff=0.000000
+[ref vs flash] ds  max_diff=0.052246, rel_diff=0.021606
+`dq` mismatch
+max abs err: 0.1875: pos [472, 119, 328], 0.2109375 vs 0.3984375
+max rel err: 16768.546875: pos [50, 68, 242], -0.0201416015625 vs 2.0116567611694336e-07
+194748360 out of 301989888 passed (64.49%)
+Cosine diff: 0.0018122459309674044 (threshold: 7e-06)
+Traceback (most recent call last):
+  File "/home/users/chenquanlin/workspace/operator/FlashMLA/tests/test_flash_mla_sparse_bwd_head128_2kernels_dq.py", line 256, in <module>
+    test_sparse_mla_bwd_head128_2kernels_dq(
+  File "/home/users/chenquanlin/workspace/operator/FlashMLA/tests/test_flash_mla_sparse_bwd_head128_2kernels_dq.py", line 192, in test_sparse_mla_bwd_head128_2kernels_dq
+    assert kk.check_is_allclose(
+           ^^^^^^^^^^^^^^^^^^^^^
+AssertionError
