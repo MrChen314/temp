@@ -1,47 +1,48 @@
-[DBG][DKV][SQ0 CTA0 DRN2] k=13 arrived dkv_free
-[DBG][DKV][SQ0 CTA0 MMA] k=14 done bar_dkv_free
-[DBG][DKV][SQ0 CTA0 PROD] wait final bar_dkv_free phase=1
-[DBG][DKV][SQ0 CTA1 PROD] done final bar_dkv_free
 [DBG][DKV][SQ0 CTA1 DRN2] k=14 wait nope phase=0 row_global=1856 valid=0
-[DBG][DKV][SQ0 CTA0 PROD] done final bar_dkv_free
 [DBG][DKV][SQ0 CTA0 DRN2] k=14 wait nope phase=0 row_global=1792 valid=0
 [DBG][DKV][SQ0 CTA0 MMA] k=14 wait S/dS buf=0 phase=1
-[DBG][DKV][SQ0 CTA1 PROD] free TMEM base=0
-[DBG][DKV][SQ0 CTA0 PROD] free TMEM base=0
 [DBG][DKV][SQ0 CTA0 MMA] k=14 done S/dS wait
 [DBG][DKV][SQ0 CTA0 MMA] k=14 arrived nope
-[DBG][DKV][SQ0 CTA0 DRN2] k=14 done nope wait
-[DBG][DKV][SQ0 CTA0 DRN1] k=14 done nope wait
 [DBG][DKV][SQ0 CTA1 DRN2] k=14 done nope wait
+[DBG][DKV][SQ0 CTA0 DRN1] k=14 done nope wait
+[DBG][DKV][SQ0 CTA0 DRN2] k=14 done nope wait
 [DBG][DKV][SQ0 CTA1 DRN1] k=14 done nope wait
+[DBG][DKV][SQ0 CTA1 DRN2] k=14 wait rope phase=0
 [DBG][DKV][SQ0 CTA0 MMA] k=14 arrived rope
+[DBG][DKV][SQ0 CTA0 DRN1] k=14 arrived dkv_free
 [DBG][DKV][SQ0 CTA1 DRN1] k=14 arrived dkv_free
 [DBG][DKV][SQ0 CTA0 DRN2] k=14 wait rope phase=0
-[DBG][DKV][SQ0 CTA1 DRN2] k=14 wait rope phase=0
-[DBG][DKV][SQ0 CTA0 DRN1] k=14 arrived dkv_free
-[DBG][DKV][SQ0 CTA1 DRN1] k=15 wait nope phase=1 row_global=1984 valid=0
 [DBG][DKV][SQ0 CTA1 DRN2] k=14 done rope wait
 [DBG][DKV][SQ0 CTA0 MMA] k=15 wait bar_dkv_free phase=0
+[DBG][DKV][SQ0 CTA1 DRN1] k=15 wait nope phase=1 row_global=1984 valid=0
 [DBG][DKV][SQ0 CTA0 DRN2] k=14 done rope wait
 [DBG][DKV][SQ0 CTA0 DRN1] k=15 wait nope phase=1 row_global=1920 valid=0
 [DBG][DKV][SQ0 CTA1 DRN2] k=14 arrived dkv_free
 [DBG][DKV][SQ0 CTA0 DRN2] k=14 arrived dkv_free
 [DBG][DKV][SQ0 CTA0 MMA] k=15 done bar_dkv_free
 [DBG][DKV][SQ0 CTA1 DRN2] k=15 wait nope phase=1 row_global=1984 valid=0
-[DBG][DKV][SQ0 CTA0 MMA] k=15 wait S/dS buf=1 phase=1
 [DBG][DKV][SQ0 CTA0 DRN2] k=15 wait nope phase=1 row_global=1920 valid=0
+[DBG][DKV][SQ0 CTA0 MMA] k=15 wait S/dS buf=1 phase=1
 [DBG][DKV][SQ0 CTA0 MMA] k=15 done S/dS wait
 [DBG][DKV][SQ0 CTA0 MMA] k=15 arrived nope
-[DBG][DKV][SQ0 CTA0 DRN1] k=15 done nope wait
-[DBG][DKV][SQ0 CTA1 DRN1] k=15 done nope wait
-[DBG][DKV][SQ0 CTA1 DRN2] k=15 done nope wait
 [DBG][DKV][SQ0 CTA0 DRN2] k=15 done nope wait
-[DBG][DKV][SQ0 CTA1 DRN1] k=15 arrived dkv_free
+[DBG][DKV][SQ0 CTA0 DRN1] k=15 done nope wait
+[DBG][DKV][SQ0 CTA1 DRN2] k=15 done nope wait
+[DBG][DKV][SQ0 CTA1 DRN1] k=15 done nope wait
 [DBG][DKV][SQ0 CTA0 MMA] k=15 arrived rope
 [DBG][DKV][SQ0 CTA0 DRN1] k=15 arrived dkv_free
 [DBG][DKV][SQ0 CTA1 DRN2] k=15 wait rope phase=1
+[DBG][DKV][SQ0 CTA1 DRN1] k=15 arrived dkv_free
 [DBG][DKV][SQ0 CTA0 DRN2] k=15 wait rope phase=1
 [DBG][DKV][SQ0 CTA1 DRN2] k=15 done rope wait
+[DBG][DKV][SQ0 CTA1 DRN1] k=15 arrived dkv_final_done
+[DBG][DKV][SQ0 CTA0 DRN1] k=15 arrived dkv_final_done
 [DBG][DKV][SQ0 CTA0 DRN2] k=15 done rope wait
 [DBG][DKV][SQ0 CTA1 DRN2] k=15 arrived dkv_free
 [DBG][DKV][SQ0 CTA0 DRN2] k=15 arrived dkv_free
+[DBG][DKV][SQ0 CTA1 DRN2] k=15 arrived dkv_final_done
+[DBG][DKV][SQ0 CTA1 PROD] done final bar_dkv_final_done
+[DBG][DKV][SQ0 CTA0 PROD] done final bar_dkv_final_done
+[DBG][DKV][SQ0 CTA0 DRN2] k=15 arrived dkv_final_done
+[DBG][DKV][SQ0 CTA1 PROD] free TMEM base=0
+[DBG][DKV][SQ0 CTA0 PROD] free TMEM base=0
