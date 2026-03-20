@@ -1,66 +1,47 @@
-root@tjzj-inf-sci-k8s-bzz2-0000:/home/users/chenquanlin/workspace/operator/FlashMLA# CUDA_VISIBLE_DEVICES=2 python /home/users/chenquanlin/workspace/operator/FlashMLA/tests/test_flash_mla_sparse_bwd_head128_2kernels_dkv.py 
-[DBG][DKV][SQ0 CTA0 PROD] before init cluster_sync topk=1068 pairs=16
-[DBG][DKV][SQ0 CTA1 PROD] before init cluster_sync topk=1068 pairs=16
-[DBG][DKV][SQ0 CTA0 PROD] after init cluster_sync
-[DBG][DKV][SQ0 CTA1 PROD] after init cluster_sync
-[DBG][DKV][SQ0 CTA0 PROD] loop_start
-[DBG][DKV][SQ0 CTA0 MMA] wait q/dO prologue
-[DBG][DKV][SQ0 CTA1 PROD] loop_start
-[DBG][DKV][SQ0 CTA0 DRN1] k=0 wait nope phase=0 row_global=0 valid=1
-[DBG][DKV][SQ0 CTA0 DRN2] k=0 wait nope phase=0 row_global=0 valid=1
-[DBG][DKV][SQ0 CTA1 DRN2] k=0 wait nope phase=0 row_global=64 valid=1
-[DBG][DKV][SQ0 CTA1 DRN1] k=0 wait nope phase=0 row_global=64 valid=1
-[DBG][DKV][SQ0 CTA1 PROD] k=0 launched S/dS buf=0
-[DBG][DKV][SQ0 CTA0 PROD] k=0 launched S/dS buf=0
-[DBG][DKV][SQ0 CTA0 MMA] done q/dO prologue
-[DBG][DKV][SQ0 CTA1 PROD] k=1 launched S/dS buf=1
-[DBG][DKV][SQ0 CTA0 PROD] k=1 launched S/dS buf=1
-[DBG][DKV][SQ0 CTA0 MMA] k=0 wait S/dS buf=0 phase=0
-[DBG][DKV][SQ0 CTA1 PROD] k=2 wait bar_dkv_rope_ready phase=0 buf=0
-[DBG][DKV][SQ0 CTA0 PROD] k=2 wait bar_dkv_rope_ready phase=0 buf=0
-[DBG][DKV][SQ0 CTA0 MMA] k=0 done S/dS wait
-[DBG][DKV][SQ0 CTA0 MMA] k=0 arrived nope
-[DBG][DKV][SQ0 CTA0 DRN1] k=0 done nope wait
-[DBG][DKV][SQ0 CTA1 DRN2] k=0 done nope wait
-[DBG][DKV][SQ0 CTA1 DRN1] k=0 done nope wait
-[DBG][DKV][SQ0 CTA0 DRN2] k=0 done nope wait
-[DBG][DKV][SQ0 CTA0 MMA] k=0 arrived rope
-[DBG][DKV][SQ0 CTA0 PROD] k=2 done bar_dkv_rope_ready
-[DBG][DKV][SQ0 CTA1 PROD] k=2 done bar_dkv_rope_ready
-[DBG][DKV][SQ0 CTA1 DRN2] k=0 wait rope phase=0
-[DBG][DKV][SQ0 CTA1 DRN1] k=0 arrived dkv_free
-[DBG][DKV][SQ0 CTA0 DRN2] k=0 wait rope phase=0
-[DBG][DKV][SQ0 CTA0 DRN1] k=0 arrived dkv_free
-[DBG][DKV][SQ0 CTA1 DRN2] k=0 done rope wait
-[DBG][DKV][SQ0 CTA0 DRN2] k=0 done rope wait
-[DBG][DKV][SQ0 CTA1 PROD] k=2 launched S/dS buf=0
-[DBG][DKV][SQ0 CTA1 DRN1] k=1 wait nope phase=1 row_global=192 valid=1
-[DBG][DKV][SQ0 CTA0 MMA] k=1 wait bar_dkv_free phase=0
-[DBG][DKV][SQ0 CTA0 PROD] k=2 launched S/dS buf=0
-[DBG][DKV][SQ0 CTA0 DRN1] k=1 wait nope phase=1 row_global=128 valid=1
-[DBG][DKV][SQ0 CTA1 DRN2] k=0 arrived dkv_free
-[DBG][DKV][SQ0 CTA0 DRN2] k=0 arrived dkv_free
-[DBG][DKV][SQ0 CTA1 PROD] k=3 wait bar_dkv_rope_ready phase=1 buf=1
-[DBG][DKV][SQ0 CTA0 PROD] k=3 wait bar_dkv_rope_ready phase=1 buf=1
-[DBG][DKV][SQ0 CTA0 MMA] k=1 done bar_dkv_free
-[DBG][DKV][SQ0 CTA1 DRN2] k=1 wait nope phase=1 row_global=192 valid=1
-[DBG][DKV][SQ0 CTA0 DRN2] k=1 wait nope phase=1 row_global=128 valid=1
-[DBG][DKV][SQ0 CTA0 MMA] k=1 wait S/dS buf=1 phase=0
-[DBG][DKV][SQ0 CTA0 MMA] k=1 done S/dS wait
-[DBG][DKV][SQ0 CTA0 MMA] k=1 arrived nope
-[DBG][DKV][SQ0 CTA0 DRN2] k=1 done nope wait
-[DBG][DKV][SQ0 CTA1 DRN2] k=1 done nope wait
-[DBG][DKV][SQ0 CTA1 DRN1] k=1 done nope wait
-[DBG][DKV][SQ0 CTA0 DRN1] k=1 done nope wait
-Traceback (most recent call last):
-  File "/home/users/chenquanlin/workspace/operator/FlashMLA/tests/test_flash_mla_sparse_bwd_head128_2kernels_dkv.py", line 181, in <module>
-    test_sparse_mla_bwd_head128_2kernels_dkv(
-  File "/home/users/chenquanlin/workspace/operator/FlashMLA/tests/test_flash_mla_sparse_bwd_head128_2kernels_dkv.py", line 120, in test_sparse_mla_bwd_head128_2kernels_dkv
-    torch.cuda.synchronize()
-  File "/usr/local/lib/python3.12/dist-packages/torch/cuda/__init__.py", line 1040, in synchronize
-    return torch._C._cuda_synchronize()
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-RuntimeError: CUDA error: tensor memory not completely freed
-CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
-For debugging consider passing CUDA_LAUNCH_BLOCKING=1
-Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+[DBG][DKV][SQ0 CTA0 DRN2] k=13 arrived dkv_free
+[DBG][DKV][SQ0 CTA0 MMA] k=14 done bar_dkv_free
+[DBG][DKV][SQ0 CTA0 PROD] wait final bar_dkv_free phase=1
+[DBG][DKV][SQ0 CTA1 PROD] done final bar_dkv_free
+[DBG][DKV][SQ0 CTA1 DRN2] k=14 wait nope phase=0 row_global=1856 valid=0
+[DBG][DKV][SQ0 CTA0 PROD] done final bar_dkv_free
+[DBG][DKV][SQ0 CTA0 DRN2] k=14 wait nope phase=0 row_global=1792 valid=0
+[DBG][DKV][SQ0 CTA0 MMA] k=14 wait S/dS buf=0 phase=1
+[DBG][DKV][SQ0 CTA1 PROD] free TMEM base=0
+[DBG][DKV][SQ0 CTA0 PROD] free TMEM base=0
+[DBG][DKV][SQ0 CTA0 MMA] k=14 done S/dS wait
+[DBG][DKV][SQ0 CTA0 MMA] k=14 arrived nope
+[DBG][DKV][SQ0 CTA0 DRN2] k=14 done nope wait
+[DBG][DKV][SQ0 CTA0 DRN1] k=14 done nope wait
+[DBG][DKV][SQ0 CTA1 DRN2] k=14 done nope wait
+[DBG][DKV][SQ0 CTA1 DRN1] k=14 done nope wait
+[DBG][DKV][SQ0 CTA0 MMA] k=14 arrived rope
+[DBG][DKV][SQ0 CTA1 DRN1] k=14 arrived dkv_free
+[DBG][DKV][SQ0 CTA0 DRN2] k=14 wait rope phase=0
+[DBG][DKV][SQ0 CTA1 DRN2] k=14 wait rope phase=0
+[DBG][DKV][SQ0 CTA0 DRN1] k=14 arrived dkv_free
+[DBG][DKV][SQ0 CTA1 DRN1] k=15 wait nope phase=1 row_global=1984 valid=0
+[DBG][DKV][SQ0 CTA1 DRN2] k=14 done rope wait
+[DBG][DKV][SQ0 CTA0 MMA] k=15 wait bar_dkv_free phase=0
+[DBG][DKV][SQ0 CTA0 DRN2] k=14 done rope wait
+[DBG][DKV][SQ0 CTA0 DRN1] k=15 wait nope phase=1 row_global=1920 valid=0
+[DBG][DKV][SQ0 CTA1 DRN2] k=14 arrived dkv_free
+[DBG][DKV][SQ0 CTA0 DRN2] k=14 arrived dkv_free
+[DBG][DKV][SQ0 CTA0 MMA] k=15 done bar_dkv_free
+[DBG][DKV][SQ0 CTA1 DRN2] k=15 wait nope phase=1 row_global=1984 valid=0
+[DBG][DKV][SQ0 CTA0 MMA] k=15 wait S/dS buf=1 phase=1
+[DBG][DKV][SQ0 CTA0 DRN2] k=15 wait nope phase=1 row_global=1920 valid=0
+[DBG][DKV][SQ0 CTA0 MMA] k=15 done S/dS wait
+[DBG][DKV][SQ0 CTA0 MMA] k=15 arrived nope
+[DBG][DKV][SQ0 CTA0 DRN1] k=15 done nope wait
+[DBG][DKV][SQ0 CTA1 DRN1] k=15 done nope wait
+[DBG][DKV][SQ0 CTA1 DRN2] k=15 done nope wait
+[DBG][DKV][SQ0 CTA0 DRN2] k=15 done nope wait
+[DBG][DKV][SQ0 CTA1 DRN1] k=15 arrived dkv_free
+[DBG][DKV][SQ0 CTA0 MMA] k=15 arrived rope
+[DBG][DKV][SQ0 CTA0 DRN1] k=15 arrived dkv_free
+[DBG][DKV][SQ0 CTA1 DRN2] k=15 wait rope phase=1
+[DBG][DKV][SQ0 CTA0 DRN2] k=15 wait rope phase=1
+[DBG][DKV][SQ0 CTA1 DRN2] k=15 done rope wait
+[DBG][DKV][SQ0 CTA0 DRN2] k=15 done rope wait
+[DBG][DKV][SQ0 CTA1 DRN2] k=15 arrived dkv_free
+[DBG][DKV][SQ0 CTA0 DRN2] k=15 arrived dkv_free
