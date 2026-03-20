@@ -1,38 +1,6 @@
-root@tjzj-inf-sci-k8s-bzz2-0000:/home/users/chenquanlin/workspace/operator/FlashMLA# CUDA_LAUNCH_BLOCKING=1 python /home/users/chenquanlin/workspace/operator/FlashMLA/tests/test_flash_mla_sparse_bwd_head128_2kernels_dq.py
-dq_dbg mma_q_ready cta=0
-dq_dbg kernel_enter cta=0 s_q=0 topk_length=2048 num_k_blocks=32 tmem_base=0 q_full=0x400 k=0x400 kv_peer=0x9400 dO=0x12400
-dq_dbg kernel_enter cta=1 s_q=0 topk_length=2048 num_k_blocks=32 tmem_base=0 q_full=0x1000400 k=0x1000400 kv_peer=0x1009400 dO=0x1012400
-dq_dbg softmax_before_p cta=1 k_block=0 phase=0
-dq_dbg mma_prologue_done cta=0
-dq_dbg kv_before_gather cta=0 k_block=0 phase=0
-dq_dbg kv_before_gather cta=1 k_block=0 phase=0
-dq_dbg softmax_before_p cta=0 k_block=0 phase=0
-dq_dbg kv_after_gather cta=1 k_block=0
-dq_dbg mma_before_qk cta=0 k_block=0 phase=0
-dq_dbg kv_after_gather cta=0 k_block=0
-dq_dbg qk_frag_info cta=0 k_block=0 a_k_tiles=36 b_k_tiles=36
-dq_dbg qk_gemm_iter cta=0 k_block=0 gemm_k=0
-dq_dbg qk_gemm_iter cta=0 k_block=0 gemm_k=1
-dq_dbg qk_gemm_iter cta=0 k_block=0 gemm_k=2
-dq_dbg qk_gemm_iter cta=0 k_block=0 gemm_k=3
-dq_dbg qk_gemm_iter cta=0 k_block=0 gemm_k=4
-dq_dbg qk_gemm_iter cta=0 k_block=0 gemm_k=5
-dq_dbg qk_gemm_iter cta=0 k_block=0 gemm_k=6
-dq_dbg qk_gemm_iter cta=0 k_block=0 gemm_k=7
-dq_dbg qk_gemm_iter cta=0 k_block=0 gemm_k=8
-dq_dbg qk_gemm_iter cta=0 k_block=0 gemm_k=9
-dq_dbg qk_gemm_iter cta=0 k_block=0 gemm_k=10
-dq_dbg qk_gemm_iter cta=0 k_block=0 gemm_k=11
-dq_dbg qk_gemm_iter cta=0 k_block=0 gemm_k=12
-dq_dbg qk_gemm_iter cta=0 k_block=0 gemm_k=13
-dq_dbg qk_gemm_iter cta=0 k_block=0 gemm_k=14
-dq_dbg qk_gemm_iter cta=0 k_block=0 gemm_k=15
-dq_dbg qk_gemm_iter cta=0 k_block=0 gemm_k=16
-dq_dbg qk_gemm_iter cta=0 k_block=0 gemm_k=17
-dq_dbg qk_gemm_iter cta=0 k_block=0 gemm_k=18
-dq_dbg qk_gemm_iter cta=0 k_block=0 gemm_k=19
-dq_dbg qk_gemm_iter cta=0 k_block=0 gemm_k=20
-CUDA error (/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/sm100/prefill/sparse/bwd/head128_2kernels/instantiations/../dq_phase.cuh:936): an illegal memory access was encountered
+root@tjzj-inf-sci-k8s-bzz2-0000:/home/users/chenquanlin/workspace/operator/FlashMLA# CUDA_LAUNCH_BLOCKING=1 python /home/users/chenquanlin/workspace/operator/FlashMLA/tests/test_f
+lash_mla_sparse_bwd_head128_2kernels_dq.py
+CUDA error (/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/sm100/prefill/sparse/bwd/head128_2kernels/instantiations/../dq_phase.cuh:785): misaligned address
 Traceback (most recent call last):
   File "/home/users/chenquanlin/workspace/operator/FlashMLA/tests/test_flash_mla_sparse_bwd_head128_2kernels_dq.py", line 256, in <module>
     test_sparse_mla_bwd_head128_2kernels_dq(
@@ -42,4 +10,4 @@ Traceback (most recent call last):
   File "/usr/local/lib/python3.12/dist-packages/flash_mla/flash_mla_interface.py", line 303, in flash_mla_sparse_bwd_head128_2kernels_dq
     dQ, s, ds = flash_mla_cuda.sparse_prefill_bwd_head128_2kernels_dq(
                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-RuntimeError: CUDA error (/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/sm100/prefill/sparse/bwd/head128_2kernels/instantiations/../dq_phase.cuh:936): CUDA error: an illegal memory access was encountered
+RuntimeError: CUDA error (/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/sm100/prefill/sparse/bwd/head128_2kernels/instantiations/../dq_phase.cuh:785): CUDA error: misaligned address
