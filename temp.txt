@@ -1,12 +1,101 @@
 root@tjzj-inf-sci-k8s-bzz2-0000:/home/users/chenquanlin/workspace/operator/FlashMLA# python /home/users/chenquanlin/workspace/operator/FlashMLA/tests/test_flash_mla_sparse_bwd_head128_2kernels_fused.py
-CUDA error (/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/sm100/prefill/sparse/bwd/head128_2kernels/instantiations/../dkv_phase.cuh:534): invalid argument
-Traceback (most recent call last):
-  File "/home/users/chenquanlin/workspace/operator/FlashMLA/tests/test_flash_mla_sparse_bwd_head128_2kernels_fused.py", line 183, in <module>
-    test_sparse_mla_bwd_head128_2kernels_fused(
-  File "/home/users/chenquanlin/workspace/operator/FlashMLA/tests/test_flash_mla_sparse_bwd_head128_2kernels_fused.py", line 106, in test_sparse_mla_bwd_head128_2kernels_fused
-    flash_dq, flash_dkv = flash_mla.flash_mla_sparse_bwd_head128_2kernels_fused(
-                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/local/lib/python3.12/dist-packages/flash_mla/flash_mla_interface.py", line 380, in flash_mla_sparse_bwd_head128_2kernels_fused
-    return flash_mla_cuda.sparse_prefill_bwd_head128_2kernels_fused(
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-RuntimeError: CUDA error (/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/sm100/prefill/sparse/bwd/head128_2kernels/instantiations/../dkv_phase.cuh:534): CUDA error: invalid argument
+[DKVDBG][B0 SQ0 CTA0 W0 WG0 L0] enter topk=2048 topk_length=2048 num_k_blocks=8 max_kv_i=2048
+[DKVDBG][B1 SQ0 CTA1 W0 WG0 L0] enter topk=2048 topk_length=2048 num_k_blocks=8 max_kv_i=2048
+[DKVDBG][B1 SQ0 CTA1 W0 WG0 L0] prefetch_tma_descriptors_done
+[DKVDBG][B0 SQ0 CTA0 W0 WG0 L0] prefetch_tma_descriptors_done
+[DKVDBG][B1 SQ0 CTA1 W0 WG0 L0] barrier_init_begin
+[DKVDBG][B0 SQ0 CTA0 W0 WG0 L0] barrier_init_begin
+[DKVDBG][B1 SQ0 CTA1 W0 WG0 L0] barrier_init_done
+[DKVDBG][B0 SQ0 CTA0 W0 WG0 L0] barrier_init_done
+[DKVDBG][B1 SQ0 CTA1 W0 WG0 L0] cluster_sync_init_before
+[DKVDBG][B0 SQ0 CTA0 W0 WG0 L0] cluster_sync_init_before
+[DKVDBG][B0 SQ0 CTA0 W0 WG0 L0] cluster_sync_init_after
+[DKVDBG][B1 SQ0 CTA1 W0 WG0 L0] cluster_sync_init_after
+[DKVDBG][B0 SQ0 CTA0 W0 WG0 L0] launch_qdo_tma_begin
+[DKVDBG][B1 SQ0 CTA1 W0 WG0 L0] launch_qdo_tma_begin
+[DKVDBG][B0 SQ0 CTA0 W0 WG0 L0] launch_qdo_tma_done
+[DKVDBG][B1 SQ0 CTA1 W0 WG0 L0] launch_qdo_tma_done
+[DKVDBG][B0 SQ0 CTA0 W0 WG0 L0] tmem_allocate_done
+[DKVDBG][B1 SQ0 CTA1 W0 WG0 L0] tmem_allocate_done
+[DKVDBG][B0 SQ0 CTA0 W0 WG0 L0] __syncthreads_before
+[DKVDBG][B1 SQ0 CTA1 W0 WG0 L0] __syncthreads_before
+[DKVDBG][B0 SQ0 CTA0 W10 WG2 L0] dS-TMA enter
+[DKVDBG][B0 SQ0 CTA0 W9 WG2 L0] S-TMA enter
+[DKVDBG][B0 SQ0 CTA0 W8 WG2 L0] MMA enter
+[DKVDBG][B1 SQ0 CTA1 W9 WG2 L0] S-TMA enter
+[DKVDBG][B1 SQ0 CTA1 W10 WG2 L0] dS-TMA enter
+[DKVDBG][B0 SQ0 CTA0 W0 WG0 L0] __syncthreads_after tmem_base=0
+[DKVDBG][B1 SQ0 CTA1 W0 WG0 L0] __syncthreads_after tmem_base=0
+[DKVDBG][B0 SQ0 CTA0 W4 WG1 L0] drain enter row=0 chunk_group=1
+[DKVDBG][B1 SQ0 CTA1 W4 WG1 L0] drain enter row=0 chunk_group=1
+[DKVDBG][B1 SQ0 CTA1 W9 WG2 L0] S-TMA k=0 launch buf=0 phase=0
+[DKVDBG][B1 SQ0 CTA1 W10 WG2 L0] dS-TMA k=0 launch buf=0 phase=0
+[DKVDBG][B0 SQ0 CTA0 W10 WG2 L0] dS-TMA k=0 launch buf=0 phase=0
+[DKVDBG][B0 SQ0 CTA0 W9 WG2 L0] S-TMA k=0 launch buf=0 phase=0
+[DKVDBG][B0 SQ0 CTA0 W0 WG0 L0] drain enter row=0 chunk_group=0
+[DKVDBG][B0 SQ0 CTA0 W8 WG2 L0] MMA q/do arrive_and_expect_tx done
+[DKVDBG][B1 SQ0 CTA1 W0 WG0 L0] drain enter row=0 chunk_group=0
+[DKVDBG][B1 SQ0 CTA1 W4 WG1 L0] drain k=0 wait part0_ready buf=0 phase=0 row_global=128 row_valid=1 kv_idx=906
+[DKVDBG][B0 SQ0 CTA0 W4 WG1 L0] drain k=0 wait part0_ready buf=0 phase=0 row_global=0 row_valid=1 kv_idx=395
+[DKVDBG][B1 SQ0 CTA1 W9 WG2 L0] S-TMA k=0 launch_done
+[DKVDBG][B0 SQ0 CTA0 W10 WG2 L0] dS-TMA k=0 launch_done
+[DKVDBG][B1 SQ0 CTA1 W10 WG2 L0] dS-TMA k=0 launch_done
+[DKVDBG][B0 SQ0 CTA0 W9 WG2 L0] S-TMA k=0 launch_done
+[DKVDBG][B0 SQ0 CTA0 W8 WG2 L0] MMA wait q_nope_ready phase=0
+[DKVDBG][B0 SQ0 CTA0 W0 WG0 L0] drain k=0 wait part0_ready buf=0 phase=0 row_global=0 row_valid=1 kv_idx=395
+[DKVDBG][B1 SQ0 CTA1 W0 WG0 L0] drain k=0 wait part0_ready buf=0 phase=0 row_global=128 row_valid=1 kv_idx=906
+[DKVDBG][B1 SQ0 CTA1 W9 WG2 L0] S-TMA k=1 wait part2_ready buf=0 phase=1 wait_phase=0
+[DKVDBG][B0 SQ0 CTA0 W10 WG2 L0] dS-TMA k=1 wait part2_ready buf=0 phase=1 wait_phase=0
+[DKVDBG][B1 SQ0 CTA1 W10 WG2 L0] dS-TMA k=1 wait part2_ready buf=0 phase=1 wait_phase=0
+[DKVDBG][B0 SQ0 CTA0 W8 WG2 L0] MMA wait_done q_nope_ready
+[DKVDBG][B0 SQ0 CTA0 W9 WG2 L0] S-TMA k=1 wait part2_ready buf=0 phase=1 wait_phase=0
+[DKVDBG][B0 SQ0 CTA0 W8 WG2 L0] MMA wait q_rope_ready phase=0
+[DKVDBG][B0 SQ0 CTA0 W8 WG2 L0] MMA wait_done q_rope_ready
+[DKVDBG][B0 SQ0 CTA0 W8 WG2 L0] MMA wait dO_ready phase=0
+[DKVDBG][B0 SQ0 CTA0 W8 WG2 L0] MMA wait_done dO_ready
+[DKVDBG][B0 SQ0 CTA0 W8 WG2 L0] MMA k=0 arrive_and_expect_tx s_ready buf=0 phase=0
+[DKVDBG][B0 SQ0 CTA0 W8 WG2 L0] MMA k=0 wait s_ready phase=0
+[DKVDBG][B0 SQ0 CTA0 W8 WG2 L0] MMA k=0 wait_done s_ready
+[DKVDBG][B0 SQ0 CTA0 W8 WG2 L0] MMA k=0 arrive_and_expect_tx ds_ready
+[DKVDBG][B0 SQ0 CTA0 W8 WG2 L0] MMA k=0 wait ds_ready phase=0
+[DKVDBG][B0 SQ0 CTA0 W8 WG2 L0] MMA k=0 wait_done ds_ready
+[DKVDBG][B0 SQ0 CTA0 W8 WG2 L0] MMA k=0 arrive part0_ready
+[DKVDBG][B1 SQ0 CTA1 W4 WG1 L0] drain k=0 wait_done part0_ready
+[DKVDBG][B1 SQ0 CTA1 W0 WG0 L0] drain k=0 wait_done part0_ready
+[DKVDBG][B0 SQ0 CTA0 W0 WG0 L0] drain k=0 wait_done part0_ready
+[DKVDBG][B0 SQ0 CTA0 W4 WG1 L0] drain k=0 wait_done part0_ready
+[DKVDBG][B1 SQ0 CTA1 W0 WG0 L0] drain k=0 arrive part0_done
+[DKVDBG][B0 SQ0 CTA0 W8 WG2 L0] MMA k=0 arrive rope_ready
+[DKVDBG][B1 SQ0 CTA1 W4 WG1 L0] drain k=0 arrive part0_done
+[DKVDBG][B0 SQ0 CTA0 W0 WG0 L0] drain k=0 arrive part0_done
+[DKVDBG][B0 SQ0 CTA0 W4 WG1 L0] drain k=0 arrive part0_done
+[DKVDBG][B1 SQ0 CTA1 W0 WG0 L0] drain k=0 wait rope_ready buf=0 phase=0
+[DKVDBG][B1 SQ0 CTA1 W4 WG1 L0] drain k=0 wait rope_ready buf=0 phase=0
+[DKVDBG][B0 SQ0 CTA0 W8 WG2 L0] MMA k=0 arrive part1_ready
+[DKVDBG][B0 SQ0 CTA0 W0 WG0 L0] drain k=0 wait rope_ready buf=0 phase=0
+[DKVDBG][B0 SQ0 CTA0 W4 WG1 L0] drain k=0 wait rope_ready buf=0 phase=0
+[DKVDBG][B1 SQ0 CTA1 W0 WG0 L0] drain k=0 wait_done rope_ready
+[DKVDBG][B1 SQ0 CTA1 W4 WG1 L0] drain k=0 wait_done rope_ready
+[DKVDBG][B0 SQ0 CTA0 W0 WG0 L0] drain k=0 wait_done rope_ready
+[DKVDBG][B0 SQ0 CTA0 W4 WG1 L0] drain k=0 wait_done rope_ready
+[DKVDBG][B0 SQ0 CTA0 W8 WG2 L0] MMA k=0 wait rope_done round_phase=0
+[DKVDBG][B1 SQ0 CTA1 W0 WG0 L0] drain k=0 arrive rope_done
+[DKVDBG][B1 SQ0 CTA1 W4 WG1 L0] drain k=0 arrive rope_done
+[DKVDBG][B0 SQ0 CTA0 W0 WG0 L0] drain k=0 arrive rope_done
+[DKVDBG][B0 SQ0 CTA0 W4 WG1 L0] drain k=0 arrive rope_done
+[DKVDBG][B1 SQ0 CTA1 W0 WG0 L0] drain k=0 wait part1_ready buf=0 phase=0
+[DKVDBG][B1 SQ0 CTA1 W4 WG1 L0] drain k=0 wait part1_ready buf=0 phase=0
+[DKVDBG][B0 SQ0 CTA0 W0 WG0 L0] drain k=0 wait part1_ready buf=0 phase=0
+[DKVDBG][B0 SQ0 CTA0 W4 WG1 L0] drain k=0 wait part1_ready buf=0 phase=0
+[DKVDBG][B1 SQ0 CTA1 W0 WG0 L0] drain k=0 wait_done part1_ready
+[DKVDBG][B1 SQ0 CTA1 W4 WG1 L0] drain k=0 wait_done part1_ready
+[DKVDBG][B0 SQ0 CTA0 W0 WG0 L0] drain k=0 wait_done part1_ready
+[DKVDBG][B0 SQ0 CTA0 W4 WG1 L0] drain k=0 wait_done part1_ready
+[DKVDBG][B1 SQ0 CTA1 W0 WG0 L0] drain k=0 arrive part1_done
+[DKVDBG][B1 SQ0 CTA1 W4 WG1 L0] drain k=0 arrive part1_done
+[DKVDBG][B0 SQ0 CTA0 W0 WG0 L0] drain k=0 arrive part1_done
+[DKVDBG][B0 SQ0 CTA0 W4 WG1 L0] drain k=0 arrive part1_done
+[DKVDBG][B1 SQ0 CTA1 W0 WG0 L0] drain k=0 wait part2_ready buf=0 phase=0
+[DKVDBG][B1 SQ0 CTA1 W4 WG1 L0] drain k=0 wait part2_ready buf=0 phase=0
+[DKVDBG][B0 SQ0 CTA0 W0 WG0 L0] drain k=0 wait part2_ready buf=0 phase=0
+[DKVDBG][B0 SQ0 CTA0 W4 WG1 L0] drain k=0 wait part2_ready buf=0 phase=0
