@@ -1,1 +1,12 @@
-当前dq kernel在整个训练框架运行时出现结果为nan或inf的现象，但是把输入dump下来单算子复现又复现不出来。怀疑算子实现或定义时有问题，比如某些buffer没初始化，有数据残留等等，仔细检查问题在哪
+root@tjzj-inf-sci-k8s-bzz2-0000:/home/users/chenquanlin/workspace/operator/FlashMLA# python /home/users/chenquanlin/workspace/operator/FlashMLA/tests/test_flash_mla_sparse_bwd_head128_2kernels_fused.py
+CUDA error (/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/sm100/prefill/sparse/bwd/head128_2kernels/instantiations/../dkv_phase.cuh:534): invalid argument
+Traceback (most recent call last):
+  File "/home/users/chenquanlin/workspace/operator/FlashMLA/tests/test_flash_mla_sparse_bwd_head128_2kernels_fused.py", line 183, in <module>
+    test_sparse_mla_bwd_head128_2kernels_fused(
+  File "/home/users/chenquanlin/workspace/operator/FlashMLA/tests/test_flash_mla_sparse_bwd_head128_2kernels_fused.py", line 106, in test_sparse_mla_bwd_head128_2kernels_fused
+    flash_dq, flash_dkv = flash_mla.flash_mla_sparse_bwd_head128_2kernels_fused(
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/flash_mla/flash_mla_interface.py", line 380, in flash_mla_sparse_bwd_head128_2kernels_fused
+    return flash_mla_cuda.sparse_prefill_bwd_head128_2kernels_fused(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: CUDA error (/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/sm100/prefill/sparse/bwd/head128_2kernels/instantiations/../dkv_phase.cuh:534): CUDA error: invalid argument
