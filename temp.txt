@@ -1,101 +1,152 @@
-root@tjzj-inf-sci-k8s-bzz2-0000:/home/users/chenquanlin/workspace/operator/FlashMLA# python /home/users/chenquanlin/workspace/operator/FlashMLA/tests/test_flash_mla_sparse_bwd_head128_2kernels_fused.py
-[DKVDBG][B0 SQ0 CTA0 W0 WG0 L0] enter topk=2048 topk_length=2048 num_k_blocks=8 max_kv_i=2048
-[DKVDBG][B1 SQ0 CTA1 W0 WG0 L0] enter topk=2048 topk_length=2048 num_k_blocks=8 max_kv_i=2048
-[DKVDBG][B1 SQ0 CTA1 W0 WG0 L0] prefetch_tma_descriptors_done
-[DKVDBG][B0 SQ0 CTA0 W0 WG0 L0] prefetch_tma_descriptors_done
-[DKVDBG][B1 SQ0 CTA1 W0 WG0 L0] barrier_init_begin
-[DKVDBG][B0 SQ0 CTA0 W0 WG0 L0] barrier_init_begin
-[DKVDBG][B1 SQ0 CTA1 W0 WG0 L0] barrier_init_done
-[DKVDBG][B0 SQ0 CTA0 W0 WG0 L0] barrier_init_done
-[DKVDBG][B1 SQ0 CTA1 W0 WG0 L0] cluster_sync_init_before
-[DKVDBG][B0 SQ0 CTA0 W0 WG0 L0] cluster_sync_init_before
-[DKVDBG][B0 SQ0 CTA0 W0 WG0 L0] cluster_sync_init_after
-[DKVDBG][B1 SQ0 CTA1 W0 WG0 L0] cluster_sync_init_after
-[DKVDBG][B0 SQ0 CTA0 W0 WG0 L0] launch_qdo_tma_begin
-[DKVDBG][B1 SQ0 CTA1 W0 WG0 L0] launch_qdo_tma_begin
-[DKVDBG][B0 SQ0 CTA0 W0 WG0 L0] launch_qdo_tma_done
-[DKVDBG][B1 SQ0 CTA1 W0 WG0 L0] launch_qdo_tma_done
-[DKVDBG][B0 SQ0 CTA0 W0 WG0 L0] tmem_allocate_done
-[DKVDBG][B1 SQ0 CTA1 W0 WG0 L0] tmem_allocate_done
-[DKVDBG][B0 SQ0 CTA0 W0 WG0 L0] __syncthreads_before
-[DKVDBG][B1 SQ0 CTA1 W0 WG0 L0] __syncthreads_before
-[DKVDBG][B0 SQ0 CTA0 W10 WG2 L0] dS-TMA enter
-[DKVDBG][B0 SQ0 CTA0 W9 WG2 L0] S-TMA enter
-[DKVDBG][B0 SQ0 CTA0 W8 WG2 L0] MMA enter
-[DKVDBG][B1 SQ0 CTA1 W9 WG2 L0] S-TMA enter
-[DKVDBG][B1 SQ0 CTA1 W10 WG2 L0] dS-TMA enter
-[DKVDBG][B0 SQ0 CTA0 W0 WG0 L0] __syncthreads_after tmem_base=0
-[DKVDBG][B1 SQ0 CTA1 W0 WG0 L0] __syncthreads_after tmem_base=0
-[DKVDBG][B0 SQ0 CTA0 W4 WG1 L0] drain enter row=0 chunk_group=1
-[DKVDBG][B1 SQ0 CTA1 W4 WG1 L0] drain enter row=0 chunk_group=1
-[DKVDBG][B1 SQ0 CTA1 W9 WG2 L0] S-TMA k=0 launch buf=0 phase=0
-[DKVDBG][B1 SQ0 CTA1 W10 WG2 L0] dS-TMA k=0 launch buf=0 phase=0
-[DKVDBG][B0 SQ0 CTA0 W10 WG2 L0] dS-TMA k=0 launch buf=0 phase=0
-[DKVDBG][B0 SQ0 CTA0 W9 WG2 L0] S-TMA k=0 launch buf=0 phase=0
-[DKVDBG][B0 SQ0 CTA0 W0 WG0 L0] drain enter row=0 chunk_group=0
-[DKVDBG][B0 SQ0 CTA0 W8 WG2 L0] MMA q/do arrive_and_expect_tx done
-[DKVDBG][B1 SQ0 CTA1 W0 WG0 L0] drain enter row=0 chunk_group=0
-[DKVDBG][B1 SQ0 CTA1 W4 WG1 L0] drain k=0 wait part0_ready buf=0 phase=0 row_global=128 row_valid=1 kv_idx=906
-[DKVDBG][B0 SQ0 CTA0 W4 WG1 L0] drain k=0 wait part0_ready buf=0 phase=0 row_global=0 row_valid=1 kv_idx=395
-[DKVDBG][B1 SQ0 CTA1 W9 WG2 L0] S-TMA k=0 launch_done
-[DKVDBG][B0 SQ0 CTA0 W10 WG2 L0] dS-TMA k=0 launch_done
-[DKVDBG][B1 SQ0 CTA1 W10 WG2 L0] dS-TMA k=0 launch_done
-[DKVDBG][B0 SQ0 CTA0 W9 WG2 L0] S-TMA k=0 launch_done
-[DKVDBG][B0 SQ0 CTA0 W8 WG2 L0] MMA wait q_nope_ready phase=0
-[DKVDBG][B0 SQ0 CTA0 W0 WG0 L0] drain k=0 wait part0_ready buf=0 phase=0 row_global=0 row_valid=1 kv_idx=395
-[DKVDBG][B1 SQ0 CTA1 W0 WG0 L0] drain k=0 wait part0_ready buf=0 phase=0 row_global=128 row_valid=1 kv_idx=906
-[DKVDBG][B1 SQ0 CTA1 W9 WG2 L0] S-TMA k=1 wait part2_ready buf=0 phase=1 wait_phase=0
-[DKVDBG][B0 SQ0 CTA0 W10 WG2 L0] dS-TMA k=1 wait part2_ready buf=0 phase=1 wait_phase=0
-[DKVDBG][B1 SQ0 CTA1 W10 WG2 L0] dS-TMA k=1 wait part2_ready buf=0 phase=1 wait_phase=0
-[DKVDBG][B0 SQ0 CTA0 W8 WG2 L0] MMA wait_done q_nope_ready
-[DKVDBG][B0 SQ0 CTA0 W9 WG2 L0] S-TMA k=1 wait part2_ready buf=0 phase=1 wait_phase=0
-[DKVDBG][B0 SQ0 CTA0 W8 WG2 L0] MMA wait q_rope_ready phase=0
-[DKVDBG][B0 SQ0 CTA0 W8 WG2 L0] MMA wait_done q_rope_ready
-[DKVDBG][B0 SQ0 CTA0 W8 WG2 L0] MMA wait dO_ready phase=0
-[DKVDBG][B0 SQ0 CTA0 W8 WG2 L0] MMA wait_done dO_ready
-[DKVDBG][B0 SQ0 CTA0 W8 WG2 L0] MMA k=0 arrive_and_expect_tx s_ready buf=0 phase=0
-[DKVDBG][B0 SQ0 CTA0 W8 WG2 L0] MMA k=0 wait s_ready phase=0
-[DKVDBG][B0 SQ0 CTA0 W8 WG2 L0] MMA k=0 wait_done s_ready
-[DKVDBG][B0 SQ0 CTA0 W8 WG2 L0] MMA k=0 arrive_and_expect_tx ds_ready
-[DKVDBG][B0 SQ0 CTA0 W8 WG2 L0] MMA k=0 wait ds_ready phase=0
-[DKVDBG][B0 SQ0 CTA0 W8 WG2 L0] MMA k=0 wait_done ds_ready
-[DKVDBG][B0 SQ0 CTA0 W8 WG2 L0] MMA k=0 arrive part0_ready
-[DKVDBG][B1 SQ0 CTA1 W4 WG1 L0] drain k=0 wait_done part0_ready
-[DKVDBG][B1 SQ0 CTA1 W0 WG0 L0] drain k=0 wait_done part0_ready
-[DKVDBG][B0 SQ0 CTA0 W0 WG0 L0] drain k=0 wait_done part0_ready
-[DKVDBG][B0 SQ0 CTA0 W4 WG1 L0] drain k=0 wait_done part0_ready
-[DKVDBG][B1 SQ0 CTA1 W0 WG0 L0] drain k=0 arrive part0_done
-[DKVDBG][B0 SQ0 CTA0 W8 WG2 L0] MMA k=0 arrive rope_ready
-[DKVDBG][B1 SQ0 CTA1 W4 WG1 L0] drain k=0 arrive part0_done
-[DKVDBG][B0 SQ0 CTA0 W0 WG0 L0] drain k=0 arrive part0_done
-[DKVDBG][B0 SQ0 CTA0 W4 WG1 L0] drain k=0 arrive part0_done
-[DKVDBG][B1 SQ0 CTA1 W0 WG0 L0] drain k=0 wait rope_ready buf=0 phase=0
-[DKVDBG][B1 SQ0 CTA1 W4 WG1 L0] drain k=0 wait rope_ready buf=0 phase=0
-[DKVDBG][B0 SQ0 CTA0 W8 WG2 L0] MMA k=0 arrive part1_ready
-[DKVDBG][B0 SQ0 CTA0 W0 WG0 L0] drain k=0 wait rope_ready buf=0 phase=0
-[DKVDBG][B0 SQ0 CTA0 W4 WG1 L0] drain k=0 wait rope_ready buf=0 phase=0
-[DKVDBG][B1 SQ0 CTA1 W0 WG0 L0] drain k=0 wait_done rope_ready
-[DKVDBG][B1 SQ0 CTA1 W4 WG1 L0] drain k=0 wait_done rope_ready
-[DKVDBG][B0 SQ0 CTA0 W0 WG0 L0] drain k=0 wait_done rope_ready
-[DKVDBG][B0 SQ0 CTA0 W4 WG1 L0] drain k=0 wait_done rope_ready
-[DKVDBG][B0 SQ0 CTA0 W8 WG2 L0] MMA k=0 wait rope_done round_phase=0
-[DKVDBG][B1 SQ0 CTA1 W0 WG0 L0] drain k=0 arrive rope_done
-[DKVDBG][B1 SQ0 CTA1 W4 WG1 L0] drain k=0 arrive rope_done
-[DKVDBG][B0 SQ0 CTA0 W0 WG0 L0] drain k=0 arrive rope_done
-[DKVDBG][B0 SQ0 CTA0 W4 WG1 L0] drain k=0 arrive rope_done
-[DKVDBG][B1 SQ0 CTA1 W0 WG0 L0] drain k=0 wait part1_ready buf=0 phase=0
-[DKVDBG][B1 SQ0 CTA1 W4 WG1 L0] drain k=0 wait part1_ready buf=0 phase=0
-[DKVDBG][B0 SQ0 CTA0 W0 WG0 L0] drain k=0 wait part1_ready buf=0 phase=0
-[DKVDBG][B0 SQ0 CTA0 W4 WG1 L0] drain k=0 wait part1_ready buf=0 phase=0
-[DKVDBG][B1 SQ0 CTA1 W0 WG0 L0] drain k=0 wait_done part1_ready
-[DKVDBG][B1 SQ0 CTA1 W4 WG1 L0] drain k=0 wait_done part1_ready
-[DKVDBG][B0 SQ0 CTA0 W0 WG0 L0] drain k=0 wait_done part1_ready
-[DKVDBG][B0 SQ0 CTA0 W4 WG1 L0] drain k=0 wait_done part1_ready
-[DKVDBG][B1 SQ0 CTA1 W0 WG0 L0] drain k=0 arrive part1_done
-[DKVDBG][B1 SQ0 CTA1 W4 WG1 L0] drain k=0 arrive part1_done
-[DKVDBG][B0 SQ0 CTA0 W0 WG0 L0] drain k=0 arrive part1_done
-[DKVDBG][B0 SQ0 CTA0 W4 WG1 L0] drain k=0 arrive part1_done
-[DKVDBG][B1 SQ0 CTA1 W0 WG0 L0] drain k=0 wait part2_ready buf=0 phase=0
-[DKVDBG][B1 SQ0 CTA1 W4 WG1 L0] drain k=0 wait part2_ready buf=0 phase=0
-[DKVDBG][B0 SQ0 CTA0 W0 WG0 L0] drain k=0 wait part2_ready buf=0 phase=0
-[DKVDBG][B0 SQ0 CTA0 W4 WG1 L0] drain k=0 wait part2_ready buf=0 phase=0
+李明
+求职岗位：大模型算法工程师
+2015-09 ~ 2019-06 北京大学 经济学（本科）
+教育背景
+2024-05 ~ 至今 华为技术有限公司 算法工程师
+2023-02 ~ 2024-02 上海矢合科技有限公司 算法工程师
+2019-07 ~ 2023-01 北京作业帮教育科技有限公司 NLP算法工程师
+1.从0到1参与搭建昇腾多模态大模型微调、强化学习训练框架
+2.创新多模态负载均衡、编码器复用等优化算法，提高模型训练速度
+1. 负责金融行业图像OCR、表格识别、意图识别等项目的研发工作
+2. 结合大模型和Prompt工程减少公司的数据标注成本
+1. 根据具体业务需求提出可行性的人工智能解决方案；
+2. 负责文本分类、命名实体识别、关系抽取、文本摘要等 NLP 任务项目的研发工作；
+工作经验
+1. 熟悉 Python 语言，具备良好的编程规范；
+2. 熟练使用 Pytorch 框架以及对 Linux 系统的使用；
+3. 熟练使用 PyCharm，Jupyter Notebook 等开发工具；
+4. 熟悉 RNN、Transformer、BERT 系列等深度学习模型原理，并能够结合实际业务加以运用；
+5. 熟悉 LLaMa、GPT、QwenVL、InternVL 等大模型原理，并结合业务加以使用；
+6. 了解 PPO、RLHF 、GRPO等原理并能够实际运用；
+专业技能
+项目一：MindSpeed MM昇腾多模态大模型训练框架
+技术框架：
+Megatron、Internvl、QwenVL
+项目背景：
+MindSpeed MM是面向大规模分布式训练的昇腾多模态大模型套件，同时支持多模态生成及多模态理解，旨在为华为昇腾芯片提
+供端到端的多模态训练解决方案, 包含预置业界主流模型，数据工程，分布式训练及加速，预训练、微调、在线推理任务等特性。
+项目描述：
+1.以Megatron后端实现Internvl模型，调整tp\pp并行策略，使用8机昇腾A3卡进行Internvl2-76B的sft训练；
+2.创新设计Vit负载均衡：通过HCCL通信均衡DP间图片patch数量，减少快慢卡等待，Internvl2B训练性能提高6.5%，该特性使
+用前后评测分数波动在5%以内；
+项目经验
+项目二：MindSpeed RL昇腾强化学习训练框架
+项目三：Github开源项目visual-openllm
+项目四：金融票据表格图片识别
+3.实现多模态VPP：修改Megatron框架，扩展支持VIT+LLM的VPP切分，Internvl2-76B实测性能提升8.5%；
+4.完成MM开源仓多模态理解模型数据模块的重构与开发；
+项目职责：
+1.适配开源多模态理解大模型到Megatron后端
+2.创新设计性能优化算法，提升模型训练效率
+3.理解模型数据模块的设计与开发
+技术框架：
+PPO、GRPO、DAPO、Qwen2.5VL
+项目背景：
+MindSpeed RL是基于昇腾生态的强化学习加速框架，旨在为华为昇腾芯片生态合作伙伴提供端到端的RL训推解决方案，支持超
+大昇腾集群训推共卡/分离部署、多模型异步流水调度、训推异构切分通信等核心加速能力
+项目描述：
+1.从0到1打通Qwen2.5VL的GRPO训练流程：包括支持训推转换resharding、数据流分发dispatch、适配多模态规则奖励模块
+等；
+2.独立创新设计视觉编码器复用功能：将vllm推理、actor、reference、update的vit计算前置，训练性能端到端提升20%-30%；
+3.Qwen2.5VL适配remove padding特性：logp&update阶段性能提升30%+；
+4.创新设计vit单卡多进程：针对Qwen2.5VL-32B，vit和actor支持独立的切分方式，其中vit单独起进程不进行切分，actor切TP
+和PP，vit计算性能提高10%+
+项目职责：
+1.适配Qwen2.5VL支持MindSpeed RL框架的GRPO算法
+2.创新设计性能优化算法，提升模型训练效率
+技术框架：
+Chatglm、Langchain、Lora、Prompt工程、Stable-diffusion、InstructPix2Pix、Visualglm、Gradio
+项目背景：
+实现类似Visual-chatgpt、文心一言的开源版。使其具有对话、文生图、图片问答、图片风格转换的功能。
+项目描述：
+1. 调用大模型api，few-shot构建6000条训练样本；
+2. 对Chatglm3进行Lora微调，评测指标：rouge-1: 0.78 rouge-2: 0.61 rouge-L: 0.77 bleu-4: 0.58；
+3. 使用Langchain构建agent，根据LLM的action识别调用对应的功能；
+项目职责：
+1. 优化生成数据集的prompt，确保生成样本的多样性和准确性；
+2. LLM的微调和量化加载；
+3. 完善Gradio的关键交互逻辑
+技术框架：
+PaddleOCR、UHDM、LORE_TSR、Resnet、TensorRT
+项目五：协同报价聊天图片识别
+项目六：金融报价意图识别
+项目背景：
+客户需要将手机拍摄的票据表格图片手动录入成excel表，为了提高录入效率，构建表格图片自动识别工具，一键将表格图片转换
+成excel表。
+项目描述：
+1. 使用UHDM去除图片的摩尔纹；
+2. 使用LORE_TSR识别图片的表格线；
+3. 训练Resnet18对单元格是否有文本进行2分类，模型指标：ACC = 99.9%；
+4. 使用PaddleOCR识别每个单元格图片的文本；
+项目职责：
+1. 负责图片数据的预处理和表格线识别的后处理；
+2. 负责单元格分类数据的构造以及分类模型的训练；
+3. 去摩尔纹、表格识别和OCR模型的择优选取
+技术框架：
+Tinybert、Kmeans、PaddleOCR、TensorRT
+项目背景：
+将用户在qq上的报价截图转换成文本，并需要将换行文本转换成同一行，并且正确识别出报价元素之间的空格。
+项目描述：
+1. 使用Bert的NSP任务，训练Tinybert对文本是否换行进行2分类，模型指标：ACC = 98%；
+2. 使用Kmeans聚类识别图片中文本颜色和背景颜色；
+3. PaddleOCR识别每行的文本；
+项目职责：
+1. 负责文本数据预处理：脏数据清洗、dif 数据修正等
+2. 训练样本的数据增强和模型训练；
+3. 文本识别结果的后处理
+技术框架：
+Tinybert、Prompt工程、Active-learning
+项目背景：
+根据用户的聊天文本，识别出用户的报价意图和报价要素，从而实现自动化报价，提高broker的报价效率。
+项目描述：
+1. 编写数据清洗脚本，从2000万条文本数据中多进程筛选出50万条有效数据；
+2. 使用主动学习中的不确定性采样减少标注成本；
+3. 调用openai的api，采用prompt进行批量数据标注，多次迭代prompt，最终实现机器标注与人工标注的数据比例为7：3；
+4. 训练Tinybert进行主语识别、词性识别和语气识别；
+项目职责：
+1. 根据项目文本数据，详细制定数据标注细则文档；
+2. 使用主动学习和Prompt工程，减少数据标注成本；
+项目七：作业帮VIP智能问答系统
+项目八：客诉摘要项目
+项目九：文本分类项目
+技术框架：
+CasRel、MultiHeadSelection、Tener、Macbert、Bi-lstm、CRF、Neo4j、Redis
+项目背景：
+为了能即时解决用户遇到的学习问题，提高用户体验，我们基于Neo4j图数据库构建教育领域知识图谱，搭建了一套K12学生智能
+问答系统。
+项目描述：
+1. 基于 Tener 模型构建 NER 识别模块，支持10种实体类别的数据识别，模型指标：F1-score = 94%；
+2. 先后使用MultiHeadSelection和CasRel进行关系抽取，F1-score从74%上升到78%；
+3. 基于 BERT 模型实现句子主题相关服务模块的搭建，模型指标：ACC = 97%；
+项目职责：
+1. 负责非结构化数据的处理：如脏数据清洗，正则过滤特殊符号等；
+2. 负责模型的设计以及训练工作，并采用不同策略进行模型的优化，如：参数调节，结果后处理等；
+技术框架：
+TextRank、Seq2seq、Attention、PGN、Coverage、Beam-search
+项目背景：
+K12在线教育，对购课家长及学生的问题反馈进行统计，明确公司在哪方面业务不足。数据集为家长和辅导老师的聊天记录，用模
+型提取摘要，提高统计人员的工作效率。
+项目描述：
+1. 构建 10 万条训练数据集、1 万条测试集；
+2. 使用 TextRank 和 Seq2seq + Attention 做基线模型；
+3. 使用 PGN + Coverage 机制，添加 Beam-search 算法；
+4. 模型评估方法采用的是：ROUGE评估方法--基于召回率指标的评价算法；
+5. 最终分数：rouge-1: 0.42 rouge-2: 0.1 rouge-L: 0.41；
+项目职责：
+1. 训练垂直领域词向量；
+2. 模型设计及优化：如模型架构调整，输出端算法优化等；
+3. 调整模型训练策略：解码阶段采用计划采样，减少曝光偏差；
+技术框架：
+Fasttext、Bert、Albert、Roberta、TextCNN、知识蒸馏
+项目背景：
+APP内嵌分类子任务，根据帖子的标题，对用户发布的帖子进行分类
+项目描述：
+1. 构建 10 万条训练数据集、5 千条测试集；
+2. 基于 fastext 构建第一代分类模型，F1-score = 88%；
+3. 基于 TextCNN 和 Roberta ，使用知识蒸馏构建第二代分类模型，F1-score = 93%；
+项目职责：
+1. 负责项目文本数据预处理：脏数据清洗、dif 数据修正等；
+2. 负责模型设计：根据项目设计训练模型，并做对比实验，进行模型迭代升级；
+3. 负责模型优化：基于模型量化、剪枝、知识蒸馏技术，优化模型预测速度；
+本人性格随和，踏实稳重，适应能力强，有较强的学习能力，能独立分析解决问题，能够快速融入到团队中，工作积极主动，对
+领导分配的任务认真完成。
