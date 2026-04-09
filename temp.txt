@@ -1,151 +1,146 @@
-# EduAgent 实现思路简述
+下面把 **普通线性注意力、GatedDeltaNet、Mamba2、DeltaNet、Kimi-Linear** 放到同一张表里。
+先给你一个判断框架：
 
-## 1. 项目定位
+* **普通线性注意力**：快，但“写入记忆”基本是**纯加法累积**，容易记忆污染。 ([arXiv][1])
+* **DeltaNet**：把“纯加法写入”改成 **delta-rule 纠错式写入**，更擅长检索和精确改写。 ([arXiv][2])
+* **Mamba2**：核心是 **selective / gated state update**，擅长“选择性遗忘和压缩状态”，并通过 SSD 框架做高效训练。 ([arXiv][3])
+* **GatedDeltaNet**：把 **Mamba2 的 gate** 和 **DeltaNet 的 delta rule** 合起来，兼顾遗忘和精确写入。 ([arXiv][4])
+* **Kimi-Linear**：以 **KDA（Kimi Delta Attention）** 为核心，把 GatedDeltaNet 再细化成 **channel-wise gate**，并采用混合式线性/全局注意力架构，更偏工程落地和超长上下文推理。 ([arXiv][5])
 
-EduAgent 的实现思路，本质上是把教育场景里高频且可标准化的任务拆成多个独立 Agent，再用统一的前后端框架把它们组织成一个可协同、可追踪、可管理的平台。
+---
 
-## 2. 整体架构思路
+## 一张对比表
 
-项目采用 `React + Express + tRPC + MySQL(Drizzle) + LLM API` 的分层结构：
+| 方法                | 核心记忆/状态形式                          | 单步更新的本质                                                         | 是否显式“遗忘”                            | 是否能“定点改写”旧记忆                   | 训练/并行特点                                                                                | 主要优点                                           | 主要短板                                                   |
+| ----------------- | ---------------------------------- | --------------------------------------------------------------- | ----------------------------------- | ------------------------------ | -------------------------------------------------------------------------------------- | ---------------------------------------------- | ------------------------------------------------------ |
+| **普通线性注意力**       | 维护一个累计的 `KV` 记忆矩阵                  | `S_t = S_{t-1} + φ(k_t) v_t^T` 这类**加性外积累积**                     | 通常**没有强显式 forget gate**             | 较弱；更像“不断往记忆里加东西”               | 依靠核技巧和结合律，把注意力从二次复杂度改成线性复杂度；也可做递推实现 ([arXiv][1])                                       | 简单、高效、长序列便宜                                    | 容易记忆污染，有限状态容量下检索/覆盖能力不足 ([arXiv][6])                   |
+| **DeltaNet**      | 有限状态记忆矩阵                           | 把纯加法写入改成 **delta-rule / 纠错式更新**                                 | 没有 GatedDeltaNet/KDA 那种更强的显式 gate   | **强**；能针对当前 key 对应内容做“修正”而非只累加 | 论文给出 over sequence length 的并行训练算法，并用 WY / Householder 思路提升硬件效率 ([arXiv][2])            | 比普通线性注意力更会“精确写入”，检索类任务更强                       | 缺少强遗忘机制，旧状态管理不如带 gate 的方法 ([arXiv][4])                 |
+| **Mamba2**        | selective SSM / 有限状态递归状态           | 用输入相关的参数对状态做 **选择性状态转移与读出**                                     | **强**；gating / selective update 是核心 | 中等；更偏“调控状态保留和衰减”               | 基于 SSD（Structured State Space Duality）实现更高效训练，论文称核心层比 Mamba 更快 2–8× ([arXiv][3])       | 状态压缩强、递归推理高效、对长序列友好                            | 对“按 key 精准覆盖旧 value”的能力不如 delta-rule 系列直观 ([arXiv][4]) |
+| **GatedDeltaNet** | gated delta memory                 | **先 gate 衰减旧状态，再用 delta rule 精确写入**                             | **强**                               | **强**                          | 论文提出并行训练算法，保持线性时间并适配现代硬件；还有 hybrid 变体与滑窗注意力/Mamba2 结合 ([arXiv][4])                     | 把“遗忘”和“精确改写”结合起来，长上下文、检索、长度外推表现更稳 ([arXiv][4]) | 结构比普通线性注意力更复杂，实现门槛更高                                   |
+| **Kimi-Linear**   | 以 **KDA** 为核心的有限状态线性记忆 + 全局注意力混合架构 | 在 GatedDeltaNet 上进一步做 **更细粒度的 channel-wise gate**，并配合 DPLR 状态转移 | **很强**，而且更细粒度                       | **强**                          | 采用混合架构；论文与仓库强调长上下文推理效率、KV cache 压缩和高吞吐实现；KDA 是 GatedDeltaNet 的 refined 版本 ([arXiv][5]) | 面向超长上下文和推理部署更强，兼顾效果与吞吐                         | 架构更复杂，不再是“纯单一线性层”思路                                    |
 
-- 前端负责按场景提供页面入口，例如问答、批改、简历审查、模拟面试、知识库管理和历史记录。
-- 后端负责把每个教育能力封装成独立业务接口，并处理鉴权、角色权限、数据存储和文件上传。
-- LLM 负责完成自然语言理解、内容生成和评分分析。
-- 数据库负责保存对话、批改记录、简历报告、面试记录和知识库内容，保证结果可回看、可审核、可沉淀。
+---
 
-## 3. 核心实现方式
+## 五者的计算流程图（Mermaid）
 
-### 3.1 用四类 Agent 对应四类核心教育任务
+下面都是**教学版**流程图，抓的是核心计算逻辑，不是论文里的全部实现细节。
 
-- `QA Agent`：处理课程知识问答，结合多轮上下文和知识库内容返回答案，并标记置信度。
-- `Grading Agent`：将试卷批改拆成客观题、简答题、代码题三类思路，统一输出结构化评分结果。
-- `Resume Review Agent`：围绕六个维度评估简历，输出分项分数、修改建议和雷达图数据。
-- `Interview Agent`：把模拟面试设计成 `intro -> tech -> project -> report` 的阶段式流程，最后生成完整评估报告。
+---
 
-### 3.2 用 tRPC 把 Agent 能力包装成业务接口
-
-后端没有把模型调用直接暴露给前端，而是先经过 tRPC 路由封装：
-
-- 前端只关心“提交问题/试卷/简历/面试回答”。
-- 后端负责调用对应 Agent、解析结构化结果、写入数据库，再把最终结果返回前端。
-
-这样做的好处是，模型能力、业务规则和数据读写被放在服务端统一管理，后期更容易扩展和维护。
-
-### 3.3 用结构化输出降低 LLM 不稳定性
-
-项目里很多 Agent 都不是只返回一段自由文本，而是要求模型按 JSON Schema 输出结果，例如：
-
-- 试卷批改输出题目得分、总分、薄弱点和建议。
-- 简历审查输出维度分数、修改建议和总结。
-- 面试总结输出综合评分、优势、不足和建议。
-
-这种做法可以让前端更稳定地渲染结果，也方便把数据直接存库和做可视化。
-
-## 4. 数据闭环设计
-
-EduAgent 不只是“调用一次模型”，而是设计了完整的数据闭环：
-
-- 学员发起问答、批改、简历审查、模拟面试。
-- 后端把过程和结果写入数据库，形成历史记录。
-- 教师可以审核知识库和批改结果。
-- 管理员可以管理用户角色和系统配置。
-- 低置信度问答会进入待补充队列，反过来驱动知识库迭代。
-
-这意味着系统会随着使用不断积累内容，而不是每次都从零开始回答。
-
-## 5. 知识库与多 Agent 协同
-
-项目的一个关键思路是“先知识库，后大模型；先单 Agent，必要时再多 Agent 协同”：
-
-- 问答场景先做知识库检索，命中后优先返回知识库答案，减少幻觉。
-- 没有命中时再回退到 LLM 生成。
-- 对复杂请求，系统可以先做意图识别，再决定调用哪个 Agent，或者组合多个 Agent 处理。
-
-这让系统既保留了大模型的灵活性，也尽量增强了答案的可控性和业务适配性。
-
-## 6. 一句话总结
-
-EduAgent 的实现思路可以概括为：以教育任务为中心拆分多 Agent，以 tRPC 统一封装后端能力，以结构化输出保证结果可用，以数据库和知识库形成持续迭代的教学闭环。
-
-## 7. 运作流程图
+### 1) 普通线性注意力
 
 ```mermaid
 flowchart TD
-    U["用户"] --> FE["前端页面"]
-    FE --> API["tRPC 接口层"]
-    API --> AUTH{"鉴权与角色校验"}
-
-    AUTH --> ROUTE{"选择业务能力"}
-    API -. "复杂请求可选" .-> PIPE["意图识别"]
-    PIPE --> ROUTE
-
-    ROUTE --> QA0["课程问答"]
-    ROUTE --> GR0["试卷批改"]
-    ROUTE --> RE0["简历审查"]
-    ROUTE --> IN0["模拟面试"]
-    AUTH --> MGMT["教师与管理员管理功能"]
-
-    QA0 --> KB["检索知识库"]
-    KB --> KBHIT{"是否命中"}
-    KBHIT -->|"是"| QA1["直接返回知识库答案"]
-    KBHIT -->|"否"| QA2["调用 QA Agent"]
-    QA2 --> CONF{"置信度是否较低"}
-    CONF -->|"是"| LOW["进入低置信度队列"]
-    CONF -->|"否"| QA3["生成问答结果"]
-    QA1 --> SAVEQA["保存对话记录与来源"]
-    QA3 --> SAVEQA
-    LOW --> KBFB["教师补充或修正知识库"]
-
-    GR0 --> GR1["提交试卷或作业"]
-    GR1 --> GR2["调用 Grading Agent"]
-    GR2 --> GR3["输出题目得分 薄弱点 总评"]
-    GR3 --> SAVEGR["保存批改记录"]
-    SAVEGR --> REVIEW["教师审核与发布"]
-
-    RE0 --> RE1["提交简历文本或文件"]
-    RE1 --> RE2["调用 Resume Review Agent"]
-    RE2 --> RE3["输出六维评分 修改建议 雷达图"]
-    RE3 --> SAVERE["保存审查结果"]
-
-    IN0 --> IN1["创建面试会话"]
-    IN1 --> IN2["Interview Agent 分阶段对话"]
-    IN2 --> IN3["生成面试报告与雷达图"]
-    IN3 --> SAVEIN["保存面试记录"]
-
-    MGMT --> KBUP["知识库上传与审核"]
-    MGMT --> USERMG["用户角色管理"]
-    MGMT --> STATS["系统统计与历史查看"]
-
-    SAVEQA --> DB["MySQL 与 Drizzle"]
-    KBFB --> DB
-    REVIEW --> DB
-    SAVERE --> DB
-    SAVEIN --> DB
-    KBUP --> DB
-    USERMG --> DB
-    STATS --> DB
-
-    DB --> OUT["历史记录 报告展示 可视化分析"]
+    A[输入 token x_t] --> B[线性投影得到 q_t k_t v_t]
+    B --> C[特征映射 phi(q_t), phi(k_t)]
+    C --> D[读取累计状态 S_{t-1}, z_{t-1}]
+    D --> E[更新记忆<br/>S_t = S_{t-1} + phi(k_t)v_t^T]
+    E --> F[更新归一化项<br/>z_t = z_{t-1} + phi(k_t)]
+    F --> G[读出输出<br/>o_t = phi(q_t)^T S_t / phi(q_t)^T z_t]
 ```
 
-## 8. PPT 精简版流程图
+它的关键点是：**把 softmax attention 改写成核特征映射后的线性递推**，所以可以边走边累计状态。 ([arXiv][1])
+
+---
+
+### 2) DeltaNet
+
+```mermaid
+flowchart TD
+    A[输入 token x_t] --> B[得到 q_t k_t v_t]
+    B --> C[读取旧状态 S_{t-1}]
+    C --> D[查询当前 key 对应的旧值 old_t]
+    D --> E[计算误差/增量<br/>delta_t = beta_t * (v_t - old_t)]
+    E --> F[按 key_t 写回状态<br/>S_t = S_{t-1} + write(k_t, delta_t)]
+    F --> G[用 q_t 从 S_t 读出 o_t]
+```
+
+它相对普通线性注意力最大的区别，是写入不再只是“加一个新外积”，而是**先看旧内容，再做纠错式更新**。 ([arXiv][2])
+
+---
+
+### 3) Mamba2
+
+```mermaid
+flowchart TD
+    A[输入 token x_t] --> B[输入投影/卷积等预处理]
+    B --> C[生成输入相关参数<br/>A_t B_t C_t 等]
+    C --> D[读取旧状态 h_{t-1}]
+    D --> E[选择性状态更新<br/>h_t = selective_SSM_update(h_{t-1}, x_t)]
+    E --> F[状态读出 y_t]
+    F --> G[输出投影]
+```
+
+Mamba2 的核心不是 key-value 映射式“外积写表”，而是**输入相关的 selective SSM 状态演化**；它在 SSD 框架下获得了更强的训练效率。 ([arXiv][3])
+
+---
+
+### 4) GatedDeltaNet
+
+```mermaid
+flowchart TD
+    A[输入 token x_t] --> B[得到 q_t k_t v_t]
+    B --> C[额外生成 gate g_t 与写入强度 beta_t]
+    C --> D[读取旧状态 S_{t-1}]
+    D --> E[先遗忘/衰减旧记忆<br/>S_t^- = gate(g_t, S_{t-1})]
+    E --> F[读取当前 key 对应旧内容 old_t]
+    F --> G[计算纠错增量<br/>delta_t = beta_t * (v_t - old_t)]
+    G --> H[按 key_t 写回<br/>S_t = S_t^- + write(k_t, delta_t)]
+    H --> I[用 q_t 从 S_t 读出 o_t]
+```
+
+这就是它最重要的思想：**先忘，再精写**。论文就是把 Mamba2 风格的 gating 和 DeltaNet 风格的 delta rule 合并。 ([arXiv][4])
+
+---
+
+### 5) Kimi-Linear（KDA 核心流程）
+
+```mermaid
+flowchart TD
+    A[输入 token x_t] --> B[得到 q_t k_t v_t]
+    B --> C[生成更细粒度的 channel-wise forget gate alpha_t]
+    C --> D[生成写入强度 beta_t]
+    D --> E[读取旧状态 S_{t-1}]
+    E --> F[按通道衰减旧状态<br/>S_t^- = channel_gate(alpha_t, S_{t-1})]
+    F --> G[读取当前 key 对应旧内容 old_t]
+    G --> H[计算增量<br/>delta_t = beta_t * (v_t - old_t)]
+    H --> I[按低秩/特化状态转移写回<br/>S_t = S_t^- + low_rank_write(k_t, delta_t)]
+    I --> J[读出 o_t]
+    J --> K[与部分全局注意力层交替组成混合架构]
+```
+
+KDA 被论文描述为 **GatedDeltaNet 的 refined version**：主要升级点是**更细粒度 gate** 和 **更适合硬件的状态转移参数化**。 ([arXiv][5])
+
+---
+
+## 一句话横向对照
+
+你可以把这五者记成一条演化链：
 
 ```mermaid
 flowchart LR
-    U["用户发起学习或教学任务"] --> FE["EduAgent 前端平台"]
-    FE --> API["后端接口与权限控制"]
-    API --> DISPATCH["按任务分发到对应 Agent"]
+    A[普通线性注意力<br/>纯加性记忆累积]
+    --> B[DeltaNet<br/>delta-rule纠错写入]
+    --> C[GatedDeltaNet<br/>gate + delta rule]
+    --> D[Kimi-Linear / KDA<br/>channel-wise gate + hybrid architecture]
 
-    DISPATCH --> QA["智能问答"]
-    DISPATCH --> GR["试卷批改"]
-    DISPATCH --> RE["简历审查"]
-    DISPATCH --> IN["模拟面试"]
-
-    QA --> LLM["LLM 与知识库协同处理"]
-    GR --> LLM
-    RE --> LLM
-    IN --> LLM
-
-    LLM --> DB["结果写入数据库"]
-    DB --> OUT["返回报告 记录历史 支持教师管理"]
+    A --> E[Mamba2<br/>selective SSM / gating]
+    E --> C
 ```
+
+这条链最核心的逻辑是：
+
+* **普通线性注意力**解决“算得快”
+* **DeltaNet**解决“写得准”
+* **Mamba2**解决“忘得好”
+* **GatedDeltaNet**解决“既能忘、又能准写”
+* **Kimi-Linear**解决“把这套东西做得更细粒度、并更适合长上下文推理部署” ([arXiv][1])
+
+如果你要，我下一条可以继续把这五个流程图再整理成 **统一符号版 Mermaid 大图**，或者补一张 **“训练复杂度 / 推理 KV cache / 长上下文能力”** 的专门对比表。
+
+[1]: https://arxiv.org/abs/2006.16236?utm_source=chatgpt.com "Transformers are RNNs: Fast Autoregressive Transformers with Linear Attention"
+[2]: https://arxiv.org/abs/2406.06484?utm_source=chatgpt.com "Parallelizing Linear Transformers with the Delta Rule over Sequence Length"
+[3]: https://arxiv.org/abs/2405.21060?utm_source=chatgpt.com "Transformers are SSMs: Generalized Models and Efficient Algorithms Through Structured State Space Duality"
+[4]: https://arxiv.org/abs/2412.06464?utm_source=chatgpt.com "Gated Delta Networks: Improving Mamba2 with Delta Rule"
+[5]: https://arxiv.org/abs/2510.26692?utm_source=chatgpt.com "Kimi Linear: An Expressive, Efficient Attention Architecture"
+[6]: https://arxiv.org/abs/2102.11174?utm_source=chatgpt.com "Linear Transformers Are Secretly Fast Weight Programmers"
